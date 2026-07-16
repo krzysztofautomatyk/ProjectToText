@@ -1,0 +1,16 @@
+{
+  "$schema": "https://v2.tauri.app/schema/capability.json",
+  "identifier": "default",
+  "description": "Default capability for ptt",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "dialog:allow-confirm"
+  ]
+}

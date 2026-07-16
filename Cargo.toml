@@ -1,0 +1,49 @@
+[package]
+name = "ptt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+authors = ["Krzysztof Automatyk <https://github.com/krzysztofautomatyk>"]
+description = "Precise, git-native desktop app for turning any folder into high-quality LLM-ready text context. Respects .gitignore exactly like git."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/krzysztofautomatyk/ProjectToText"
+homepage = "https://github.com/krzysztofautomatyk/ProjectToText"
+documentation = "https://github.com/krzysztofautomatyk/ProjectToText#readme"
+readme = "README.md"
+keywords = ["tauri", "llm", "context", "git", "desktop"]
+categories = ["development-tools", "command-line-utilities"]
+exclude = [
+  "target/",
+  "ui/node_modules/",
+  "ui/dist/",
+  ".DS_Store",
+]
+
+[[bin]]
+name = "ptt"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-dialog = "2"
+# Core logic
+ignore = "0.4"
+content_inspector = "0.2"
+encoding_rs = "0.8"
+tokio = { version = "1", features = ["sync"] }
+arboard = "3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

@@ -1,0 +1,8 @@
+# Example project-level exclusions for LLM packing.
+# Same syntax as .gitignore. Safe to keep empty or customize per repo.
+#
+# Uncomment patterns you never want in packed LLM context:
+# *.log
+# *.min.js
+# **/fixtures/large/**
+# **/*.snap
