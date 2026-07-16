@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tauri.conf.json` frontend npm commands point at `ui/`
 - Empty/corrupt app icons that broke Windows Tauri builds
 - Linux CI package conflict (`libappindicator` vs Ayatana)
+- Windows unit test that attempted to create filenames with illegal `<>` characters
 
 ### Changed
 

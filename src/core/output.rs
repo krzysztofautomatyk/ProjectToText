@@ -353,13 +353,13 @@ mod tests {
 
     #[test]
     fn xml_escapes_attribute_special_chars() {
+        // Do not create a real file named with `<>` — those characters are illegal
+        // on Windows. Synthetic DirEntryMeta is enough: missing file yields a
+        // placeholder body, while the path attribute still must be escaped.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // Unusual but legal filename characters for attr escape test via synthetic entry
-        let path = PathBuf::from("a&b<c>.rs");
-        fs::write(root.join("a&b<c>.rs"), "x").unwrap();
         let entries = vec![DirEntryMeta {
-            path: path.clone(),
+            path: PathBuf::from("a&b<c>.rs"),
             is_dir: false,
             size: Some(1),
         }];
@@ -370,7 +370,12 @@ mod tests {
         };
         write_output(&mut buf, &entries, root, &opts).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("path=\"a&amp;b&lt;c&gt;.rs\""));
+        assert!(
+            s.contains("path=\"a&amp;b&lt;c&gt;.rs\""),
+            "expected escaped path attr, got:\n{s}"
+        );
+        // Unit-level coverage for remaining attr entities
+        assert_eq!(escape_xml_attr(r#"x"y'z"#), "x&quot;y&apos;z");
     }
 
     #[test]
