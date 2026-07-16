@@ -1,14 +1,13 @@
-// ptt — ProjectToText
-// Tauri v2 desktop app: open folder → respect .gitignore exactly like Git → pack into LLM-ready text.
+//! ptt — ProjectToText
+//! Tauri v2 desktop app: open folder → respect .gitignore exactly like Git → pack into LLM-ready text.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri_plugin_dialog::DialogExt;
 
-mod core;
-
-use core::output::{WriteOptions, DEFAULT_MAX_FILE_SIZE};
-use core::walker::{normalize_rel_path, path_is_selected};
+use ptt::core::output::OutputFormat;
+use ptt::core::output::{WriteOptions, DEFAULT_MAX_FILE_SIZE};
+use ptt::core::walker::{normalize_rel_path, path_is_selected, walk};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileNode {
@@ -45,7 +44,7 @@ async fn scan_folder(path: String) -> Result<Vec<FileNode>, String> {
         return Err(format!("Not a directory: {path}"));
     }
 
-    let entries = core::walker::walk(&root).map_err(|e| e.to_string())?;
+    let entries = walk(&root).map_err(|e| e.to_string())?;
 
     let nodes: Vec<FileNode> = entries
         .into_iter()
@@ -81,7 +80,7 @@ async fn generate_output(
         return Err(format!("Not a directory: {path}"));
     }
 
-    let entries = core::walker::walk(&root).map_err(|e| e.to_string())?;
+    let entries = walk(&root).map_err(|e| e.to_string())?;
 
     let selected_norm: Vec<String> = selected_paths
         .iter()
@@ -100,10 +99,10 @@ async fn generate_output(
         .collect();
 
     let format = match options.format.as_str() {
-        "markdown" => core::output::OutputFormat::Markdown,
-        "json" => core::output::OutputFormat::Json,
-        "plain" => core::output::OutputFormat::Plain,
-        _ => core::output::OutputFormat::Xml,
+        "markdown" => OutputFormat::Markdown,
+        "json" => OutputFormat::Json,
+        "plain" => OutputFormat::Plain,
+        _ => OutputFormat::Xml,
     };
 
     let write_opts = WriteOptions {
@@ -116,8 +115,7 @@ async fn generate_output(
     let _ = options.relative_paths;
 
     let mut buf = Vec::new();
-    core::output::write_output(&mut buf, &filtered, &root, &write_opts)
-        .map_err(|e| e.to_string())?;
+    ptt::write_output(&mut buf, &filtered, &root, &write_opts).map_err(|e| e.to_string())?;
 
     String::from_utf8(buf).map_err(|e| format!("Output is not valid UTF-8: {e}"))
 }

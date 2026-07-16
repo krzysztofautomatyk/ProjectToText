@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract changelog section
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          export VERSION TAG
+          # Prefer matching version section; fall back to Unreleased
+          python3 - <<'PY' > /tmp/release-notes.md
+          import pathlib, re, os
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          version = os.environ.get("VERSION", "")
+          tag = os.environ.get("TAG", version)
+          patterns = [
+              rf"## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## |\Z)",
+              r"## \[Unreleased\][^\n]*\n(.*?)(?=\n## |\Z)",
+          ]
+          body = ""
+          for pat in patterns:
+              m = re.search(pat, text, re.S)
+              if m and m.group(1).strip():
+                  body = m.group(1).strip()
+                  break
+          if not body:
+              body = f"Release {tag} of ProjectToText (ptt)."
+          print(body)
+          PY
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ProjectToText ${{ github.ref_name }}
+          body_path: /tmp/release-notes.md
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

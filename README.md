@@ -40,17 +40,7 @@ Inspired by tools like [Repomix](https://github.com/yamadashy/repomix), focused 
 
 > Open a project → curate selection → **Copy packed** into your LLM.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  ptt  ProjectToText     ~/code/my-app      [Copy packed]    │
-├──────────────┬──────────────────────────────────────────────┤
-│ ☑ src/       │  <project_context>                           │
-│   ☑ main.rs  │    <files>…                                  │
-│   ☑ lib.rs   │  </project_context>                          │
-│ ☐ tests/     │                                              │
-│ ☐ README.md  │  ~12k tokens · XML                           │
-└──────────────┴──────────────────────────────────────────────┘
-```
+![ProjectToText UI — file tree, smart selection, XML packed output](docs/screenshot.svg)
 
 ---
 
@@ -136,18 +126,21 @@ fixtures/large/**
 
 ```
 ProjectToText/
-├── src/                 # Rust (Tauri backend + pure core)
-│   ├── main.rs          # Commands: scan, generate, save, clipboard
+├── src/
+│   ├── lib.rs           # Pure core library crate (`ptt`)
+│   ├── main.rs          # Tauri binary: scan, generate, save, clipboard
 │   └── core/
 │       ├── walker.rs    # git ls-files / ignore + .pttignore
 │       └── output.rs    # XML / MD / JSON / plain writers
 ├── ui/                  # React + Vite + TypeScript frontend
+├── docs/                # Architecture notes + assets
 ├── capabilities/        # Tauri v2 ACL
 ├── icons/               # App icons
 └── tauri.conf.json
 ```
 
-Core modules (`walker`, `output`) are designed to stay **testable without the UI**.
+Core modules (`walker`, `output`) live in the **library crate** and stay unit-testable without the GUI.  
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full diagram.
 
 ---
 

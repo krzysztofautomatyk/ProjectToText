@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Library crate layout (`src/lib.rs`) so walker/output are reusable without the UI
+- Architecture doc + polished UI screenshot asset for README
+- Tag-driven GitHub Release workflow (`v*.*.*`)
 - Comprehensive unit tests for walker and output modules
 - Dual license files (`LICENSE-MIT`, `LICENSE-APACHE`) and project docs
 - GitHub Actions CI (Rust tests + UI build across macOS/Linux/Windows)

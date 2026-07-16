@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="640" viewBox="0 0 1120 640" role="img" aria-label="ProjectToText desktop UI mockup">
+  <defs>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1f883d"/>
+      <stop offset="100%" stop-color="#1f6feb"/>
+    </linearGradient>
+    <filter id="soft" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="16" flood-color="#010409" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <rect width="1120" height="640" fill="#0d1117"/>
+  <rect x="24" y="24" width="1072" height="592" rx="12" fill="#161b22" stroke="#30363d" filter="url(#soft)"/>
+
+  <!-- title bar -->
+  <rect x="24" y="24" width="1072" height="48" rx="12" fill="#161b22"/>
+  <rect x="24" y="60" width="1072" height="1" fill="#30363d"/>
+  <circle cx="52" cy="48" r="5" fill="#ff5f57"/>
+  <circle cx="70" cy="48" r="5" fill="#febc2e"/>
+  <circle cx="88" cy="48" r="5" fill="#28c840"/>
+  <rect x="120" y="36" width="28" height="28" rx="7" fill="url(#brand)"/>
+  <text x="128" y="54" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" font-weight="800" fill="#fff">pt</text>
+  <text x="158" y="47" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13" font-weight="650" fill="#e6edf3">ProjectToText</text>
+  <text x="158" y="60" font-family="ui-sans-serif, system-ui, sans-serif" font-size="9" fill="#6e7681">Pack projects for LLMs</text>
+  <rect x="340" y="36" width="280" height="24" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <text x="354" y="52" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#8b949e">~/code/my-app</text>
+  <rect x="900" y="36" width="110" height="26" rx="6" fill="#238636"/>
+  <text x="918" y="53" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600" fill="#fff">Copy packed</text>
+  <rect x="1020" y="36" width="50" height="26" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="1034" y="53" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="#c9d1d9">Save</text>
+
+  <!-- toolbar -->
+  <rect x="24" y="72" width="1072" height="36" fill="#161b22"/>
+  <rect x="24" y="107" width="1072" height="1" fill="#30363d"/>
+  <rect x="40" y="80" width="180" height="22" rx="6" fill="#0d1117" stroke="#30363d"/>
+  <text x="52" y="95" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="#6e7681">Filter files…</text>
+  <text x="240" y="95" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="#8b949e">Source  ·  + Docs  ·  All clean</text>
+  <text x="980" y="95" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" fill="#8b949e"><tspan fill="#e6edf3" font-weight="650">12</tspan> / 48 files</text>
+
+  <!-- tree -->
+  <rect x="24" y="108" width="320" height="480" fill="#161b22"/>
+  <rect x="343" y="108" width="1" height="480" fill="#30363d"/>
+  <text x="40" y="130" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" font-weight="650" fill="#8b949e" letter-spacing="0.6">FILES</text>
+  <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#c9d1d9">
+    <rect x="36" y="142" width="292" height="26" rx="4" fill="#1f2a3a"/>
+    <text x="48" y="159">▸ src/ <tspan fill="#6e7681" font-size="10">8/10</tspan></text>
+    <text x="64" y="185" fill="#58a6ff">☑ main.rs</text>
+    <text x="64" y="209" fill="#58a6ff">☑ lib.rs</text>
+    <text x="64" y="233" fill="#58a6ff">☑ walker.rs</text>
+    <text x="48" y="261">▸ ui/</text>
+    <text x="64" y="285">☐ node_modules/</text>
+    <text x="48" y="313" fill="#58a6ff">☑ README.md</text>
+    <text x="48" y="337">☐ Cargo.lock</text>
+    <text x="48" y="361" fill="#58a6ff">☑ Cargo.toml</text>
+  </g>
+
+  <!-- preview -->
+  <rect x="344" y="108" width="752" height="36" fill="#161b22"/>
+  <rect x="344" y="143" width="752" height="1" fill="#30363d"/>
+  <text x="360" y="131" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600" fill="#e6edf3">Packed output</text>
+  <text x="480" y="131" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#8b949e">File list</text>
+  <rect x="920" y="116" width="70" height="20" rx="4" fill="#21262d" stroke="#30363d"/>
+  <text x="934" y="130" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" fill="#c9d1d9">XML ▾</text>
+  <rect x="1000" y="116" width="80" height="20" rx="10" fill="rgba(63,185,80,0.12)" stroke="rgba(63,185,80,0.25)"/>
+  <text x="1012" y="130" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" font-weight="600" fill="#3fb950">~12k tokens</text>
+
+  <rect x="356" y="156" width="728" height="400" rx="8" fill="#0d1117" stroke="#30363d"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#8b949e">
+    <text x="372" y="180" fill="#7ee787">&lt;project_context&gt;</text>
+    <text x="384" y="200">&lt;source&gt;ptt · my-app&lt;/source&gt;</text>
+    <text x="384" y="220">&lt;directory_structure&gt;</text>
+    <text x="400" y="240">src/main.rs</text>
+    <text x="400" y="260">src/lib.rs</text>
+    <text x="400" y="280">src/core/walker.rs</text>
+    <text x="384" y="300">&lt;/directory_structure&gt;</text>
+    <text x="384" y="320">&lt;files&gt;</text>
+    <text x="400" y="340" fill="#79c0ff">&lt;file path="src/main.rs"&gt;</text>
+    <text x="416" y="360">&lt;![CDATA[</text>
+    <text x="432" y="380" fill="#c9d1d9">fn main() { … }</text>
+    <text x="416" y="400">]]&gt;</text>
+    <text x="400" y="420">&lt;/file&gt;</text>
+    <text x="384" y="440">…</text>
+    <text x="372" y="470" fill="#7ee787">&lt;/project_context&gt;</text>
+  </g>
+
+  <!-- status -->
+  <rect x="24" y="588" width="1072" height="28" rx="0" fill="#161b22"/>
+  <rect x="24" y="588" width="1072" height="1" fill="#30363d"/>
+  <text x="40" y="607" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6e7681">my-app · ~/code/my-app</text>
+  <text x="820" y="607" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10" fill="#8b949e">Selected: <tspan fill="#e6edf3" font-weight="650">12</tspan>  |  ~<tspan fill="#58a6ff" font-weight="650">12k</tspan> tokens  |  xml</text>
+</svg>
