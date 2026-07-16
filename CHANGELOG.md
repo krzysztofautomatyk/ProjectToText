@@ -11,11 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Comprehensive unit tests for walker and output modules
 - Dual license files (`LICENSE-MIT`, `LICENSE-APACHE`) and project docs
-- GitHub Actions CI (Rust tests + UI build)
+- GitHub Actions CI (Rust tests + UI build across macOS/Linux/Windows)
 - Real system clipboard fallback via `arboard`
 - Save dialog default filename support
 - CSP configuration for Tauri webview
-- Bundle metadata and icons configuration
+- Bundle metadata and multi-size app icons (PNG / ICO / ICNS)
 
 ### Fixed
 
@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Git walk path only used inside actual git work trees
 - `.gitignore` no longer drops `Cargo.lock` for this binary app
 - `tauri.conf.json` frontend npm commands point at `ui/`
+- Empty/corrupt app icons that broke Windows Tauri builds
+- Linux CI package conflict (`libappindicator` vs Ayatana)
 
 ### Changed
 

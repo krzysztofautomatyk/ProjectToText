@@ -25,7 +25,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -34,9 +34,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # Prefer Ayatana (Ubuntu 24.04). Do not install both appindicator stacks.
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
             librsvg2-dev \
             patchelf \
             libgtk-3-dev \
@@ -44,7 +44,6 @@ jobs:
 
       - name: Cargo fmt check
         run: cargo fmt --all -- --check
-        continue-on-error: true
 
       - name: Cargo test
         run: cargo test --all-targets
