@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Browser mode: folder picker via File System Access API / `webkitdirectory` when not running under Tauri
 - In-app file preview with syntax highlighting (click a file in the tree)
 - Open file with system default app, VS Code / common editors, or choose program
 - Context menu on files: preview, open with, toggle pack selection

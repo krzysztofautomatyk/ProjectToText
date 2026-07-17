@@ -36,7 +36,20 @@ import {
   CheckCircle2,
 } from 'lucide-react';
 import FileViewer, { type FilePreviewData } from './FileViewer';
+import {
+  downloadText,
+  generateBrowserOutput,
+  pickDirectoryWithInput,
+  pickDirectoryWithPicker,
+  readBrowserFilePreview,
+  scanDirectoryHandle,
+  scanFileList,
+  type BrowserProject,
+} from './browserFs';
+import { isTauriRuntime } from './tauriEnv';
 import './index.css';
+
+const IN_TAURI = isTauriRuntime();
 
 /* ─── Types ──────────────────────────────────────────── */
 
@@ -758,6 +771,9 @@ function App() {
   const genSeq = useRef(0);
   const hasLoadedOnce = useRef(false);
   const generateTimer = useRef<number | null>(null);
+  /** Browser-mode project (files in memory). Null in Tauri desktop mode. */
+  const browserProjectRef = useRef<BrowserProject | null>(null);
+  const [browserMode, setBrowserMode] = useState(!IN_TAURI);
 
   const selectedSet = useMemo(
     () => new Set(nodes.filter((n) => n.selected && !n.is_dir).map((n) => n.path)),
@@ -813,16 +829,22 @@ function App() {
       const seq = ++genSeq.current;
       setGenerating(true);
       try {
-        const opts: PackOptions = {
-          format: fmt,
-          include_summary: true,
-          relative_paths: true,
-        };
-        const result = await invoke<string>('generate_output', {
-          path: rootPath,
-          selectedPaths: sel,
-          options: opts,
-        });
+        let result: string;
+        const browserProject = browserProjectRef.current;
+        if (browserProject) {
+          result = await generateBrowserOutput(browserProject, sel, fmt);
+        } else {
+          const opts: PackOptions = {
+            format: fmt,
+            include_summary: true,
+            relative_paths: true,
+          };
+          result = await invoke<string>('generate_output', {
+            path: rootPath,
+            selectedPaths: sel,
+            options: opts,
+          });
+        }
         if (seq !== genSeq.current) return;
         setOutput(result);
         setStats({ files: sel.length, tokens: estimateTokens(result) });
@@ -863,37 +885,57 @@ function App() {
     [generateNow],
   );
 
+  const applyScanResult = useCallback(
+    async (
+      result: FileNode[],
+      pathLabel: string,
+      nextPreset: SelectionPreset,
+      fromBrowser: boolean,
+    ) => {
+      const withSelection = applyPreset(result, nextPreset);
+      setNodes(withSelection);
+      setCurrentPath(pathLabel);
+      setBrowserMode(fromBrowser);
+      setFilterText('');
+      setFilePreview(null);
+      setPreviewRelPath(null);
+      setPreviewError(null);
+      setContextMenu(null);
+
+      const topDirs = withSelection
+        .filter((n) => n.is_dir && !n.path.includes('/'))
+        .map((n) => n.path);
+      const rootName = pathLabel.split(/[/\\]/).filter(Boolean).pop() ?? '';
+      const firstLevel = withSelection
+        .filter((n) => {
+          if (!n.is_dir) return false;
+          const parts = n.path.split(/[/\\]/).filter(Boolean);
+          return parts.length <= 2 || n.path.endsWith(rootName);
+        })
+        .map((n) => n.path)
+        .slice(0, 40);
+
+      setExpanded(new Set([...topDirs, ...firstLevel].slice(0, 50)));
+      await generateNow(withSelection, pathLabel, format);
+    },
+    [format, generateNow],
+  );
+
   const scan = useCallback(
     async (path: string, nextPreset: SelectionPreset = preset) => {
+      if (!IN_TAURI || browserProjectRef.current) {
+        pushToast(
+          'info',
+          'In browser mode use Open to pick the folder again (native path refresh needs the desktop app).',
+        );
+        return;
+      }
       setScanning(true);
       setGenerating(true);
       try {
+        browserProjectRef.current = null;
         const result = await invoke<FileNode[]>('scan_folder', { path });
-        const withSelection = applyPreset(result, nextPreset);
-        setNodes(withSelection);
-        setCurrentPath(path);
-        setFilterText('');
-        setFilePreview(null);
-        setPreviewRelPath(null);
-        setPreviewError(null);
-        setContextMenu(null);
-
-        // Expand top-level dirs by default
-        const topDirs = withSelection.filter((n) => n.is_dir && !n.path.includes('/')).map((n) => n.path);
-        // Also expand first level of nested if paths use full paths
-        const rootName = path.split(/[/\\]/).filter(Boolean).pop() ?? '';
-        const firstLevel = withSelection
-          .filter((n) => {
-            if (!n.is_dir) return false;
-            const parts = n.path.split(/[/\\]/).filter(Boolean);
-            // relative-ish depth 1–2
-            return parts.length <= 2 || n.path.endsWith(rootName);
-          })
-          .map((n) => n.path)
-          .slice(0, 40);
-
-        setExpanded(new Set([...topDirs, ...firstLevel].slice(0, 50)));
-        await generateNow(withSelection, path, format);
+        await applyScanResult(result, path, nextPreset, false);
       } catch (e) {
         console.error(e);
         pushToast('error', 'Failed to scan folder');
@@ -902,10 +944,60 @@ function App() {
         setScanning(false);
       }
     },
-    [preset, format, generateNow, pushToast],
+    [preset, applyScanResult, pushToast],
   );
 
+  const openFolderBrowser = useCallback(async () => {
+    setScanning(true);
+    setGenerating(true);
+    try {
+      // Prefer modern directory picker (Chrome, Edge, Opera)
+      try {
+        const handle = await pickDirectoryWithPicker();
+        const { nodes, project } = await scanDirectoryHandle(handle);
+        browserProjectRef.current = project;
+        await applyScanResult(nodes, project.rootName, preset, true);
+        pushToast('info', 'Browser mode — packing works here; Open with apps needs desktop app');
+        return;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        // User cancelled picker
+        if (msg.includes('abort') || msg.includes('AbortError') || msg.includes('canceled')) {
+          return;
+        }
+        if (msg !== 'SHOW_DIRECTORY_PICKER_UNSUPPORTED') {
+          // Permission denied etc. — try input fallback
+          console.warn('showDirectoryPicker failed, trying input fallback', e);
+        }
+      }
+
+      // Fallback: <input webkitdirectory> (Firefox / Safari / older browsers)
+      pushToast('info', 'Select a folder in the file dialog…');
+      const list = await pickDirectoryWithInput();
+      const { nodes, project } = scanFileList(list);
+      browserProjectRef.current = project;
+      await applyScanResult(nodes, project.rootName, preset, true);
+      pushToast('info', 'Browser mode — packing works; use cargo tauri dev for full desktop features');
+    } catch (e) {
+      console.error(e);
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('No folder')) return;
+      pushToast(
+        'error',
+        'Could not open folder in the browser. Prefer Chrome/Edge, or run: cargo tauri dev',
+      );
+      setGenerating(false);
+    } finally {
+      setScanning(false);
+    }
+  }, [applyScanResult, preset, pushToast]);
+
   const openFolder = useCallback(async () => {
+    // Desktop (Tauri): native dialog. Browser: File System Access / webkitdirectory.
+    if (!IN_TAURI) {
+      await openFolderBrowser();
+      return;
+    }
     try {
       const selected = await openDialog({
         directory: true,
@@ -914,13 +1006,18 @@ function App() {
       });
       if (selected) {
         const path = Array.isArray(selected) ? selected[0] : selected;
-        if (path) await scan(path);
+        if (path) {
+          browserProjectRef.current = null;
+          await scan(path);
+        }
       }
     } catch (e) {
       console.error(e);
-      pushToast('error', 'Failed to open folder');
+      // If Tauri dialog fails (misconfigured), fall back to browser picker inside webview
+      pushToast('info', 'Native dialog failed — trying browser folder picker…');
+      await openFolderBrowser();
     }
-  }, [scan, pushToast]);
+  }, [scan, openFolderBrowser, pushToast]);
 
   /* ─── File preview / open with ─────────────────────── */
 
@@ -933,12 +1030,21 @@ function App() {
       setPreviewLoading(true);
       setPreviewError(null);
       try {
-        const result = await invoke<FilePreviewData>('read_file_preview', {
-          root: currentPath,
-          relativePath: normalizePath(relPath),
-          maxBytes: 512 * 1024,
-        });
-        setFilePreview(result);
+        const browserProject = browserProjectRef.current;
+        if (browserProject) {
+          const result = await readBrowserFilePreview(
+            browserProject,
+            normalizePath(relPath),
+          );
+          setFilePreview(result);
+        } else {
+          const result = await invoke<FilePreviewData>('read_file_preview', {
+            root: currentPath,
+            relativePath: normalizePath(relPath),
+            maxBytes: 512 * 1024,
+          });
+          setFilePreview(result);
+        }
       } catch (e) {
         console.error(e);
         setFilePreview(null);
@@ -956,6 +1062,13 @@ function App() {
       const path = relPath ?? previewRelPath;
       if (!currentPath || !path) return;
       setContextMenu(null);
+      if (browserProjectRef.current || !IN_TAURI) {
+        pushToast(
+          'info',
+          'Opening with system apps requires the desktop app: cargo tauri dev',
+        );
+        return;
+      }
       try {
         await invoke('open_in_default_app', {
           root: currentPath,
@@ -975,6 +1088,13 @@ function App() {
       const path = relPath ?? previewRelPath;
       if (!currentPath || !path) return;
       setContextMenu(null);
+      if (browserProjectRef.current || !IN_TAURI) {
+        pushToast(
+          'info',
+          `Open with ${app} needs the desktop app (cargo tauri dev)`,
+        );
+        return;
+      }
       try {
         await invoke('open_with_app', {
           root: currentPath,
@@ -1000,6 +1120,13 @@ function App() {
       const path = relPath ?? previewRelPath;
       if (!currentPath || !path) return;
       setContextMenu(null);
+      if (browserProjectRef.current || !IN_TAURI) {
+        pushToast(
+          'info',
+          'Choose program requires the desktop app: cargo tauri dev',
+        );
+        return;
+      }
       try {
         const opened = await invoke<boolean>('pick_app_and_open', {
           root: currentPath,
@@ -1279,6 +1406,11 @@ function App() {
           : format === 'json'
             ? 'project.json'
             : 'project.txt';
+    if (browserProjectRef.current || !IN_TAURI) {
+      downloadText(name, output);
+      pushToast('success', `Downloaded ${name}`);
+      return;
+    }
     try {
       const saved = await invoke<boolean>('save_to_file', {
         text: output,
@@ -1287,7 +1419,13 @@ function App() {
       if (saved) pushToast('success', 'Saved packed output');
     } catch (e) {
       console.error(e);
-      pushToast('error', 'Failed to save file');
+      // Last resort: download in webview
+      try {
+        downloadText(name, output);
+        pushToast('success', `Downloaded ${name}`);
+      } catch {
+        pushToast('error', 'Failed to save file');
+      }
     }
   }, [output, format, pushToast]);
 
@@ -1566,6 +1704,17 @@ function App() {
           </div>
         </div>
       </header>
+
+      {browserMode && (
+        <div className="browser-mode-banner" role="status">
+          <Info size={13} aria-hidden />
+          <span>
+            <strong>Browser mode</strong> — folder dialog works here, but for native
+            dialogs and “Open with VS Code / Notepad++” run{' '}
+            <code>cargo tauri dev</code> (desktop app), not only the Vite URL.
+          </span>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div className="toolbar">

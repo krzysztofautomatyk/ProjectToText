@@ -81,6 +81,10 @@ cargo install tauri-cli --version "^2"
 cargo tauri dev
 ```
 
+> **Important:** Open the app with `cargo tauri dev` (desktop window).  
+> Opening only `http://localhost:5173` in a browser works for pack/preview (browser folder picker), but native dialogs and “Open with VS Code” need the Tauri desktop shell.
+
+
 ### Build release
 
 ```bash
