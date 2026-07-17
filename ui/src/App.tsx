@@ -39,11 +39,13 @@ import FileViewer, { type FilePreviewData } from './FileViewer';
 import {
   downloadText,
   generateBrowserOutput,
+  isCancelledError,
   pickDirectoryWithInput,
   pickDirectoryWithPicker,
   readBrowserFilePreview,
   scanDirectoryHandle,
   scanFileList,
+  UserCancelledError,
   type BrowserProject,
 } from './browserFs';
 import { isTauriRuntime } from './tauriEnv';
@@ -901,6 +903,7 @@ function App() {
       setPreviewRelPath(null);
       setPreviewError(null);
       setContextMenu(null);
+      hasLoadedOnce.current = false;
 
       const topDirs = withSelection
         .filter((n) => n.is_dir && !n.path.includes('/'))
@@ -916,9 +919,30 @@ function App() {
         .slice(0, 40);
 
       setExpanded(new Set([...topDirs, ...firstLevel].slice(0, 50)));
+
+      const fileCount = withSelection.filter((n) => !n.is_dir).length;
+      const selectedCountLocal = withSelection.filter((n) => n.selected && !n.is_dir).length;
+
+      if (fileCount === 0) {
+        setOutput('');
+        setStats({ files: 0, tokens: 0 });
+        setGenerating(false);
+        pushToast(
+          'info',
+          'Folder opened but no files found (empty or only ignored folders like node_modules/bin/obj).',
+        );
+        return;
+      }
+
+      pushToast(
+        'success',
+        `Loaded ${fileCount} files · ${selectedCountLocal} selected (${nextPreset})`,
+      );
+
+      // Pack after tree is visible
       await generateNow(withSelection, pathLabel, format);
     },
-    [format, generateNow],
+    [format, generateNow, pushToast],
   );
 
   const scan = useCallback(
@@ -931,14 +955,15 @@ function App() {
         return;
       }
       setScanning(true);
-      setGenerating(true);
+      setGenerating(false);
       try {
         browserProjectRef.current = null;
         const result = await invoke<FileNode[]>('scan_folder', { path });
         await applyScanResult(result, path, nextPreset, false);
       } catch (e) {
         console.error(e);
-        pushToast('error', 'Failed to scan folder');
+        const msg = e instanceof Error ? e.message : String(e);
+        pushToast('error', `Failed to scan folder: ${msg}`);
         setGenerating(false);
       } finally {
         setScanning(false);
@@ -949,42 +974,58 @@ function App() {
 
   const openFolderBrowser = useCallback(async () => {
     setScanning(true);
-    setGenerating(true);
+    setGenerating(false);
+    setOutput('');
     try {
+      let nodes: FileNode[] | null = null;
+      let project: BrowserProject | null = null;
+
       // Prefer modern directory picker (Chrome, Edge, Opera)
       try {
         const handle = await pickDirectoryWithPicker();
-        const { nodes, project } = await scanDirectoryHandle(handle);
-        browserProjectRef.current = project;
-        await applyScanResult(nodes, project.rootName, preset, true);
-        pushToast('info', 'Browser mode — packing works here; Open with apps needs desktop app');
-        return;
+        setScanning(true);
+        pushToast('info', `Reading folder “${handle.name}”…`);
+        const scanned = await scanDirectoryHandle(handle);
+        nodes = scanned.nodes;
+        project = scanned.project;
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        // User cancelled picker
-        if (msg.includes('abort') || msg.includes('AbortError') || msg.includes('canceled')) {
+        if (isCancelledError(e) || e instanceof UserCancelledError) {
           return;
         }
+        const msg = e instanceof Error ? e.message : String(e);
         if (msg !== 'SHOW_DIRECTORY_PICKER_UNSUPPORTED') {
-          // Permission denied etc. — try input fallback
           console.warn('showDirectoryPicker failed, trying input fallback', e);
+        }
+
+        // Fallback: <input webkitdirectory>
+        try {
+          pushToast('info', 'Select a folder in the file dialog…');
+          const list = await pickDirectoryWithInput();
+          const scanned = scanFileList(list);
+          nodes = scanned.nodes;
+          project = scanned.project;
+        } catch (e2) {
+          if (isCancelledError(e2) || e2 instanceof UserCancelledError) return;
+          throw e2;
         }
       }
 
-      // Fallback: <input webkitdirectory> (Firefox / Safari / older browsers)
-      pushToast('info', 'Select a folder in the file dialog…');
-      const list = await pickDirectoryWithInput();
-      const { nodes, project } = scanFileList(list);
+      if (!nodes || !project) {
+        pushToast('error', 'No folder data received');
+        return;
+      }
+
       browserProjectRef.current = project;
+      // End "scanning" before packing so the tree can paint
+      setScanning(false);
       await applyScanResult(nodes, project.rootName, preset, true);
-      pushToast('info', 'Browser mode — packing works; use cargo tauri dev for full desktop features');
     } catch (e) {
       console.error(e);
+      if (isCancelledError(e) || e instanceof UserCancelledError) return;
       const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes('No folder')) return;
       pushToast(
         'error',
-        'Could not open folder in the browser. Prefer Chrome/Edge, or run: cargo tauri dev',
+        msg || 'Could not open folder in the browser. Prefer Chrome/Edge, or run: cargo tauri dev',
       );
       setGenerating(false);
     } finally {
@@ -1004,18 +1045,31 @@ function App() {
         multiple: false,
         title: 'Select folder to pack',
       });
-      if (selected) {
-        const path = Array.isArray(selected) ? selected[0] : selected;
-        if (path) {
-          browserProjectRef.current = null;
-          await scan(path);
-        }
+      if (!selected) return;
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      // Guard against unexpected object returns from future plugin versions
+      const pathStr =
+        typeof path === 'string'
+          ? path
+          : path && typeof path === 'object' && 'path' in path
+            ? String((path as { path: string }).path)
+            : String(path ?? '');
+      if (!pathStr) {
+        pushToast('error', 'Dialog returned an empty path');
+        return;
       }
+      browserProjectRef.current = null;
+      await scan(pathStr);
     } catch (e) {
       console.error(e);
-      // If Tauri dialog fails (misconfigured), fall back to browser picker inside webview
-      pushToast('info', 'Native dialog failed — trying browser folder picker…');
-      await openFolderBrowser();
+      const msg = e instanceof Error ? e.message : String(e);
+      pushToast('error', `Open folder failed: ${msg}`);
+      // Fallback: browser picker inside webview (still useful)
+      try {
+        await openFolderBrowser();
+      } catch {
+        /* already toasted */
+      }
     }
   }, [scan, openFolderBrowser, pushToast]);
 
