@@ -48,28 +48,34 @@ Inspired by tools like [Repomix](https://github.com/yamadashy/repomix), focused 
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (1.77+)
-- [Node.js](https://nodejs.org/) 20+
-- Platform deps for [Tauri](https://v2.tauri.app/start/prerequisites/)
-- Optional but recommended: `git` on `PATH` (best ignore fidelity)
+| Tool | Why | Install |
+|------|-----|---------|
+| **Rust + Cargo** (1.77+) | Builds the desktop app (`cargo` is **not** preinstalled on Windows) | https://rustup.rs/ — then **restart the terminal** |
+| **Node.js** 20+ | Frontend (`npm`) | https://nodejs.org/ (LTS) |
+| **Git** | Clone + best ignore fidelity | https://git-scm.com/ |
+| **Tauri OS deps** | WebView + linker | https://v2.tauri.app/start/prerequisites/ |
+
+**Windows note:** if `cargo` is “not recognized”, install Rust via rustup, ensure `%USERPROFILE%\.cargo\bin` is on PATH, and open a **new** PowerShell/CMD. You also need Visual Studio Build Tools (“Desktop development with C++”) and WebView2. Full walkthrough: [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Verify before building:
+
+```bash
+rustc -V
+cargo -V
+node -v
+npm -v
+```
 
 ### Develop
 
 ```bash
-# Frontend deps
+# 1) Frontend deps
 npm --prefix ui install
 
-# Run the desktop app (starts Vite + Tauri)
-cargo tauri dev
-# or, if the Tauri CLI is installed globally:
-# npm --prefix ui run dev   # in one terminal
-# cargo run                 # requires frontend dist / devUrl per tauri.conf.json
-```
-
-Install the Tauri CLI if needed:
-
-```bash
+# 2) Tauri CLI (once per machine)
 cargo install tauri-cli --version "^2"
+
+# 3) Run the desktop app (from repo root)
 cargo tauri dev
 ```
 
@@ -80,7 +86,7 @@ npm --prefix ui install
 cargo tauri build
 ```
 
-Artifacts land under `target/release/bundle/` (`.dmg` / `.app` on macOS, etc.).
+Artifacts land under `target/release/bundle/` (`.msi` / `.exe` on Windows, `.dmg` / `.app` on macOS, etc.).
 
 ### Tests
 

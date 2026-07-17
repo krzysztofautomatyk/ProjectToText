@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Output API accepts structured `WriteOptions`
 - Clearer errors when scan/generate targets a missing path
 - Cargo package metadata points at `krzysztofautomatyk/ProjectToText`
+- CONTRIBUTING/README: explicit Windows setup for Rust/`cargo`, MSVC, WebView2
 
 ## [0.1.0] - 2026-07-12
 
