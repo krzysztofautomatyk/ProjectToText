@@ -7,6 +7,7 @@ import {
   type ChangeEvent,
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -15,7 +16,9 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import {
   Check,
   Copy,
+  ExternalLink,
   File,
+  FileCode2,
   FileText,
   Folder,
   FolderOpen,
@@ -32,6 +35,7 @@ import {
   AlertCircle,
   CheckCircle2,
 } from 'lucide-react';
+import FileViewer, { type FilePreviewData } from './FileViewer';
 import './index.css';
 
 /* ─── Types ──────────────────────────────────────────── */
@@ -61,10 +65,17 @@ interface TreeNode {
 }
 
 type OutputFormat = 'xml' | 'markdown' | 'json' | 'plain';
-type ViewMode = 'packed' | 'list';
+type ViewMode = 'packed' | 'list' | 'file';
 type ListFormat = 'tree' | 'paths';
 type SelectionPreset = 'source' | 'docs' | 'all';
 type ToastKind = 'success' | 'error' | 'info';
+
+interface ContextMenuState {
+  x: number;
+  y: number;
+  path: string;
+  isDir: boolean;
+}
 
 interface ToastItem {
   id: number;
@@ -93,6 +104,7 @@ const JUNK_DIRS = [
 ];
 
 const SOURCE_EXTS = [
+  // Web / JS
   '.ts',
   '.tsx',
   '.js',
@@ -101,18 +113,38 @@ const SOURCE_EXTS = [
   '.cjs',
   '.vue',
   '.svelte',
+  // Systems / general
   '.rs',
   '.go',
   '.py',
   '.java',
-  '.cs',
   '.cpp',
   '.c',
   '.h',
   '.hpp',
+  // .NET / XAML / WPF / MAUI / Blazor
+  '.cs',
+  '.fs',
+  '.fsx',
+  '.fsi',
+  '.vb',
+  '.xaml',
+  '.axaml',
+  '.razor',
+  '.cshtml',
+  '.csproj',
+  '.fsproj',
+  '.vbproj',
+  '.sln',
+  '.props',
+  '.targets',
+  '.resx',
+  '.editorconfig',
+  // Config / markup / styles
   '.md',
   '.txt',
   '.json',
+  '.jsonc',
   '.toml',
   '.yaml',
   '.yml',
@@ -122,10 +154,22 @@ const SOURCE_EXTS = [
   '.html',
   '.sql',
   '.sh',
+  '.ps1',
   '.rb',
   '.kt',
   '.swift',
 ];
+
+/** Extensions that are source even when nested (e.g. MainWindow.xaml.cs). */
+function isSourcePath(path: string): boolean {
+  const lower = path.toLowerCase().replace(/\\/g, '/');
+  if (SOURCE_EXTS.some((ext) => lower.endsWith(ext))) return true;
+  // Double extensions used heavily in .NET
+  if (lower.endsWith('.xaml.cs') || lower.endsWith('.razor.cs') || lower.endsWith('.designer.cs')) {
+    return true;
+  }
+  return false;
+}
 
 const DOC_EXTS = ['.md', '.txt', '.rst', '.adoc'];
 
@@ -230,12 +274,10 @@ function applyPreset(nodes: FileNode[], preset: SelectionPreset): FileNode[] {
     }
     if (preset === 'docs') {
       const isDoc = DOC_EXTS.some((ext) => lower.endsWith(ext));
-      const isSource = SOURCE_EXTS.some((ext) => lower.endsWith(ext));
-      return { ...n, selected: (isSource || isDoc) && !junk };
+      return { ...n, selected: (isSourcePath(n.path) || isDoc) && !junk };
     }
-    // source (default)
-    const isSource = SOURCE_EXTS.some((ext) => lower.endsWith(ext));
-    return { ...n, selected: isSource && !junk };
+    // source (default) — includes .xaml, .csproj, Blazor, etc.
+    return { ...n, selected: isSourcePath(n.path) && !junk };
   });
 }
 
@@ -493,7 +535,10 @@ function TreeItem({
   onToggleExpand,
   onToggleSelect,
   onFocusPath,
+  onOpenFile,
+  onContextMenu,
   focusedPath,
+  previewPath,
 }: {
   node: TreeNode;
   depth: number;
@@ -503,7 +548,10 @@ function TreeItem({
   onToggleExpand: (path: string) => void;
   onToggleSelect: (path: string, isDir: boolean) => void;
   onFocusPath: (path: string) => void;
+  onOpenFile: (path: string) => void;
+  onContextMenu: (e: ReactMouseEvent, path: string, isDir: boolean) => void;
   focusedPath: string | null;
+  previewPath: string | null;
 }) {
   const checkRef = useRef<HTMLInputElement>(null);
   const hasChildren = node.children.length > 0;
@@ -520,6 +568,7 @@ function TreeItem({
     ? subtree.allSelected && subtree.total > 0
     : selectedSet.has(node.path);
   const isPartial = node.isDir && subtree.partial;
+  const isPreviewing = !node.isDir && previewPath === node.path;
 
   useEffect(() => {
     if (checkRef.current) {
@@ -530,7 +579,7 @@ function TreeItem({
   const handleRowClick = () => {
     onFocusPath(node.path);
     if (hasChildren) onToggleExpand(node.path);
-    else onToggleSelect(node.path, false);
+    else onOpenFile(node.path);
   };
 
   const handleKeyDown = (e: ReactKeyboardEvent) => {
@@ -558,12 +607,14 @@ function TreeItem({
           'tree-item',
           isSelected && !isPartial ? 'is-selected' : '',
           isPartial ? 'is-partial' : '',
+          isPreviewing ? 'is-previewing' : '',
           matchesFilter ? 'is-filtered-match' : '',
         ]
           .filter(Boolean)
           .join(' ')}
         style={{ paddingLeft: `${depth * 14 + 4}px` } as CSSProperties}
         onClick={handleRowClick}
+        onContextMenu={(e) => onContextMenu(e, node.path, node.isDir)}
         onKeyDown={handleKeyDown}
         tabIndex={0}
         role="treeitem"
@@ -651,7 +702,10 @@ function TreeItem({
               onToggleExpand={onToggleExpand}
               onToggleSelect={onToggleSelect}
               onFocusPath={onFocusPath}
+              onOpenFile={onOpenFile}
+              onContextMenu={onContextMenu}
               focusedPath={focusedPath}
+              previewPath={previewPath}
             />
           ))}
         </div>
@@ -675,6 +729,11 @@ function App() {
   const [filterText, setFilterText] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [preset, setPreset] = useState<SelectionPreset>('source');
+  const [filePreview, setFilePreview] = useState<FilePreviewData | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewRelPath, setPreviewRelPath] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [treeWidth, setTreeWidth] = useState(() => {
     try {
@@ -814,6 +873,10 @@ function App() {
         setNodes(withSelection);
         setCurrentPath(path);
         setFilterText('');
+        setFilePreview(null);
+        setPreviewRelPath(null);
+        setPreviewError(null);
+        setContextMenu(null);
 
         // Expand top-level dirs by default
         const topDirs = withSelection.filter((n) => n.is_dir && !n.path.includes('/')).map((n) => n.path);
@@ -858,6 +921,122 @@ function App() {
       pushToast('error', 'Failed to open folder');
     }
   }, [scan, pushToast]);
+
+  /* ─── File preview / open with ─────────────────────── */
+
+  const openFilePreview = useCallback(
+    async (relPath: string) => {
+      if (!currentPath) return;
+      setContextMenu(null);
+      setPreviewRelPath(relPath);
+      setView('file');
+      setPreviewLoading(true);
+      setPreviewError(null);
+      try {
+        const result = await invoke<FilePreviewData>('read_file_preview', {
+          root: currentPath,
+          relativePath: normalizePath(relPath),
+          maxBytes: 512 * 1024,
+        });
+        setFilePreview(result);
+      } catch (e) {
+        console.error(e);
+        setFilePreview(null);
+        setPreviewError(e instanceof Error ? e.message : String(e));
+        pushToast('error', 'Failed to load file preview');
+      } finally {
+        setPreviewLoading(false);
+      }
+    },
+    [currentPath, pushToast],
+  );
+
+  const openInDefaultApp = useCallback(
+    async (relPath?: string) => {
+      const path = relPath ?? previewRelPath;
+      if (!currentPath || !path) return;
+      setContextMenu(null);
+      try {
+        await invoke('open_in_default_app', {
+          root: currentPath,
+          relativePath: normalizePath(path),
+        });
+        pushToast('success', 'Opened in default application');
+      } catch (e) {
+        console.error(e);
+        pushToast('error', e instanceof Error ? e.message : 'Could not open file');
+      }
+    },
+    [currentPath, previewRelPath, pushToast],
+  );
+
+  const openWithApp = useCallback(
+    async (app: string, relPath?: string) => {
+      const path = relPath ?? previewRelPath;
+      if (!currentPath || !path) return;
+      setContextMenu(null);
+      try {
+        await invoke('open_with_app', {
+          root: currentPath,
+          relativePath: normalizePath(path),
+          app,
+        });
+        pushToast('success', `Opened with ${app}`);
+      } catch (e) {
+        console.error(e);
+        pushToast(
+          'error',
+          e instanceof Error
+            ? e.message
+            : `Could not open with ${app} (is it on PATH?)`,
+        );
+      }
+    },
+    [currentPath, previewRelPath, pushToast],
+  );
+
+  const pickAppAndOpen = useCallback(
+    async (relPath?: string) => {
+      const path = relPath ?? previewRelPath;
+      if (!currentPath || !path) return;
+      setContextMenu(null);
+      try {
+        const opened = await invoke<boolean>('pick_app_and_open', {
+          root: currentPath,
+          relativePath: normalizePath(path),
+        });
+        if (opened) pushToast('success', 'Opened with selected program');
+      } catch (e) {
+        console.error(e);
+        pushToast('error', e instanceof Error ? e.message : 'Could not open with selected app');
+      }
+    },
+    [currentPath, previewRelPath, pushToast],
+  );
+
+  const handleTreeContextMenu = useCallback(
+    (e: ReactMouseEvent, path: string, isDir: boolean) => {
+      e.preventDefault();
+      if (isDir) return;
+      setFocusedPath(path);
+      setContextMenu({ x: e.clientX, y: e.clientY, path, isDir });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') close();
+    };
+    window.addEventListener('click', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [contextMenu]);
 
   /* ─── Selection ────────────────────────────────────── */
 
@@ -1528,7 +1707,10 @@ function App() {
                   onToggleExpand={toggleExpand}
                   onToggleSelect={toggleSelect}
                   onFocusPath={setFocusedPath}
+                  onOpenFile={(p) => void openFilePreview(p)}
+                  onContextMenu={handleTreeContextMenu}
                   focusedPath={focusedPath}
+                  previewPath={previewRelPath}
                 />
               ))
             ) : currentPath && filterText ? (
@@ -1601,12 +1783,6 @@ function App() {
                 tabIndex={view === 'packed' ? 0 : -1}
                 className={`tab ${view === 'packed' ? 'active' : ''}`}
                 onClick={() => setView('packed')}
-                onKeyDown={(e) => {
-                  if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
-                    e.preventDefault();
-                    setView('list');
-                  }
-                }}
               >
                 <FileText size={14} /> Packed output
               </button>
@@ -1619,32 +1795,48 @@ function App() {
                 tabIndex={view === 'list' ? 0 : -1}
                 className={`tab ${view === 'list' ? 'active' : ''}`}
                 onClick={() => setView('list')}
-                onKeyDown={(e) => {
-                  if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
-                    e.preventDefault();
-                    setView('packed');
-                  }
-                }}
               >
                 <List size={14} /> File list
+              </button>
+              <button
+                type="button"
+                role="tab"
+                id="tab-file"
+                aria-controls="panel-file"
+                aria-selected={view === 'file'}
+                tabIndex={view === 'file' ? 0 : -1}
+                className={`tab ${view === 'file' ? 'active' : ''}`}
+                onClick={() => setView('file')}
+                title="In-app file preview with syntax highlighting"
+              >
+                <FileCode2 size={14} /> File
+                {previewRelPath ? (
+                  <span className="tab-file-name">
+                    {previewRelPath.split(/[/\\]/).pop()}
+                  </span>
+                ) : null}
               </button>
             </div>
 
             <div className="preview-actions">
-              <label className="sr-only" htmlFor="format-select">
-                Output format
-              </label>
-              <select
-                id="format-select"
-                className="select"
-                value={format}
-                onChange={(e) => changeFormat(e.target.value as OutputFormat)}
-              >
-                <option value="xml">XML</option>
-                <option value="markdown">Markdown</option>
-                <option value="json">JSON</option>
-                <option value="plain">Plain</option>
-              </select>
+              {view !== 'file' && (
+                <>
+                  <label className="sr-only" htmlFor="format-select">
+                    Output format
+                  </label>
+                  <select
+                    id="format-select"
+                    className="select"
+                    value={format}
+                    onChange={(e) => changeFormat(e.target.value as OutputFormat)}
+                  >
+                    <option value="xml">XML</option>
+                    <option value="markdown">Markdown</option>
+                    <option value="json">JSON</option>
+                    <option value="plain">Plain</option>
+                  </select>
+                </>
+              )}
 
               {view === 'list' && (
                 <>
@@ -1663,7 +1855,7 @@ function App() {
                 </>
               )}
 
-              {readyBadge}
+              {view !== 'file' && readyBadge}
             </div>
           </div>
 
@@ -1682,13 +1874,25 @@ function App() {
           )}
 
           <div
-            className={`preview-content${generating && output ? ' is-updating' : ''}`}
-            aria-busy={generating}
+            className={`preview-content${generating && output && view === 'packed' ? ' is-updating' : ''}${view === 'file' ? ' is-file-view' : ''}`}
+            aria-busy={generating || previewLoading}
             role="tabpanel"
-            id={view === 'packed' ? 'panel-packed' : 'panel-list'}
-            aria-labelledby={view === 'packed' ? 'tab-packed' : 'tab-list'}
+            id={
+              view === 'packed'
+                ? 'panel-packed'
+                : view === 'list'
+                  ? 'panel-list'
+                  : 'panel-file'
+            }
+            aria-labelledby={
+              view === 'packed'
+                ? 'tab-packed'
+                : view === 'list'
+                  ? 'tab-list'
+                  : 'tab-file'
+            }
           >
-            {showInitialLoading ? (
+            {showInitialLoading && view !== 'file' ? (
               <div className="loading-center">
                 <div className="title">
                   <Loader2 size={18} className="spin icon-accent" />
@@ -1700,6 +1904,16 @@ function App() {
                     : 'Applying smart source selection'}
                 </div>
               </div>
+            ) : view === 'file' ? (
+              <FileViewer
+                preview={filePreview}
+                loading={previewLoading}
+                error={previewError}
+                onOpenDefault={() => void openInDefaultApp()}
+                onOpenWithCode={() => void openWithApp('code')}
+                onOpenWithPicker={() => void pickAppAndOpen()}
+                onOpenWithCommand={(cmd) => void openWithApp(cmd)}
+              />
             ) : view === 'packed' ? (
               output ? (
                 <pre className="output-text">{output}</pre>
@@ -1710,8 +1924,10 @@ function App() {
                   </div>
                   <div className="empty-title">Nothing packed yet</div>
                   <div className="empty-desc">
-                    Select files in the tree. <strong className="text-strong">Copy packed</strong>{' '}
-                    is the main action — ready for your LLM.
+                    Select files in the tree (checkbox). Click a file name to{' '}
+                    <strong className="text-strong">preview</strong> it.
+                    <strong className="text-strong"> Copy packed</strong> is ready
+                    for your LLM.
                   </div>
                 </div>
               )
@@ -1736,6 +1952,68 @@ function App() {
           </div>
         </section>
       </div>
+
+      {contextMenu && (
+        <div
+          className="ctx-menu"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          role="menu"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => void openFilePreview(contextMenu.path)}
+          >
+            <FileCode2 size={14} /> Preview in app
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => void openInDefaultApp(contextMenu.path)}
+          >
+            <ExternalLink size={14} /> Open with default app
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => void openWithApp('code', contextMenu.path)}
+          >
+            Open with VS Code
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => void openWithApp('notepad++', contextMenu.path)}
+          >
+            Open with Notepad++
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => void pickAppAndOpen(contextMenu.path)}
+          >
+            Choose program…
+          </button>
+          <div className="ctx-sep" />
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => {
+              toggleSelect(contextMenu.path, false);
+              setContextMenu(null);
+            }}
+          >
+            Toggle pack selection
+          </button>
+        </div>
+      )}
 
       {/* Status bar */}
       <footer className="status-bar">
@@ -1887,7 +2165,19 @@ function App() {
                 <dt>
                   <span className="kbd">Space</span> / <span className="kbd">Enter</span>
                 </dt>
-                <dd>Toggle file or expand folder</dd>
+                <dd>Open file preview or expand folder</dd>
+              </div>
+              <div>
+                <dt>
+                  <span className="kbd">Right-click</span>
+                </dt>
+                <dd>Open with default app / VS Code / choose program</dd>
+              </div>
+              <div>
+                <dt>
+                  <span className="kbd">Checkbox</span>
+                </dt>
+                <dd>Include file in packed LLM output</dd>
               </div>
             </dl>
             <div className="help-theme">

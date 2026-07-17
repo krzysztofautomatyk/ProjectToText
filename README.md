@@ -31,6 +31,8 @@ Inspired by tools like [Repomix](https://github.com/yamadashy/repomix), focused 
 - **Formats**: XML (recommended for LLMs), Markdown, JSON, Plain
 - **Safety**: per-file size limit (default 2 MiB), binary detection, UTF-8 decoding with notes
 - **UI**: file tree with partial selection, filter, presets, token estimate, light/dark/system theme
+- **.NET-aware Source preset**: includes `.xaml`, `.cs`, `.csproj`, `.razor`, `.sln`, and related files
+- **File preview**: click a file for in-app syntax highlighting; right-click or toolbar to open with the system default app, VS Code, Notepad++, or pick another program
 - **Workflow**: copy packed output, copy file list (tree or paths), save to disk, drag-and-drop folder
 - **Keyboard shortcuts**: open, refresh, filter, copy, save, help (`?`)
 

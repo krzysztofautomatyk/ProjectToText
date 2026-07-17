@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- In-app file preview with syntax highlighting (click a file in the tree)
+- Open file with system default app, VS Code / common editors, or choose program
+- Context menu on files: preview, open with, toggle pack selection
+- Source preset includes .NET / XAML / Blazor / project files (`.xaml`, `.csproj`, `.razor`, …)
 - Library crate layout (`src/lib.rs`) so walker/output are reusable without the UI
 - Architecture doc + polished UI screenshot asset for README
 - Tag-driven GitHub Release workflow (`v*.*.*`)
