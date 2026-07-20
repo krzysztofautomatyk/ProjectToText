@@ -6,6 +6,12 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to release (e.g. v0.1.2). Leave empty to use the branch tip without a GitHub Release upload."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -139,8 +145,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: ProjectToText ${{ github.ref_name }}
+          tagName: ${{ github.event_name == 'workflow_dispatch' && (inputs.tag != '' && inputs.tag || github.ref_name) || github.ref_name }}
+          releaseName: ProjectToText ${{ github.event_name == 'workflow_dispatch' && (inputs.tag != '' && inputs.tag || github.ref_name) || github.ref_name }}
           releaseBodyFile: release-notes.md
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
