@@ -17,8 +17,6 @@ jobs:
   release-notes:
     name: Prepare release
     runs-on: ubuntu-latest
-    outputs:
-      body_path: release-notes.md
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +29,7 @@ jobs:
         run: |
           VERSION="${TAG#v}"
           export VERSION TAG
-          python3 - <<'PY' > release-notes.md
+          python3 <<'PY'
           import pathlib, re, os
           text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
           version = os.environ.get("VERSION", "")
@@ -48,22 +46,17 @@ jobs:
                   break
           if not body:
               body = f"Release {tag} of ProjectToText (ptt)."
-          header = f"""## ProjectToText {tag}
-
-Prebuilt **desktop** installers are attached below (macOS / Windows / Linux).
-
-Also available after install or `cargo build --release`:
-
-```bash
-ptt pack . -o context.xml
-ptt pack ./my-app -f markdown -o context.md
-```
-
-Build from source: see [README](https://github.com/krzysztofautomatyk/ProjectToText#readme).
-
----
-"""
-          print(header + body)
+          header = (
+              f"## ProjectToText {tag}\n\n"
+              "Prebuilt **desktop** installers are attached below "
+              "(macOS / Windows / Linux).\n\n"
+              "Headless pack (same engine as the UI):\n\n"
+              "    ptt pack . -o context.xml\n"
+              "    ptt pack ./my-app -f markdown -o context.md\n\n"
+              "Build from source: see the repository README.\n\n---\n\n"
+          )
+          pathlib.Path("release-notes.md").write_text(header + body + "\n", encoding="utf-8")
+          print("Wrote release-notes.md")
           PY
 
       - name: Upload notes artifact
@@ -112,8 +105,10 @@ Build from source: see [README](https://github.com/krzysztofautomatyk/ProjectToT
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
+
+      - name: Add cross-compile target
+        if: matrix.rust_target != ''
+        run: rustup target add ${{ matrix.rust_target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -121,7 +116,7 @@ Build from source: see [README](https://github.com/krzysztofautomatyk/ProjectToT
           key: release-${{ matrix.label }}
 
       - name: Install Linux Tauri system deps
-        if: runner.os == 'Linux'
+        if: runner.os == "Linux"
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -145,7 +140,7 @@ Build from source: see [README](https://github.com/krzysztofautomatyk/ProjectToT
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "ProjectToText ${{ github.ref_name }}"
+          releaseName: ProjectToText ${{ github.ref_name }}
           releaseBodyFile: release-notes.md
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
