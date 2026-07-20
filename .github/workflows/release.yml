@@ -1,79 +1,16 @@
-# Multi-platform desktop binaries + GitHub Release assets.
-# Trigger: push a version tag, e.g. `git tag v0.1.2 && git push origin v0.1.2`
 name: Release
 
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v*"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing git tag to release (e.g. v0.1.2). Leave empty to use the branch tip without a GitHub Release upload."
-        required: false
-        default: ""
 
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  release-notes:
-    name: Prepare release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Extract changelog section
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          VERSION="${TAG#v}"
-          export VERSION TAG
-          python3 <<'PY'
-          import pathlib, re, os
-          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
-          version = os.environ.get("VERSION", "")
-          tag = os.environ.get("TAG", version)
-          patterns = [
-              rf"## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## |\Z)",
-              r"## \[Unreleased\][^\n]*\n(.*?)(?=\n## |\Z)",
-          ]
-          body = ""
-          for pat in patterns:
-              m = re.search(pat, text, re.S)
-              if m and m.group(1).strip():
-                  body = m.group(1).strip()
-                  break
-          if not body:
-              body = f"Release {tag} of ProjectToText (ptt)."
-          header = (
-              f"## ProjectToText {tag}\n\n"
-              "Prebuilt **desktop** installers are attached below "
-              "(macOS / Windows / Linux).\n\n"
-              "Headless pack (same engine as the UI):\n\n"
-              "    ptt pack . -o context.xml\n"
-              "    ptt pack ./my-app -f markdown -o context.md\n\n"
-              "Build from source: see the repository README.\n\n---\n\n"
-          )
-          pathlib.Path("release-notes.md").write_text(header + body + "\n", encoding="utf-8")
-          print("Wrote release-notes.md")
-          PY
-
-      - name: Upload notes artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-notes
-          path: release-notes.md
-
   publish-tauri:
-    name: Build (${{ matrix.label }})
-    needs: release-notes
     permissions:
       contents: write
     strategy:
@@ -81,73 +18,46 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            label: macOS-aarch64
             args: --target aarch64-apple-darwin
-            rust_target: aarch64-apple-darwin
           - platform: macos-latest
-            label: macOS-x86_64
             args: --target x86_64-apple-darwin
-            rust_target: x86_64-apple-darwin
           - platform: ubuntu-22.04
-            label: Linux-x86_64
             args: ""
-            rust_target: ""
           - platform: windows-latest
-            label: Windows-x86_64
             args: ""
-            rust_target: ""
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: lts/*
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Add cross-compile target
-        if: matrix.rust_target != ''
-        run: rustup target add ${{ matrix.rust_target }}
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.label }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - name: Install Linux Tauri system deps
-        if: runner.os == "Linux"
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            patchelf \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf libgtk-3-dev libayatana-appindicator3-dev
 
       - name: Install frontend dependencies
         run: npm --prefix ui ci
 
-      - name: Download release notes
-        uses: actions/download-artifact@v4
-        with:
-          name: release-notes
-
-      - name: Build and upload to GitHub Release
-        uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.event_name == 'workflow_dispatch' && (inputs.tag != '' && inputs.tag || github.ref_name) || github.ref_name }}
-          releaseName: ProjectToText ${{ github.event_name == 'workflow_dispatch' && (inputs.tag != '' && inputs.tag || github.ref_name) || github.ref_name }}
-          releaseBodyFile: release-notes.md
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', '0.1.2') }}
+          releaseName: ProjectToText ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+          releaseBody: "See the assets to download this version and install. Use: ptt pack . -o context.xml"
           releaseDraft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: false
           args: ${{ matrix.args }}
