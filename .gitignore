@@ -39,6 +39,10 @@ ptt-output.*
 coverage/
 *.lcov
 tarpaulin-report.html
+ui/test-results/
+ui/playwright-report/
+ui/blob-report/
+ui/playwright/.cache/
 
 # Tauri / bundling artifacts
 *.dmg

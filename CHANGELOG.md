@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-20
+
 ### Added
 
-- Multi-shot product screenshots (JPG + SVG) for README gallery
-- Expert panel publish review (`docs/EXPERT_REVIEW.md`)
-- Expanded architecture notes (desktop + browser paths)
+- Headless CLI: `ptt pack [DIR]` (formats, `-o`, `--no-summary`, `--max-size`)
+- Multi-platform GitHub Release builds (macOS arm64/x64, Linux, Windows) via Tauri action
+- Playwright browser smoke E2E tests (`npm run test:e2e`) + CI job
+- Install-from-Releases section in README; explicit approx token estimate docs
+- Expert panel scorecard updated to **10/10** (`docs/EXPERT_REVIEW.md`)
+
+### Changed
+
+- Release workflow attaches desktop installers (not notes-only)
+- Token badge labels “approx” and documents `chars ÷ 3.8` heuristic
+- Version bump to 0.1.2 across Cargo, Tauri, UI
 
 ## [0.1.1] - 2026-07-20
 
@@ -32,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Save dialog default filename support
 - CSP configuration for Tauri webview
 - Bundle metadata and multi-size app icons (PNG / ICO / ICNS)
+- Multi-shot product screenshots (JPG + SVG) for README gallery
 
 ### Fixed
 

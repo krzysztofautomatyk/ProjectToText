@@ -1,5 +1,8 @@
 //! ptt — ProjectToText
 //! Tauri v2 desktop app: open folder → respect .gitignore exactly like Git → pack into LLM-ready text.
+//! Headless: `ptt pack [DIR] [OPTIONS]` (see `cli` module).
+
+mod cli;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -253,6 +256,11 @@ async fn save_to_file(
 }
 
 fn main() {
+    // Headless packing without launching the GUI webview.
+    if cli::maybe_run() {
+        return;
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![

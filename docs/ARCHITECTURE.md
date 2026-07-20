@@ -6,13 +6,14 @@ ProjectToText (`ptt`) is a **Tauri v2** desktop application with a thin UI shell
 ┌──────────────────────────────────────────────────────────┐
 │  ui/  (React + TypeScript + Vite)                        │
 │  tree · presets · preview · theme · browser pack path    │
+│  Playwright e2e smoke (browser shell)                    │
 └────────────────────────────┬─────────────────────────────┘
                              │  Tauri IPC  (desktop)
                              │  or in-browser FS APIs
 ┌────────────────────────────▼─────────────────────────────┐
 │  src/main.rs  (binary)                                   │
-│  scan_folder · generate_output · preview · save/copy     │
-│  open_with (system / editor)                             │
+│  GUI: scan · generate · preview · save/copy · open_with  │
+│  CLI: `ptt pack` (src/cli.rs) — no webview               │
 └────────────────────────────┬─────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────┐
@@ -22,6 +23,14 @@ ProjectToText (`ptt`) is a **Tauri v2** desktop application with a thin UI shell
 │  └── preview  safe path resolve + text load              │
 └──────────────────────────────────────────────────────────┘
 ```
+
+### Headless CLI
+
+```bash
+ptt pack [DIR] [-f xml|markdown|json|plain] [-o FILE] [--no-summary] [--max-size N]
+```
+
+Uses the same `walk` + `write_output` path as the desktop packer (all files after ignore rules; selection UI is desktop-only).
 
 ## Design goals
 

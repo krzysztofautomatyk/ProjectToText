@@ -263,9 +263,18 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
+/**
+ * Approximate token count for UX warnings only.
+ * Heuristic: characters ÷ 3.8 (rough code / mixed English average).
+ * Not model-specific (not GPT/Claude tokenizer) and not billing-grade.
+ */
 function estimateTokens(text: string): number {
-  return Math.round(text.length / 3.8);
+  if (!text) return 0;
+  return Math.max(0, Math.round(text.length / 3.8));
 }
+
+const TOKEN_ESTIMATE_HINT =
+  'Approximate only (chars ÷ 3.8). Not a model-specific tokenizer.';
 
 function isJunkPath(path: string): boolean {
   const lower = normalizePath(path).toLowerCase();
@@ -1640,8 +1649,8 @@ function App() {
     }
     if (output && view === 'packed') {
       return (
-        <span className={tokenBadgeClass(stats.tokens)} title="Approximate token count">
-          <Check size={11} /> ready · ~{formatTokens(stats.tokens)} tokens
+        <span className={tokenBadgeClass(stats.tokens)} title={TOKEN_ESTIMATE_HINT}>
+          <Check size={11} /> ready · ~{formatTokens(stats.tokens)} tokens (approx)
         </span>
       );
     }
@@ -1652,11 +1661,12 @@ function App() {
     <div
       className={`app-container${dragOver ? ' drag-over' : ''}`}
       style={{ ['--tree-width' as string]: `${treeWidth}px` }}
+      data-testid="app-root"
     >
       {/* Header */}
-      <header className="header">
+      <header className="header" data-testid="app-header">
         <div className="header-left">
-          <div className="brand" title="ProjectToText">
+          <div className="brand" title="ProjectToText" data-testid="brand">
             <div className="brand-mark" aria-hidden>
               ptt
             </div>
@@ -1693,7 +1703,13 @@ function App() {
 
           <div className="toolbar-sep" />
 
-          <button type="button" onClick={() => void openFolder()} className="btn" title={`Open folder (${isMac ? '⌘' : 'Ctrl'}O)`}>
+          <button
+            type="button"
+            onClick={() => void openFolder()}
+            className="btn"
+            title={`Open folder (${isMac ? '⌘' : 'Ctrl'}O)`}
+            data-testid="btn-open-folder"
+          >
             <FolderOpen size={15} /> Open
             <span className="kbd">{isMac ? '⌘O' : '⌃O'}</span>
           </button>
@@ -1927,7 +1943,7 @@ function App() {
                 </button>
               </div>
             ) : !currentPath ? (
-              <div className="empty-state">
+              <div className="empty-state" data-testid="empty-open-project">
                 <div className="empty-icon">
                   <FolderOpen size={26} />
                 </div>
@@ -1937,7 +1953,12 @@ function App() {
                   <strong className="text-emphasis">.gitignore</strong> exactly
                   like Git.
                 </div>
-                <button type="button" className="btn btn-primary" onClick={() => void openFolder()}>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => void openFolder()}
+                  data-testid="btn-open-folder-empty"
+                >
                   <FolderOpen size={15} /> Open folder
                 </button>
                 <div className="empty-hints">
@@ -2246,8 +2267,8 @@ function App() {
                 stats.tokens >= TOKEN_HARD
                   ? 'Very large context — consider deselecting files'
                   : stats.tokens >= TOKEN_SOFT
-                    ? 'Large pack — may exceed smaller model windows'
-                    : 'Approximate token estimate'
+                    ? `Large pack — may exceed smaller model windows. ${TOKEN_ESTIMATE_HINT}`
+                    : TOKEN_ESTIMATE_HINT
               }
             >
               ~
