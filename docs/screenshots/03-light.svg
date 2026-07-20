@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-label="ProjectToText — light theme with Markdown output">
+  <defs>
+    <linearGradient id="g3" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a7f37"/>
+      <stop offset="100%" stop-color="#0969da"/>
+    </linearGradient>
+    <filter id="sh3" x="-8%" y="-8%" width="116%" height="116%">
+      <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#1f2328" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="720" fill="#eaeef2"/>
+  <rect x="40" y="36" width="1200" height="648" rx="14" fill="#ffffff" stroke="#d0d7de" filter="url(#sh3)"/>
+
+  <rect x="40" y="36" width="1200" height="52" rx="14" fill="#f6f8fa"/>
+  <rect x="40" y="74" width="1200" height="14" fill="#f6f8fa"/>
+  <rect x="40" y="87" width="1200" height="1" fill="#d0d7de"/>
+  <circle cx="68" cy="62" r="6" fill="#ff5f57"/>
+  <circle cx="90" cy="62" r="6" fill="#febc2e"/>
+  <circle cx="112" cy="62" r="6" fill="#28c840"/>
+  <rect x="140" y="48" width="30" height="30" rx="8" fill="url(#g3)"/>
+  <text x="148" y="68" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" font-weight="800" fill="#fff">pt</text>
+  <text x="180" y="66" font-family="ui-sans-serif,system-ui,sans-serif" font-size="14" font-weight="650" fill="#1f2328">ProjectToText</text>
+  <rect x="980" y="50" width="130" height="28" rx="6" fill="#1a7f37"/>
+  <text x="1000" y="68" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="600" fill="#fff">Copy packed</text>
+  <rect x="1120" y="50" width="90" height="28" rx="6" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="1146" y="68" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="#24292f">Save</text>
+
+  <rect x="40" y="88" width="1200" height="40" fill="#f6f8fa"/>
+  <rect x="40" y="127" width="1200" height="1" fill="#d0d7de"/>
+  <rect x="272" y="96" width="64" height="24" rx="6" fill="rgba(9,105,218,0.1)" stroke="rgba(9,105,218,0.35)"/>
+  <text x="286" y="112" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" font-weight="600" fill="#0969da">Source</text>
+  <text x="348" y="112" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#656d76">Docs · All clean · Light theme</text>
+
+  <rect x="40" y="128" width="340" height="520" fill="#ffffff"/>
+  <rect x="379" y="128" width="1" height="520" fill="#d0d7de"/>
+  <text x="56" y="152" font-family="ui-sans-serif,system-ui,sans-serif" font-size="10" font-weight="700" fill="#656d76" letter-spacing="0.8">FILES</text>
+  <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+    <rect x="52" y="164" width="312" height="28" rx="5" fill="#ddf4ff"/>
+    <text x="64" y="183" fill="#24292f">▾ src/ <tspan fill="#656d76" font-size="11">selected</tspan></text>
+    <text x="84" y="211" fill="#0969da">☑ MainWindow.xaml</text>
+    <text x="84" y="237" fill="#0969da">☑ ViewModels/MainVm.cs</text>
+    <text x="84" y="263" fill="#0969da">☑ App.xaml.cs</text>
+    <text x="64" y="295" fill="#0969da">☑ MyApp.csproj</text>
+    <text x="64" y="321" fill="#656d76">☐ bin/</text>
+    <text x="64" y="347" fill="#656d76">☐ obj/</text>
+    <text x="64" y="373" fill="#0969da">☑ README.md</text>
+  </g>
+
+  <rect x="380" y="128" width="860" height="40" fill="#f6f8fa"/>
+  <rect x="380" y="167" width="860" height="1" fill="#d0d7de"/>
+  <text x="400" y="154" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" font-weight="650" fill="#1f2328">Packed output</text>
+  <rect x="1040" y="140" width="100" height="22" rx="5" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="1052" y="155" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#24292f">Markdown ▾</text>
+  <rect x="1150" y="140" width="66" height="22" rx="11" fill="#dafbe1" stroke="#4ac26b"/>
+  <text x="1162" y="155" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" font-weight="600" fill="#1a7f37">~8k</text>
+
+  <rect x="396" y="180" width="828" height="440" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12">
+    <text x="416" y="208" fill="#0550ae"># Project: MyApp</text>
+    <text x="416" y="240" fill="#656d76">## File tree</text>
+    <text x="416" y="268" fill="#24292f">- src/MainWindow.xaml</text>
+    <text x="416" y="292" fill="#24292f">- src/ViewModels/MainVm.cs</text>
+    <text x="416" y="316" fill="#24292f">- MyApp.csproj</text>
+    <text x="416" y="352" fill="#656d76">## src/MainWindow.xaml</text>
+    <text x="416" y="380" fill="#cf222e">```xml</text>
+    <text x="416" y="408" fill="#24292f">&lt;Window x:Class="MyApp.MainWindow"&gt;</text>
+    <text x="416" y="432" fill="#24292f">  &lt;Grid&gt;…&lt;/Grid&gt;</text>
+    <text x="416" y="456" fill="#24292f">&lt;/Window&gt;</text>
+    <text x="416" y="484" fill="#cf222e">```</text>
+    <text x="416" y="520" fill="#656d76">## src/ViewModels/MainVm.cs</text>
+    <text x="416" y="548" fill="#cf222e">```csharp</text>
+    <text x="416" y="576" fill="#24292f">public sealed class MainVm : ObservableObject { … }</text>
+    <text x="416" y="604" fill="#cf222e">```</text>
+  </g>
+
+  <rect x="40" y="648" width="1200" height="36" fill="#f6f8fa"/>
+  <rect x="40" y="648" width="1200" height="1" fill="#d0d7de"/>
+  <text x="56" y="671" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#656d76">.NET / XAML Source preset · light theme · markdown</text>
+</svg>

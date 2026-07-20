@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-label="ProjectToText — file preview with syntax highlight and open-with">
+  <defs>
+    <linearGradient id="g2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#238636"/>
+      <stop offset="100%" stop-color="#1f6feb"/>
+    </linearGradient>
+    <filter id="sh2" x="-8%" y="-8%" width="116%" height="116%">
+      <feDropShadow dx="0" dy="12" stdDeviation="20" flood-color="#010409" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="720" fill="#010409"/>
+  <rect x="40" y="36" width="1200" height="648" rx="14" fill="#0d1117" stroke="#30363d" filter="url(#sh2)"/>
+
+  <rect x="40" y="36" width="1200" height="52" rx="14" fill="#161b22"/>
+  <rect x="40" y="74" width="1200" height="14" fill="#161b22"/>
+  <rect x="40" y="87" width="1200" height="1" fill="#30363d"/>
+  <circle cx="68" cy="62" r="6" fill="#ff5f57"/>
+  <circle cx="90" cy="62" r="6" fill="#febc2e"/>
+  <circle cx="112" cy="62" r="6" fill="#28c840"/>
+  <rect x="140" y="48" width="30" height="30" rx="8" fill="url(#g2)"/>
+  <text x="148" y="68" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" font-weight="800" fill="#fff">pt</text>
+  <text x="180" y="66" font-family="ui-sans-serif,system-ui,sans-serif" font-size="14" font-weight="650" fill="#e6edf3">ProjectToText</text>
+  <rect x="980" y="50" width="130" height="28" rx="6" fill="#238636"/>
+  <text x="1000" y="68" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="600" fill="#fff">Copy packed</text>
+  <rect x="1120" y="50" width="90" height="28" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="1146" y="68" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="#c9d1d9">Save</text>
+
+  <rect x="40" y="88" width="1200" height="40" fill="#161b22"/>
+  <rect x="40" y="127" width="1200" height="1" fill="#30363d"/>
+  <text x="56" y="112" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#8b949e">Click a file → syntax preview · Open with system apps</text>
+
+  <rect x="40" y="128" width="340" height="520" fill="#0d1117"/>
+  <rect x="379" y="128" width="1" height="520" fill="#30363d"/>
+  <text x="56" y="152" font-family="ui-sans-serif,system-ui,sans-serif" font-size="10" font-weight="700" fill="#8b949e" letter-spacing="0.8">FILES</text>
+  <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+    <text x="64" y="183" fill="#c9d1d9">▾ ui/src/</text>
+    <rect x="72" y="196" width="288" height="28" rx="5" fill="#1f2a3a"/>
+    <text x="84" y="215" fill="#58a6ff">☑ App.tsx</text>
+    <text x="84" y="247" fill="#c9d1d9">  FileViewer.tsx</text>
+    <text x="84" y="273" fill="#c9d1d9">  browserFs.ts</text>
+    <text x="84" y="299" fill="#c9d1d9">  syntax.ts</text>
+    <text x="64" y="335" fill="#c9d1d9">▾ src/core/</text>
+    <text x="84" y="361" fill="#58a6ff">☑ walker.rs</text>
+    <text x="84" y="387" fill="#58a6ff">☑ output.rs</text>
+  </g>
+
+  <rect x="380" y="128" width="860" height="40" fill="#161b22"/>
+  <rect x="380" y="167" width="860" height="1" fill="#30363d"/>
+  <text x="400" y="154" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" fill="#8b949e">Packed</text>
+  <text x="470" y="154" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" fill="#8b949e">List</text>
+  <text x="520" y="154" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" font-weight="650" fill="#f78166">File</text>
+  <text x="580" y="154" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8b949e">ui/src/App.tsx</text>
+
+  <!-- open with bar -->
+  <rect x="396" y="180" width="828" height="36" rx="6" fill="#161b22" stroke="#30363d"/>
+  <text x="412" y="203" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#8b949e">Open with</text>
+  <rect x="490" y="188" width="100" height="22" rx="5" fill="#21262d" stroke="#30363d"/>
+  <text x="508" y="203" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#c9d1d9">Default app</text>
+  <rect x="600" y="188" width="80" height="22" rx="5" fill="#21262d" stroke="#30363d"/>
+  <text x="618" y="203" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#c9d1d9">VS Code</text>
+  <rect x="690" y="188" width="100" height="22" rx="5" fill="#21262d" stroke="#30363d"/>
+  <text x="706" y="203" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#c9d1d9">Notepad++</text>
+  <rect x="800" y="188" width="80" height="22" rx="5" fill="#21262d" stroke="#30363d"/>
+  <text x="818" y="203" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#c9d1d9">Choose…</text>
+
+  <rect x="396" y="228" width="828" height="392" rx="8" fill="#0d1117" stroke="#30363d"/>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12">
+    <text x="416" y="256" fill="#6e7681">  1</text>
+    <text x="452" y="256" fill="#ff7b72">import</text>
+    <text x="520" y="256" fill="#c9d1d9"> { useState } </text>
+    <text x="640" y="256" fill="#ff7b72">from</text>
+    <text x="684" y="256" fill="#a5d6ff">'react'</text>
+    <text x="744" y="256" fill="#c9d1d9">;</text>
+    <text x="416" y="284" fill="#6e7681">  2</text>
+    <text x="452" y="284" fill="#ff7b72">import</text>
+    <text x="520" y="284" fill="#c9d1d9"> FileViewer </text>
+    <text x="620" y="284" fill="#ff7b72">from</text>
+    <text x="664" y="284" fill="#a5d6ff">'./FileViewer'</text>
+    <text x="780" y="284" fill="#c9d1d9">;</text>
+    <text x="416" y="312" fill="#6e7681">  3</text>
+    <text x="416" y="340" fill="#6e7681">  4</text>
+    <text x="452" y="340" fill="#ff7b72">export default function</text>
+    <text x="640" y="340" fill="#d2a8ff"> App</text>
+    <text x="680" y="340" fill="#c9d1d9">() {</text>
+    <text x="416" y="368" fill="#6e7681">  5</text>
+    <text x="468" y="368" fill="#ff7b72">const</text>
+    <text x="520" y="368" fill="#c9d1d9"> [path, setPath] = </text>
+    <text x="680" y="368" fill="#d2a8ff">useState</text>
+    <text x="760" y="368" fill="#c9d1d9">&lt;string | null&gt;(null);</text>
+    <text x="416" y="396" fill="#6e7681">  6</text>
+    <text x="468" y="396" fill="#8b949e">// … pack selection, presets, toasts</text>
+    <text x="416" y="424" fill="#6e7681">  7</text>
+    <text x="468" y="424" fill="#ff7b72">return</text>
+    <text x="532" y="424" fill="#c9d1d9"> (</text>
+    <text x="416" y="452" fill="#6e7681">  8</text>
+    <text x="484" y="452" fill="#79c0ff">&lt;div</text>
+    <text x="528" y="452" fill="#7ee787"> className</text>
+    <text x="620" y="452" fill="#c9d1d9">=</text>
+    <text x="636" y="452" fill="#a5d6ff">"app"</text>
+    <text x="684" y="452" fill="#79c0ff">&gt;</text>
+    <text x="416" y="480" fill="#6e7681">  9</text>
+    <text x="500" y="480" fill="#79c0ff">&lt;FileViewer</text>
+    <text x="600" y="480" fill="#7ee787"> path</text>
+    <text x="644" y="480" fill="#c9d1d9">={path} /&gt;</text>
+    <text x="416" y="508" fill="#6e7681"> 10</text>
+    <text x="484" y="508" fill="#79c0ff">&lt;/div&gt;</text>
+    <text x="416" y="536" fill="#6e7681"> 11</text>
+    <text x="468" y="536" fill="#c9d1d9">);</text>
+    <text x="416" y="564" fill="#6e7681"> 12</text>
+    <text x="452" y="564" fill="#c9d1d9">}</text>
+  </g>
+
+  <rect x="40" y="648" width="1200" height="36" fill="#161b22"/>
+  <rect x="40" y="648" width="1200" height="1" fill="#30363d"/>
+  <text x="56" y="671" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11" fill="#8b949e">Preview · TypeScript · UTF-8 · Open with needs desktop (Tauri)</text>
+</svg>
