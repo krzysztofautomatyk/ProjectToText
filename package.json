@@ -1,0 +1,17 @@
+{
+  "name": "project-to-text",
+  "private": true,
+  "version": "0.1.3",
+  "description": "ProjectToText workspace scripts for running the Tauri app",
+  "scripts": {
+    "dev": "cargo tauri dev",
+    "tauri:dev": "cargo tauri dev",
+    "build": "cargo tauri build",
+    "tauri:build": "cargo tauri build",
+    "installer:macos": "bash installer/build-macos.sh",
+    "installer:windows": "powershell -ExecutionPolicy Bypass -File installer/build-windows.ps1",
+    "ui:install": "npm --prefix ui install",
+    "ui:dev": "npm --prefix ui run dev",
+    "ui:build": "npm --prefix ui run build"
+  }
+}

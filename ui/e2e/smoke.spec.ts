@@ -22,6 +22,15 @@ test.describe('ProjectToText browser shell', () => {
     await expect(page.getByTestId('brand')).toContainText('ptt');
   });
 
+  test('folder history panel opens from the header', async ({ page }) => {
+    await page.goto('/');
+    await page.getByTestId('btn-folder-history').click();
+    await expect(page.getByRole('heading', { name: 'Folder history' })).toBeVisible();
+    await expect(page.getByText('No folders in history')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('heading', { name: 'Folder history' })).toBeHidden();
+  });
+
   test('help shortcut opens shortcuts dialog', async ({ page }) => {
     await page.goto('/');
     await page.keyboard.press('?');

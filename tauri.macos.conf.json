@@ -1,0 +1,6 @@
+{
+  "$schema": "https://v2.tauri.app/schema.json",
+  "bundle": {
+    "targets": ["app", "dmg"]
+  }
+}

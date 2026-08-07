@@ -1,4 +1,4 @@
-.PHONY: help dev test lint build ui-install ui-build e2e pack-demo check
+.PHONY: help dev test lint build ui-install ui-build e2e pack-demo installer-macos installer-windows check
 
 help:
 	@echo "ptt — ProjectToText"
@@ -11,6 +11,8 @@ help:
 	@echo "  make e2e          Browser Playwright smoke tests"
 	@echo "  make pack-demo    Headless pack of this repo (XML to /tmp)"
 	@echo "  make build        Release app bundle (cargo tauri build)"
+	@echo "  make installer-macos   Build unsigned macOS .app + .dmg"
+	@echo "  make installer-windows Build unsigned Windows .msi + .exe"
 	@echo "  make check        test + lint + ui-build + e2e"
 
 ui-install:
@@ -39,6 +41,12 @@ pack-demo:
 
 build: ui-build
 	cargo tauri build
+
+installer-macos:
+	bash installer/build-macos.sh
+
+installer-windows:
+	powershell -ExecutionPolicy Bypass -File installer/build-windows.ps1
 
 check: test lint ui-build e2e
 	@echo "All checks passed."

@@ -22,15 +22,19 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  History as HistoryIcon,
   Info,
   List,
   Loader2,
   Monitor,
   Moon,
+  Pin,
+  PinOff,
   RefreshCw,
   Save,
   Search,
   Sun,
+  Trash2,
   X,
   AlertCircle,
   CheckCircle2,
@@ -48,6 +52,15 @@ import {
   UserCancelledError,
   type BrowserProject,
 } from './browserFs';
+import {
+  folderHistoryKey,
+  readFolderHistory,
+  rememberFolder,
+  removeFolder,
+  setFolderPinned,
+  writeFolderHistory,
+  type FolderHistoryEntry,
+} from './folderHistory';
 import { isTauriRuntime } from './tauriEnv';
 import './index.css';
 
@@ -550,6 +563,127 @@ function ToastViewport({
   );
 }
 
+function formatHistoryDate(timestamp: number): string {
+  if (!timestamp) return 'Previously opened';
+  return `Opened ${new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: timestamp > Date.now() - 365 * 24 * 60 * 60 * 1000 ? undefined : 'numeric',
+  }).format(timestamp)}`;
+}
+
+function FolderHistoryPanel({
+  entries,
+  currentPath,
+  scanning,
+  onClose,
+  onOpen,
+  onTogglePin,
+  onRemove,
+  onClear,
+}: {
+  entries: FolderHistoryEntry[];
+  currentPath: string;
+  scanning: boolean;
+  onClose: () => void;
+  onOpen: (entry: FolderHistoryEntry) => void;
+  onTogglePin: (entry: FolderHistoryEntry) => void;
+  onRemove: (entry: FolderHistoryEntry) => void;
+  onClear: () => void;
+}) {
+  return (
+    <div className="history-overlay" role="presentation" onClick={onClose}>
+      <section
+        className="history-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="folder-history-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="history-header">
+          <div>
+            <h2 id="folder-history-title">Folder history</h2>
+            <p>Pin projects you open often. History is saved on this device.</p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-ghost btn-icon"
+            onClick={onClose}
+            aria-label="Close folder history"
+          >
+            <X size={14} />
+          </button>
+        </div>
+
+        {entries.length > 0 ? (
+          <>
+            <div className="history-toolbar">
+              <span>{entries.length} saved folder{entries.length === 1 ? '' : 's'}</span>
+              <button type="button" className="panel-link" onClick={onClear}>
+                Clear history
+              </button>
+            </div>
+            <div className="history-list">
+              {entries.map((entry) => {
+                const isCurrent =
+                  !!currentPath && folderHistoryKey(currentPath) === folderHistoryKey(entry.path);
+                return (
+                  <div
+                    className={`history-item${isCurrent ? ' is-current' : ''}`}
+                    key={folderHistoryKey(entry.path)}
+                  >
+                    <button
+                      type="button"
+                      className="history-entry"
+                      onClick={() => onOpen(entry)}
+                      disabled={scanning}
+                      title={entry.path}
+                    >
+                      <FolderOpen size={16} className="history-entry-icon" aria-hidden />
+                      <span className="history-entry-copy">
+                        <strong>{entry.name}</strong>
+                        <span>{entry.path}</span>
+                        <small>{formatHistoryDate(entry.lastOpenedAt)}</small>
+                      </span>
+                      {isCurrent && <span className="history-current">Current</span>}
+                    </button>
+                    <div className="history-item-actions">
+                      <button
+                        type="button"
+                        className={`btn btn-icon history-action${entry.pinned ? ' is-pinned' : ''}`}
+                        onClick={() => onTogglePin(entry)}
+                        aria-label={entry.pinned ? `Unpin ${entry.name}` : `Pin ${entry.name}`}
+                        title={entry.pinned ? 'Unpin folder' : 'Pin folder'}
+                      >
+                        {entry.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-icon history-action danger"
+                        onClick={() => onRemove(entry)}
+                        aria-label={`Remove ${entry.name} from history`}
+                        title="Remove from history"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        ) : (
+          <div className="history-empty">
+            <HistoryIcon size={22} aria-hidden />
+            <strong>No folders in history</strong>
+            <span>Open a project and it will appear here for quick access.</span>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function TreeItem({
   node,
   depth,
@@ -772,6 +906,10 @@ function App() {
   const [dragOver, setDragOver] = useState(false);
   const [focusedPath, setFocusedPath] = useState<string | null>(null);
   const [showHelp, setShowHelp] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [folderHistory, setFolderHistory] = useState<FolderHistoryEntry[]>(() =>
+    IN_TAURI ? readFolderHistory() : [],
+  );
   const [themePref, setThemePref] = useState<ThemePref>(() => readThemePref());
   const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() =>
     resolveTheme(readThemePref()),
@@ -818,6 +956,51 @@ function App() {
   const dismissToast = useCallback((id: number) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+
+  const rememberLoadedFolder = useCallback((path: string) => {
+    setFolderHistory((prev) => rememberFolder(prev, path));
+  }, []);
+
+  const toggleFolderPin = useCallback((entry: FolderHistoryEntry) => {
+    setFolderHistory((prev) => setFolderPinned(prev, entry.path, !entry.pinned));
+  }, []);
+
+  const removeFolderFromHistory = useCallback((entry: FolderHistoryEntry) => {
+    setFolderHistory((prev) => removeFolder(prev, entry.path));
+  }, []);
+
+  const clearFolderHistory = useCallback(() => {
+    setFolderHistory([]);
+  }, []);
+
+  const clearCurrentProject = useCallback(() => {
+    if (!currentPath && nodes.length === 0 && !output) return;
+    if (generateTimer.current != null) {
+      window.clearTimeout(generateTimer.current);
+      generateTimer.current = null;
+    }
+    genSeq.current += 1;
+    browserProjectRef.current = null;
+    hasLoadedOnce.current = false;
+    setCurrentPath('');
+    setNodes([]);
+    setOutput('');
+    setStats({ files: 0, tokens: 0 });
+    setScanning(false);
+    setGenerating(false);
+    setBrowserMode(!IN_TAURI);
+    setFilterText('');
+    setExpanded(new Set());
+    setPreset('source');
+    setView('packed');
+    setFilePreview(null);
+    setPreviewRelPath(null);
+    setPreviewError(null);
+    setContextMenu(null);
+    setFocusedPath(null);
+    setShowHistory(false);
+    pushToast('info', 'Project cleared — choose another folder');
+  }, [currentPath, nodes.length, output, pushToast]);
 
   /* ─── Generate ─────────────────────────────────────── */
 
@@ -913,6 +1096,7 @@ function App() {
       setPreviewError(null);
       setContextMenu(null);
       hasLoadedOnce.current = false;
+      if (!fromBrowser) rememberLoadedFolder(pathLabel);
 
       const topDirs = withSelection
         .filter((n) => n.is_dir && !n.path.includes('/'))
@@ -951,7 +1135,7 @@ function App() {
       // Pack after tree is visible
       await generateNow(withSelection, pathLabel, format);
     },
-    [format, generateNow, pushToast],
+    [format, generateNow, pushToast, rememberLoadedFolder],
   );
 
   const scan = useCallback(
@@ -1081,6 +1265,22 @@ function App() {
       }
     }
   }, [scan, openFolderBrowser, pushToast]);
+
+  const openHistoryFolder = useCallback(
+    (entry: FolderHistoryEntry) => {
+      if (!IN_TAURI) {
+        pushToast(
+          'info',
+          'Folder history can be reopened in the desktop app, where native paths are available.',
+        );
+        return;
+      }
+      setShowHistory(false);
+      browserProjectRef.current = null;
+      void scan(entry.path);
+    },
+    [pushToast, scan],
+  );
 
   /* ─── File preview / open with ─────────────────────── */
 
@@ -1379,6 +1579,10 @@ function App() {
     }
   }, [treeWidth, resizing]);
 
+  useEffect(() => {
+    if (IN_TAURI) writeFolderHistory(folderHistory);
+  }, [folderHistory]);
+
   // Theme: apply + follow system when pref is "system"
   useEffect(() => {
     setResolvedTheme(applyTheme(themePref));
@@ -1546,6 +1750,10 @@ function App() {
           setShowHelp(false);
           return;
         }
+        if (showHistory) {
+          setShowHistory(false);
+          return;
+        }
         if (filterText) {
           setFilterText('');
           filterRef.current?.blur();
@@ -1572,6 +1780,7 @@ function App() {
     output,
     filterText,
     showHelp,
+    showHistory,
   ]);
 
   /* ─── Resizable panel ──────────────────────────────── */
@@ -1701,6 +1910,24 @@ function App() {
             )}
           </button>
 
+          <button
+            type="button"
+            className={`btn history-toggle${showHistory ? ' is-active' : ''}`}
+            onClick={() => setShowHistory((visible) => !visible)}
+            title="Open folder history"
+            aria-label="Open folder history"
+            aria-expanded={showHistory}
+            data-testid="btn-folder-history"
+          >
+            <HistoryIcon size={15} />
+            <span className="btn-label">History</span>
+            {folderHistory.length > 0 && (
+              <span className="history-count" aria-label={`${folderHistory.length} folders`}>
+                {folderHistory.length}
+              </span>
+            )}
+          </button>
+
           <div className="toolbar-sep" />
 
           <button
@@ -1722,6 +1949,17 @@ function App() {
             title={`Refresh (${isMac ? '⌘' : 'Ctrl'}R)`}
           >
             <RefreshCw size={15} className={scanning ? 'spin' : ''} /> Refresh
+          </button>
+
+          <button
+            type="button"
+            onClick={clearCurrentProject}
+            className="btn"
+            disabled={scanning || (!currentPath && nodes.length === 0 && !output)}
+            title="Clear current project and choose another folder"
+            data-testid="btn-clear-project"
+          >
+            <X size={15} /> Clear
           </button>
 
           <div className="toolbar-sep" />
@@ -2176,6 +2414,19 @@ function App() {
           </div>
         </section>
       </div>
+
+      {showHistory && (
+        <FolderHistoryPanel
+          entries={folderHistory}
+          currentPath={currentPath}
+          scanning={scanning}
+          onClose={() => setShowHistory(false)}
+          onOpen={openHistoryFolder}
+          onTogglePin={toggleFolderPin}
+          onRemove={removeFolderFromHistory}
+          onClear={clearFolderHistory}
+        />
+      )}
 
       {contextMenu && (
         <div

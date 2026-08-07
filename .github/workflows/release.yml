@@ -18,13 +18,13 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: --target aarch64-apple-darwin
+            args: --ci --no-sign --target aarch64-apple-darwin
           - platform: macos-latest
-            args: --target x86_64-apple-darwin
+            args: --ci --no-sign --target x86_64-apple-darwin
           - platform: ubuntu-22.04
-            args: ""
+            args: --ci --no-sign
           - platform: windows-latest
-            args: ""
+            args: --ci --no-sign
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -51,13 +51,18 @@ jobs:
       - name: Install frontend dependencies
         run: npm --prefix ui ci
 
+      - name: Read app version
+        id: app_version
+        shell: bash
+        run: echo "version=$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', '0.1.2') }}
-          releaseName: ProjectToText ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
-          releaseBody: "See the assets to download this version and install. Use: ptt pack . -o context.xml"
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.app_version.outputs.version) }}
+          releaseName: ProjectToText ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}-dev', steps.app_version.outputs.version) }}
+          releaseBody: "Download the macOS .dmg or Windows .msi/.exe installer from the assets. Use: ptt pack . -o context.xml"
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://v2.tauri.app/schema.json",
+  "bundle": {
+    "targets": ["msi", "nsis"],
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "wix": {
+        "upgradeCode": "03df25c3-1923-56a7-9589-a05bf55d7173",
+        "language": "en-US"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "compression": "lzma",
+        "startMenuFolder": "ProjectToText"
+      }
+    }
+  }
+}

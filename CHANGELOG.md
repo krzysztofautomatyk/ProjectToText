@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-07
+
+### Added
+
+- Repository-managed macOS (`.app` / `.dmg`) and Windows (`.msi` / NSIS `.exe`) installer scripts and platform-specific Tauri bundle settings.
+- Persistent desktop folder history with pinned projects and quick reopen.
+- Clear current project action for quickly opening another folder.
+
 ## [0.1.2] - 2026-07-20
 
 ### Added

@@ -55,6 +55,7 @@ Vector mockups (crisp on HiDPI): [`01-main.svg`](docs/screenshots/01-main.svg) �
 - **File preview**: click a file for syntax highlighting; open with system default, VS Code, Notepad++, or pick an app
 - **Desktop + browser**: full power in Tauri; pack/preview also works in Vite browser via folder picker
 - **Headless CLI**: `ptt pack [DIR]` — same git-native engine, CI-friendly
+- **Folder history**: recently opened desktop folders can be reopened and pinned for quick access
 - **Workflow**: copy packed output, copy file list, save to disk, drag-and-drop folder
 - **Shortcuts**: open, refresh, filter, copy, save, help (`?`)
 - **Honest token estimate**: UI shows **approx** tokens (`chars ÷ 3.8`), not a model tokenizer
@@ -128,7 +129,19 @@ npm --prefix ui install
 cargo tauri build
 ```
 
-Artifacts: `target/release/bundle/` (`.dmg` / `.app` · `.msi` / `.exe` · Linux packages).
+Platform-specific installer helpers are also committed under [`installer/`](installer/):
+
+```bash
+# macOS
+./installer/build-macos.sh
+
+# Windows PowerShell
+powershell -ExecutionPolicy Bypass -File .\installer\build-windows.ps1
+```
+
+Artifacts are written to `target/release/bundle/`: macOS produces `.app` / `.dmg`,
+and Windows produces `.msi` / NSIS `.exe`. The platform-specific Tauri settings
+live in `tauri.macos.conf.json` and `tauri.windows.conf.json`.
 
 ```bash
 # CLI only (no bundle)
