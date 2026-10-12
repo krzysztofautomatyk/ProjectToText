@@ -2,6 +2,14 @@
 //! Tauri v2 desktop app: open folder → respect .gitignore exactly like Git → pack into LLM-ready text.
 //! Headless: `ptt pack [DIR] [OPTIONS]` (see `cli` module).
 
+// On Windows, build as a GUI app in release mode so no empty console window
+// appears next to the desktop UI. In dev/debug builds we keep the console
+// subsystem so `cargo run` still shows CLI output (`ptt pack ...`).
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod cli;
 
 use serde::{Deserialize, Serialize};
@@ -255,7 +263,27 @@ async fn save_to_file(
     }
 }
 
+/// On Windows GUI-subsystem builds the process has no console, so a
+/// terminal-launched CLI run (`ptt pack`) would print nothing. Attach to the
+/// parent console (only present when launched from a terminal); a GUI launch
+/// from Explorer/Start Menu has no such parent and opens nothing.
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn attach_parent_console() {
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF; // (DWORD)-1
+    extern "system" {
+        fn AttachConsole(process: u32) -> i32;
+    }
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+fn attach_parent_console() {}
+
 fn main() {
+    attach_parent_console();
+
     // Headless packing without launching the GUI webview.
     if cli::maybe_run() {
         return;
