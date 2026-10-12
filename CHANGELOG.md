@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-12
+
+### Added
+
+- **Custom projects panel** (Custom button next to History): per-project list with saved file/folder selection exclusions, manage entries, open project straight from the panel.
+- **Favorites**: star a project and it always appears at the top of the Custom list; favorite state persists across restarts.
+- **Project notes**: free-form per-project comment (e.g. why files were excluded), editable in place, stored permanently.
+- **Selection-exclusion replay**: files you uncheck are remembered per project and automatically deselected again the next time you open that project; re-checking a file removes it from the exclusion list.
+- **Preferences export/import**: one-click JSON snapshot export of all custom projects + folder history (`ptt-prefs-YYYYMMDD.json`) and defensive merge-on-import from any machine, with clear validation errors and skip counts.
+- **Version chip in the header** showing the running app version (`v0.2.0`).
+
+### Fixed
+
+- **Windows**: app no longer opens an empty terminal/console window alongside the GUI (release builds are now GUI-subsystem binaries).
+- Windows terminal-launched `ptt pack ...` output works: the release binary attaches to the parent console on start, so CLI output is visible while GUI launches (Explorer/Start Menu) still open no console.
+
+### Changed
+
+- Dependency refresh: Tauri 2.12, React 19.3, Vite 8.3, TypeScript 6.0 toolchain and all Cargo/npm dependencies to latest compatible versions.
+
 ## [0.1.3] - 2026-08-07
 
 ### Added

@@ -56,6 +56,10 @@ Vector mockups (crisp on HiDPI): [`01-main.svg`](docs/screenshots/01-main.svg) �
 - **Desktop + browser**: full power in Tauri; pack/preview also works in Vite browser via folder picker
 - **Headless CLI**: `ptt pack [DIR]` — same git-native engine, CI-friendly
 - **Folder history**: recently opened desktop folders can be reopened and pinned for quick access
+- **Custom projects**: per-project panel (next to History) with **saved selection exclusions** — files/folders you uncheck are remembered and auto-deselected again on the next open; re-check a file to clear it
+- **Favorites**: star projects so they always sort to the top of the Custom list
+- **Project notes**: free-form per-project comment (why files are excluded), editable in place, persisted
+- **Preferences export/import**: one-click JSON snapshot of all custom projects + folder history, merge-on-import between machines with validation
 - **Workflow**: copy packed output, copy file list, save to disk, drag-and-drop folder
 - **Shortcuts**: open, refresh, filter, copy, save, help (`?`)
 - **Honest token estimate**: UI shows **approx** tokens (`chars ÷ 3.8`), not a model tokenizer
@@ -170,6 +174,19 @@ Tag `v*.*.*` runs multi-OS Tauri builds and attaches installers to the GitHub Re
 4. Pick format (**XML** recommended for most models).
 5. **Copy packed** into your chat / agent, or **Save** to a file.
 6. Optional: click a file for **preview**, or open it in your editor.
+
+### Custom projects (favorites, notes, remembered exclusions)
+
+Open the **Custom** panel in the header (next to **History**):
+
+- Every folder you open appears there. Files you **uncheck** are remembered as
+  exclusions — the next time you open the project they stay unchecked.
+- Star (**favorite**) a project to keep it at the top of the list.
+- Add a free-form **note** (e.g. `keep generated sources out`) — it persists
+  with the project and explains your exclusions.
+- **Export all** downloads one JSON snapshot with every custom project and the
+  folder history; **Import…** merges a snapshot from another machine
+  (newer timestamps win, favorites stick, invalid entries are skipped).
 
 ### `.pttignore`
 

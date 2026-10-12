@@ -33,6 +33,11 @@ import {
   RefreshCw,
   Save,
   Search,
+  SlidersHorizontal,
+  MessageSquare,
+  Download,
+  Upload,
+  Star,
   Sun,
   Trash2,
   X,
@@ -61,6 +66,25 @@ import {
   writeFolderHistory,
   type FolderHistoryEntry,
 } from './folderHistory';
+import {
+  applyDeselectDelta,
+  clearDeselectPaths,
+  projectPrefKey,
+  readProjectPrefs,
+  rememberProject,
+  removeProject,
+  setProjectFavorite,
+  setProjectNote,
+  writeProjectPrefs,
+  type ProjectPref,
+} from './projectPrefs';
+import {
+  buildPrefSnapshot,
+  mergePrefSnapshot,
+  parsePrefSnapshot,
+  snapshotFileName,
+} from './prefTransfer';
+import APP_VERSION from './version';
 import { isTauriRuntime } from './tauriEnv';
 import './index.css';
 
@@ -572,6 +596,170 @@ function formatHistoryDate(timestamp: number): string {
   }).format(timestamp)}`;
 }
 
+function CustomProjectsPanel({
+  entries,
+  currentPath,
+  scanning,
+  onClose,
+  onOpen,
+  onToggleFavorite,
+  onNoteChange,
+  onClearDeselect,
+  onRemove,
+  onExport,
+  onImport,
+}: {
+  entries: ProjectPref[];
+  currentPath: string;
+  scanning: boolean;
+  onClose: () => void;
+  onOpen: (entry: ProjectPref) => void;
+  onToggleFavorite: (entry: ProjectPref) => void;
+  onNoteChange: (entry: ProjectPref, note: string) => void;
+  onClearDeselect: (entry: ProjectPref) => void;
+  onRemove: (entry: ProjectPref) => void;
+  onExport: () => void;
+  onImport: () => void;
+}) {
+  return (
+    <div className="history-overlay" role="presentation" onClick={onClose}>
+      <section
+        className="history-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="custom-projects-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="history-header">
+          <div>
+            <h2 id="custom-projects-title">Custom projects</h2>
+            <p>
+              Projects with saved selection exclusions, favorites first. Notes and
+              excluded files are kept on this device.
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-ghost btn-icon"
+            onClick={onClose}
+            aria-label="Close custom projects"
+          >
+            <X size={14} />
+          </button>
+        </div>
+
+        <div className="history-toolbar custom-transfer" data-testid="custom-transfer">
+          <button type="button" className="panel-link" onClick={onExport}>
+            <Download size={12} aria-hidden /> Export all
+          </button>
+          <button type="button" className="panel-link" onClick={onImport}>
+            <Upload size={12} aria-hidden /> Import…
+          </button>
+          <span className="custom-transfer-hint">JSON · merges into existing entries</span>
+        </div>
+
+        {entries.length > 0 ? (
+          <div className="history-list">
+            {entries.map((entry) => {
+              const isCurrent =
+                !!currentPath &&
+                projectPrefKey(currentPath) === projectPrefKey(entry.path);
+              return (
+                <div
+                  className={`history-item custom-item${isCurrent ? ' is-current' : ''}`}
+                  key={projectPrefKey(entry.path)}
+                >
+                  <div className="custom-item-body">
+                    <button
+                      type="button"
+                      className="history-entry"
+                      onClick={() => onOpen(entry)}
+                      disabled={scanning}
+                      title={entry.path}
+                    >
+                      <FolderOpen size={16} className="history-entry-icon" aria-hidden />
+                      <span className="history-entry-copy">
+                        <strong>{entry.name}</strong>
+                        <span>{entry.path}</span>
+                      </span>
+                      {isCurrent && <span className="history-current">Current</span>}
+                    </button>
+
+                    {entry.deselectPaths.length > 0 && (
+                      <div className="custom-deselect" data-testid="custom-deselect">
+                        <span className="custom-deselect-label" aria-hidden>
+                          <X size={11} /> {entry.deselectPaths.length} deselected
+                        </span>
+                        <button
+                          type="button"
+                          className="panel-link"
+                          onClick={() => onClearDeselect(entry)}
+                          aria-label={`Clear saved deselect list for ${entry.name}`}
+                        >
+                          Clear deselections
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="custom-note-row" data-testid="custom-note">
+                      <MessageSquare size={12} className="icon-muted" aria-hidden />
+                      <textarea
+                        className="custom-note-input"
+                        rows={1}
+                        placeholder="Add a note… (e.g. why these files are excluded)"
+                        value={entry.note}
+                        onChange={(e) => onNoteChange(entry, e.target.value)}
+                        aria-label={`Note for ${entry.name}`}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="history-item-actions">
+                    <button
+                      type="button"
+                      className={`btn btn-icon history-action${entry.favorite ? ' is-pinned' : ''}`}
+                      onClick={() => onToggleFavorite(entry)}
+                      aria-label={
+                        entry.favorite
+                          ? `Remove ${entry.name} from favorites`
+                          : `Add ${entry.name} to favorites`
+                      }
+                      title={entry.favorite ? 'Unfavorite project' : 'Favorite project'}
+                    >
+                      {entry.favorite ? (
+                        <Star size={14} fill="currentColor" />
+                      ) : (
+                        <Star size={14} />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-icon history-action danger"
+                      onClick={() => onRemove(entry)}
+                      aria-label={`Remove ${entry.name} from custom projects`}
+                      title="Remove from custom projects"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="history-empty">
+            <SlidersHorizontal size={22} aria-hidden />
+            <strong>No custom projects yet</strong>
+            <span>
+              Open a project and deselect some files — they will be remembered here.
+            </span>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function FolderHistoryPanel({
   entries,
   currentPath,
@@ -910,6 +1098,8 @@ function App() {
   const [folderHistory, setFolderHistory] = useState<FolderHistoryEntry[]>(() =>
     IN_TAURI ? readFolderHistory() : [],
   );
+  const [showCustom, setShowCustom] = useState(false);
+  const [customProjects, setCustomProjects] = useState<ProjectPref[]>(readProjectPrefs);
   const [themePref, setThemePref] = useState<ThemePref>(() => readThemePref());
   const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() =>
     resolveTheme(readThemePref()),
@@ -959,6 +1149,7 @@ function App() {
 
   const rememberLoadedFolder = useCallback((path: string) => {
     setFolderHistory((prev) => rememberFolder(prev, path));
+    setCustomProjects((prev) => rememberProject(prev, path));
   }, []);
 
   const toggleFolderPin = useCallback((entry: FolderHistoryEntry) => {
@@ -972,6 +1163,72 @@ function App() {
   const clearFolderHistory = useCallback(() => {
     setFolderHistory([]);
   }, []);
+
+  const toggleCustomFavorite = useCallback((entry: ProjectPref) => {
+    setCustomProjects((prev) => setProjectFavorite(prev, entry.path, !entry.favorite));
+  }, []);
+
+  const changeCustomNote = useCallback((entry: ProjectPref, note: string) => {
+    setCustomProjects((prev) => setProjectNote(prev, entry.path, note));
+  }, []);
+
+  const clearCustomDeselect = useCallback((entry: ProjectPref) => {
+    setCustomProjects((prev) => clearDeselectPaths(prev, entry.path));
+  }, []);
+
+  const removeCustomProject = useCallback((entry: ProjectPref) => {
+    setCustomProjects((prev) => removeProject(prev, entry.path));
+  }, []);
+
+  /* ─── Preferences export / import ──────────────────── */
+
+  const exportPrefs = useCallback(() => {
+    const snapshot = buildPrefSnapshot(customProjects, folderHistory);
+    const text = JSON.stringify(snapshot, null, 2);
+    downloadText(snapshotFileName(), text);
+    pushToast(
+      'success',
+      `Exported ${customProjects.length} projects · ${folderHistory.length} history entries`,
+    );
+  }, [customProjects, folderHistory, pushToast]);
+
+  const importPrefs = useCallback(async () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json,.json';
+    input.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+    document.body.appendChild(input);
+    const pick = new Promise<File | null>((resolve) => {
+      input.addEventListener('change', () => resolve(input.files?.[0] ?? null));
+      window.addEventListener(
+        'focus',
+        () => setTimeout(() => resolve(input.files?.[0] ?? null), 600),
+        { once: true },
+      );
+    });
+    input.click();
+    const file = await pick;
+    input.remove();
+    if (!file) return;
+
+    try {
+      const snapshot = parsePrefSnapshot(await file.text());
+      const result = mergePrefSnapshot(
+        snapshot,
+        customProjects,
+        folderHistory,
+      );
+      setCustomProjects(result.projects);
+      setFolderHistory(result.history);
+      pushToast(
+        'success',
+        `Imported ${result.projectsImported} projects · ${result.historyImported} history entries` +
+          (result.skipped > 0 ? ` (${result.skipped} invalid skipped)` : ''),
+      );
+    } catch (e) {
+      pushToast('error', e instanceof Error ? e.message : 'Import failed');
+    }
+  }, [customProjects, folderHistory, pushToast]);
 
   const clearCurrentProject = useCallback(() => {
     if (!currentPath && nodes.length === 0 && !output) return;
@@ -1086,7 +1343,22 @@ function App() {
       nextPreset: SelectionPreset,
       fromBrowser: boolean,
     ) => {
-      const withSelection = applyPreset(result, nextPreset);
+      const withBase = applyPreset(result, nextPreset);
+      // Apply saved per-project deselects (files user unchecked previously)
+      const saved = customProjects.find(
+        (p) => projectPrefKey(p.path) === projectPrefKey(pathLabel),
+      );
+      const savedDeselect = new Set(
+        saved ? saved.deselectPaths.map((p) => p.replace(/\\/g, '/')) : [],
+      );
+      const withSelection =
+        savedDeselect.size > 0
+          ? withBase.map((n) =>
+              !n.is_dir && savedDeselect.has(normalizePath(n.path))
+                ? { ...n, selected: false }
+                : n,
+            )
+          : withBase;
       setNodes(withSelection);
       setCurrentPath(pathLabel);
       setBrowserMode(fromBrowser);
@@ -1135,7 +1407,7 @@ function App() {
       // Pack after tree is visible
       await generateNow(withSelection, pathLabel, format);
     },
-    [format, generateNow, pushToast, rememberLoadedFolder],
+    [format, generateNow, pushToast, rememberLoadedFolder, customProjects],
   );
 
   const scan = useCallback(
@@ -1276,6 +1548,22 @@ function App() {
         return;
       }
       setShowHistory(false);
+      browserProjectRef.current = null;
+      void scan(entry.path);
+    },
+    [pushToast, scan],
+  );
+
+  const openCustomProject = useCallback(
+    (entry: ProjectPref) => {
+      if (!IN_TAURI) {
+        pushToast(
+          'info',
+          'Custom projects can be reopened in the desktop app, where native paths are available.',
+        );
+        return;
+      }
+      setShowCustom(false);
       browserProjectRef.current = null;
       void scan(entry.path);
     },
@@ -1430,6 +1718,26 @@ function App() {
 
   /* ─── Selection ────────────────────────────────────── */
 
+  /** Record just-toggled paths (delta) so Custom projects replay user intent exactly. */
+  const recordDeselectionDelta = useCallback(
+    (toggledPaths: string[], turnedOn: boolean) => {
+      if (!currentPath) return;
+      setCustomProjects((prev) => {
+        const key = projectPrefKey(currentPath);
+        const existing = prev.some((p) => projectPrefKey(p.path) === key);
+        const base = existing ? prev : rememberProject(prev, currentPath);
+        return applyDeselectDelta(
+          base,
+          currentPath,
+          turnedOn
+            ? { turnedOn: toggledPaths, turnedOff: [] }
+            : { turnedOn: [], turnedOff: toggledPaths },
+        );
+      });
+    },
+    [currentPath],
+  );
+
   const toggleSelect = useCallback(
     (path: string, isDir: boolean) => {
       const norm = normalizePath(path);
@@ -1463,11 +1771,24 @@ function App() {
 
         if (currentPath) {
           generate(updated, currentPath, format, false);
+          if (isDir) {
+            const toggled = prev
+              .filter(
+                (n) =>
+                  !n.is_dir &&
+                  (normalizePath(n.path) === norm ||
+                    normalizePath(n.path).startsWith(norm + '/')),
+              )
+              .map((n) => n.path);
+            recordDeselectionDelta(toggled, newState);
+          } else {
+            recordDeselectionDelta([norm], newState);
+          }
         }
         return updated;
       });
     },
-    [currentPath, format, generate],
+    [currentPath, format, generate, recordDeselectionDelta],
   );
 
   const selectAll = useCallback(() => {
@@ -1510,6 +1831,14 @@ function App() {
     }
     setNodes(updated);
     const remaining = updated.filter((n) => n.selected && !n.is_dir).length;
+    if (currentPath) {
+      // Deselect-all is an explicit user action: previously-selected matched files
+      // become exclusions in the Custom replay list.
+      const toggled = updated
+        .filter((n) => !n.is_dir && !n.selected)
+        .map((n) => normalizePath(n.path));
+      recordDeselectionDelta(toggled, false);
+    }
     if (remaining === 0) {
       setOutput('');
       setStats({ files: 0, tokens: 0 });
@@ -1517,7 +1846,7 @@ function App() {
     } else if (currentPath) {
       generate(updated, currentPath, format, true);
     }
-  }, [nodes, filterText, filteredTree, currentPath, format, generate]);
+  }, [nodes, filterText, filteredTree, currentPath, format, generate, recordDeselectionDelta]);
 
   const applySelectionPreset = useCallback(
     (next: SelectionPreset) => {
@@ -1580,8 +1909,12 @@ function App() {
   }, [treeWidth, resizing]);
 
   useEffect(() => {
-    if (IN_TAURI) writeFolderHistory(folderHistory);
+    writeFolderHistory(folderHistory);
   }, [folderHistory]);
+
+  useEffect(() => {
+    writeProjectPrefs(customProjects);
+  }, [customProjects]);
 
   // Theme: apply + follow system when pref is "system"
   useEffect(() => {
@@ -1881,7 +2214,13 @@ function App() {
             </div>
             <div className="brand-text">
               <span className="brand-name">ProjectToText</span>
-              <span className="brand-tag">Pack projects for LLMs</span>
+              <span
+                className="brand-version"
+                title="Application version"
+                data-testid="app-version"
+              >
+                v{APP_VERSION}
+              </span>
             </div>
           </div>
 
@@ -1907,6 +2246,24 @@ function App() {
               <Moon size={15} />
             ) : (
               <Monitor size={15} />
+            )}
+          </button>
+
+          <button
+            type="button"
+            className={`btn history-toggle${showCustom ? ' is-active' : ''}`}
+            onClick={() => setShowCustom((visible) => !visible)}
+            title="Custom projects — saved exclusions, favorites, notes"
+            aria-label="Open custom projects"
+            aria-expanded={showCustom}
+            data-testid="btn-custom-projects"
+          >
+            <SlidersHorizontal size={15} />
+            <span className="btn-label">Custom</span>
+            {customProjects.length > 0 && (
+              <span className="history-count" aria-label={`${customProjects.length} custom projects`}>
+                {customProjects.length}
+              </span>
             )}
           </button>
 
@@ -2425,6 +2782,22 @@ function App() {
           onTogglePin={toggleFolderPin}
           onRemove={removeFolderFromHistory}
           onClear={clearFolderHistory}
+        />
+      )}
+
+      {showCustom && (
+        <CustomProjectsPanel
+          entries={customProjects}
+          currentPath={currentPath}
+          scanning={scanning}
+          onClose={() => setShowCustom(false)}
+          onOpen={openCustomProject}
+          onToggleFavorite={toggleCustomFavorite}
+          onNoteChange={changeCustomNote}
+          onClearDeselect={clearCustomDeselect}
+          onRemove={removeCustomProject}
+          onExport={exportPrefs}
+          onImport={importPrefs}
         />
       )}
 

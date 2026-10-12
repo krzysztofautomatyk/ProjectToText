@@ -360,6 +360,105 @@ body {
   font-weight: 500;
 }
 
+.brand-version {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-weight: 500;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Custom projects panel ─────────────────────────── */
+
+.custom-transfer {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.custom-transfer .panel-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+}
+
+.custom-transfer-hint {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.custom-item {
+  align-items: stretch;
+}
+
+.custom-item-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 4px;
+}
+
+.custom-item-body .history-entry {
+  align-self: stretch;
+}
+
+.custom-deselect {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 8px 0 34px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.custom-deselect-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--warning);
+  font-weight: 550;
+}
+
+.custom-note-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 8px 0 34px;
+  color: var(--text-faint);
+}
+
+.custom-note-row > svg {
+  margin-top: 5px;
+  flex-shrink: 0;
+}
+
+.custom-note-input {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  padding: 4px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-canvas);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.custom-note-input::placeholder {
+  color: var(--text-faint);
+}
+
+.custom-note-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-soft);
+}
+
 .path-chip {
   display: flex;
   align-items: center;
