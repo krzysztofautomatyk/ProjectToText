@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-13
+
+### Fixed
+
+- macOS app bundles are now signed (ad-hoc), so Apple Silicon Macs no longer report the app as "damaged" after install. The app is still not notarized, so Gatekeeper asks users to confirm opening it.
+
 ## [0.2.4] - 2026-10-13
 
 ### Changed

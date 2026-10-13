@@ -1,7 +1,7 @@
 {
   "$schema": "https://v2.tauri.app/schema.json",
   "productName": "ptt",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "identifier": "com.projecttotext.ptt",
   "build": {
     "beforeDevCommand": {
