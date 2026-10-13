@@ -40,6 +40,18 @@ Inspired by tools like [Repomix](https://github.com/yamadashy/repomix), optimize
 | <img src="docs/screenshots/01-main-dark.jpg" alt="Main UI dark" width="280" /> | <img src="docs/screenshots/02-file-preview.jpg" alt="File preview" width="280" /> | <img src="docs/screenshots/03-light-theme.jpg" alt="Light theme" width="280" /> |
 | Tree · presets · XML pack | Click file · syntax · VS Code | .NET / XAML Source · MD |
 
+### v0.2.0 — new in this release
+
+| Version + main view | Custom projects panel | Export all |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/04-main-v0.2.png" alt="Main view with version chip" width="280" /> | <img src="docs/screenshots/05-custom-projects.png" alt="Custom projects panel" width="280" /> | <img src="docs/screenshots/06-export-import.png" alt="Export toast" width="280" /> |
+| `v0.2.0` in header · Custom button with count | Favorites on top · notes · remembered exclusions | JSON snapshot download |
+
+| Import merge |
+|:---:|
+| <img src="docs/screenshots/07-import-merge.png" alt="Import merge toast" width="280" /> |
+| Snapshot imported back · merged into existing entries |
+
 Vector mockups (crisp on HiDPI): [`01-main.svg`](docs/screenshots/01-main.svg) · [`02-preview.svg`](docs/screenshots/02-preview.svg) · [`03-light.svg`](docs/screenshots/03-light.svg)
 
 ---
