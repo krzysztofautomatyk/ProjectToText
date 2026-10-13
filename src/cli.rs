@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process;
 
@@ -21,7 +21,7 @@ ARGS:
 OPTIONS:
   -f, --format <FMT>    xml | markdown | json | plain  (default: xml)
   -o, --output <FILE>   Write to file instead of stdout
-      --no-summary      Omit directory structure summary
+      --no-summary      Omit XML file summary (directory listing remains)
       --max-size <N>    Per-file size limit in bytes (default: 2097152)
   -h, --help            Show this help
 
@@ -40,10 +40,34 @@ struct PackArgs {
     max_file_size: u64,
 }
 
-pub fn maybe_run() -> bool {
+pub enum Launch {
+    Headless,
+    Desktop(Option<String>),
+}
+
+fn desktop_folder(argv: &[String]) -> Result<Option<String>, String> {
+    if argv.is_empty() {
+        return Ok(None);
+    }
+    if argv.len() != 1 || argv[0].starts_with('-') {
+        return Err("Use ptt [DIR] for desktop or ptt pack [DIR] [OPTIONS]".into());
+    }
+    let path = PathBuf::from(&argv[0]);
+    if !path.is_dir() {
+        return Err(format!("Unknown command or invalid directory: {}", argv[0]));
+    }
+    Ok(Some(
+        path.canonicalize()
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .into_owned(),
+    ))
+}
+
+pub fn maybe_run() -> Launch {
     let mut argv = env::args().skip(1).collect::<Vec<_>>();
     if argv.is_empty() {
-        return false;
+        return Launch::Desktop(None);
     }
     let cmd = argv[0].as_str();
     if cmd != "pack" && cmd != "--pack" {
@@ -55,7 +79,13 @@ pub fn maybe_run() -> bool {
             println!("ptt {}", env!("CARGO_PKG_VERSION"));
             process::exit(0);
         }
-        return false;
+        return match desktop_folder(&argv) {
+            Ok(folder) => Launch::Desktop(folder),
+            Err(error) => {
+                eprintln!("ptt: {error}");
+                process::exit(2);
+            }
+        };
     }
     argv.remove(0);
     match parse_args(&argv) {
@@ -64,7 +94,7 @@ pub fn maybe_run() -> bool {
                 eprintln!("ptt pack: {e}");
                 process::exit(1);
             }
-            true
+            Launch::Headless
         }
         Err(e) => {
             eprintln!("ptt pack: {e}\n\n{USAGE}");
@@ -76,7 +106,7 @@ pub fn maybe_run() -> bool {
 fn print_top_help() {
     println!(
         "ptt {} — ProjectToText\n\n\
-         Desktop:  run with no arguments (or launch the app bundle)\n\
+         Desktop:  ptt [DIR] (or launch the app bundle)\n\
          Headless: ptt pack [DIR] [OPTIONS]\n\n\
          {USAGE}",
         env!("CARGO_PKG_VERSION")
@@ -168,8 +198,16 @@ fn run_pack(args: &PackArgs) -> Result<(), String> {
         max_file_size: args.max_file_size,
     };
 
-    let mut buf = Vec::new();
-    write_output(&mut buf, &entries, &root, &opts).map_err(|e| e.to_string())?;
+    fn stream<W: Write>(
+        writer: W,
+        entries: &[ptt::DirEntryMeta],
+        root: &std::path::Path,
+        opts: &WriteOptions,
+    ) -> Result<(), String> {
+        let mut writer = BufWriter::new(writer);
+        write_output(&mut writer, entries, root, opts).map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())
+    }
 
     match &args.output {
         Some(path) => {
@@ -178,24 +216,27 @@ fn run_pack(args: &PackArgs) -> Result<(), String> {
                     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
             }
-            fs::write(path, &buf).map_err(|e| e.to_string())?;
-            eprintln!(
-                "ptt pack: wrote {} files → {} ({} bytes)",
-                file_count,
-                path.display(),
-                buf.len()
-            );
+            if path.exists() {
+                let destination = path.canonicalize().map_err(|error| error.to_string())?;
+                if entries
+                    .iter()
+                    .any(|entry| !entry.is_dir && root.join(&entry.path) == destination)
+                {
+                    return Err(
+                        "Output is also an input file; place it outside the project or ignore it"
+                            .into(),
+                    );
+                }
+            }
+            let file = fs::File::create(path).map_err(|error| error.to_string())?;
+            stream(file, &entries, &root, &opts)?;
+            eprintln!("ptt pack: wrote {} files → {}", file_count, path.display());
         }
         None => {
-            let mut out = io::stdout().lock();
-            out.write_all(&buf).map_err(|e| e.to_string())?;
-            if !buf.ends_with(b"\n") {
-                let _ = out.write_all(b"\n");
-            }
+            stream(io::stdout().lock(), &entries, &root, &opts)?;
             eprintln!(
-                "ptt pack: {} files · {} bytes · {}",
+                "ptt pack: {} files · {}",
                 file_count,
-                buf.len(),
                 format_label(args.format)
             );
         }
@@ -249,6 +290,16 @@ mod tests {
             text.contains("fn main") || text.contains("CDATA") || text.contains("file"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn desktop_arguments_validate_folder_and_reject_typos() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().to_string_lossy().into_owned();
+        assert!(desktop_folder(&[path]).unwrap().is_some());
+        assert_eq!(desktop_folder(&[]).unwrap(), None);
+        assert!(desktop_folder(&["pak".into(), ".".into()]).is_err());
+        assert!(desktop_folder(&["--unknown".into()]).is_err());
     }
 
     #[test]

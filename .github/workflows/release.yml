@@ -36,10 +36,10 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: npm
@@ -73,7 +73,7 @@ jobs:
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.app_version.outputs.version) }}
           releaseName: ProjectToText ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}-dev', steps.app_version.outputs.version) }}
-          releaseBody: "Pick the file for your system: macOS Apple Silicon (M1 and newer) .dmg, macOS Intel .dmg, Windows .msi/.exe, or Linux .AppImage/.deb/.rpm. Use: ptt pack . -o context.xml"
+          releaseBody: "Pick the file for your system: macOS Apple Silicon (M1 and newer) .dmg, macOS Intel .dmg, Windows .msi/.exe, or Linux .AppImage/.deb/.rpm. Use: ptt pack . -o context.xml\n\n**macOS: 'Apple cannot verify ptt.app' warning.** The app is not notarized yet, so Gatekeeper blocks the first launch. Click Done (not Move to Bin), then open System Settings > Privacy & Security, scroll down and click Open Anyway next to ptt.app (available for about an hour). Or run: xattr -dr com.apple.quarantine /Applications/ptt.app"
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
@@ -85,12 +85,12 @@ jobs:
   # does a plain GET, which returns JSON for those, so rewrite them to public download links.
   verify-updater-manifest:
     needs: publish-tauri
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read app version
         id: app_version

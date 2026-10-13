@@ -290,6 +290,35 @@ export function pickDirectoryWithInput(): Promise<FileList> {
 const PREVIEW_MAX = 512 * 1024;
 const PACK_MAX = 2 * 1024 * 1024;
 
+type DecodeResult = { ok: true; text: string } | { ok: false; reason: 'binary' | 'encoding' };
+
+const INVALID_ENCODING_MESSAGE = '[Invalid text encoding: use UTF-8 or UTF-16 with BOM]';
+
+/** Mirrors `decode_text` in src/core/text.rs: UTF-8 or BOM-declared UTF-16, never guessed. */
+function decodeText(buf: Uint8Array, truncated = false): DecodeResult {
+  const encoding = buf[0] === 0xff && buf[1] === 0xfe ? 'utf-16le'
+    : buf[0] === 0xfe && buf[1] === 0xff ? 'utf-16be' : 'utf-8';
+  const hasBom = encoding !== 'utf-8' || (buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf);
+  if (!hasBom && looksBinary(buf)) return { ok: false, reason: 'binary' };
+  let text: string;
+  try {
+    text = new TextDecoder(encoding, { fatal: true }).decode(buf, { stream: truncated });
+  } catch {
+    return { ok: false, reason: 'encoding' };
+  }
+  return text.includes('\0') ? { ok: false, reason: 'binary' } : { ok: true, text };
+}
+
+function markdownFence(content: string): string {
+  let longest = 0;
+  let run = 0;
+  for (const char of content) {
+    run = char === '`' ? run + 1 : 0;
+    longest = Math.max(longest, run);
+  }
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
 export async function readBrowserFilePreview(
   project: BrowserProject,
   relativePath: string,
@@ -321,8 +350,21 @@ export async function readBrowserFilePreview(
   }
   const slice = file.slice(0, Math.min(size, PREVIEW_MAX));
   const buf = new Uint8Array(await slice.arrayBuffer());
-  const binary = buf.includes(0) || looksBinary(buf);
-  if (binary) {
+  const truncated = size > PREVIEW_MAX;
+  const decoded = decodeText(buf, truncated);
+  if (!decoded.ok && decoded.reason === 'encoding') {
+    return {
+      path: file.name,
+      relativePath: key,
+      language: 'plaintext',
+      content: INVALID_ENCODING_MESSAGE,
+      size,
+      truncated: false,
+      binary: false,
+      absolutePath: `${project.rootName}/${key}`,
+    };
+  }
+  if (!decoded.ok) {
     return {
       path: file.name,
       relativePath: key,
@@ -334,8 +376,7 @@ export async function readBrowserFilePreview(
       absolutePath: `${project.rootName}/${key}`,
     };
   }
-  let content = new TextDecoder('utf-8', { fatal: false }).decode(buf);
-  const truncated = size > PREVIEW_MAX;
+  let content = decoded.text;
   if (truncated) {
     content += `\n\n// … truncated for preview (${size} bytes total) …`;
   }
@@ -394,11 +435,10 @@ async function readPackContent(file: File): Promise<string> {
   }
   try {
     const buf = new Uint8Array(await file.arrayBuffer());
-    if (buf.includes(0) || looksBinary(buf)) {
-      return `[Binary file - ${file.size} bytes, content omitted for LLM safety]`;
-    }
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
-    return text;
+    const decoded = decodeText(buf);
+    if (decoded.ok) return decoded.text;
+    if (decoded.reason === 'encoding') return INVALID_ENCODING_MESSAGE;
+    return `[Binary file - ${file.size} bytes, content omitted for LLM safety]`;
   } catch (e) {
     return `[Error reading file: ${e instanceof Error ? e.message : String(e)}]`;
   }
@@ -409,10 +449,20 @@ export async function generateBrowserOutput(
   selectedPaths: string[],
   format: string,
 ): Promise<string> {
-  const selected = selectedPaths.map((p) => p.replace(/\\/g, '/'));
+  const selected = new Set(selectedPaths.map((p) => p.replace(/\\/g, '/').replace(/\/+$/, '')));
+  const isSelected = (path: string): boolean => {
+    let prefix = path;
+    while (prefix) {
+      if (selected.has(prefix)) return true;
+      const slash = prefix.lastIndexOf('/');
+      if (slash < 0) return false;
+      prefix = prefix.slice(0, slash);
+    }
+    return false;
+  };
   const entries: { path: string; file: File }[] = [];
   for (const [path, file] of project.files) {
-    if (selected.some((sp) => path === sp || path.startsWith(sp + '/'))) {
+    if (isSelected(path)) {
       entries.push({ path, file });
     }
   }
@@ -452,7 +502,7 @@ export async function generateBrowserOutput(
     for (const e of limited) {
       const content = await readPackContent(e.file);
       const ext = e.path.includes('.') ? e.path.split('.').pop() : '';
-      const fence = content.includes('```') ? '~~~~' : '```';
+      const fence = markdownFence(content);
       parts.push(`## \`${e.path}\`\n${fence}${ext}\n${content}\n${fence}\n`);
     }
     return parts.join('\n');

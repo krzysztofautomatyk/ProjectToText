@@ -102,6 +102,12 @@ interface FileNode {
   selected: boolean;
 }
 
+interface ScanResult {
+  root: string;
+  revision: number;
+  nodes: FileNode[];
+}
+
 interface PackOptions {
   format: string;
   include_summary: boolean;
@@ -311,6 +317,11 @@ function estimateTokens(text: string): number {
   return Math.max(0, Math.round(text.length / 3.8));
 }
 
+/** Same heuristic as estimateTokens, applied to a file's byte size (no content read). */
+function estimateTokensFromBytes(bytes: number): number {
+  return Math.max(0, Math.round(bytes / 3.8));
+}
+
 const TOKEN_ESTIMATE_HINT =
   'Approximate only (chars ÷ 3.8). Not a model-specific tokenizer.';
 
@@ -452,38 +463,57 @@ function buildFileTree(flatNodes: FileNode[]): TreeNode {
   return root;
 }
 
+type SubtreeStats = {
+  selected: number;
+  total: number;
+  partial: boolean;
+  allSelected: boolean;
+  /** Estimated tokens of every file in the subtree (selected or not). */
+  tokens: number;
+};
+
 function computeSubtree(
   node: TreeNode,
   selectedSet: Set<string>,
-): { selected: number; total: number; partial: boolean; allSelected: boolean } {
+  stats: Map<string, SubtreeStats>,
+): SubtreeStats {
   if (!node.isDir) {
     const sel = selectedSet.has(node.path);
-    return { selected: sel ? 1 : 0, total: 1, partial: false, allSelected: sel };
+    const result: SubtreeStats = {
+      selected: sel ? 1 : 0,
+      total: 1,
+      partial: false,
+      allSelected: sel,
+      tokens: estimateTokensFromBytes(node.size ?? 0),
+    };
+    stats.set(node.path, result);
+    return result;
   }
 
   let selected = 0;
   let total = 0;
   let allSelected = true;
   let anySelected = false;
+  let tokens = 0;
 
   for (const child of node.children) {
-    const res = computeSubtree(child, selectedSet);
+    const res = computeSubtree(child, selectedSet, stats);
     selected += res.selected;
     total += res.total;
+    tokens += res.tokens;
     if (!res.allSelected) allSelected = false;
     if (res.selected > 0) anySelected = true;
   }
 
-  if (total === 0) {
-    return { selected: 0, total: 0, partial: false, allSelected: false };
-  }
-
-  return {
+  const result: SubtreeStats = {
     selected,
     total,
     partial: anySelected && !allSelected,
-    allSelected,
+    allSelected: total > 0 && allSelected,
+    tokens,
   };
+  stats.set(node.path, result);
+  return result;
 }
 
 function highlightMatch(text: string, query: string): ReactNode {
@@ -564,7 +594,6 @@ const ABOUT_FRONTEND_LIBS = [
   'react-dom',
   'lucide-react',
   'highlight.js',
-  'tailwindcss',
 ];
 const ABOUT_BACKEND_LIBS = [
   'tauri',
@@ -579,6 +608,7 @@ const ABOUT_BACKEND_LIBS = [
   'tokio',
   'arboard',
   'open',
+  'dunce',
 ];
 
 function AboutDialog({
@@ -970,6 +1000,8 @@ function TreeItem({
   onContextMenu,
   focusedPath,
   previewPath,
+  subtreeStats,
+  tokenSort,
 }: {
   node: TreeNode;
   depth: number;
@@ -983,6 +1015,8 @@ function TreeItem({
   onContextMenu: (e: ReactMouseEvent, path: string, isDir: boolean) => void;
   focusedPath: string | null;
   previewPath: string | null;
+  subtreeStats: Map<string, SubtreeStats>;
+  tokenSort: boolean;
 }) {
   const checkRef = useRef<HTMLInputElement>(null);
   const hasChildren = node.children.length > 0;
@@ -990,10 +1024,20 @@ function TreeItem({
   // When filtering, auto-expand matched branches
   const showChildren = hasChildren && (isExpanded || !!filterText.trim());
 
-  const subtree = useMemo(
-    () => computeSubtree(node, selectedSet),
-    [node, selectedSet],
-  );
+  const subtree = subtreeStats.get(node.path) ?? {
+    selected: 0,
+    total: 0,
+    partial: false,
+    allSelected: false,
+    tokens: 0,
+  };
+  // Children ordered by estimated token weight (heaviest first) when sorting by tokens.
+  const children = tokenSort
+    ? [...node.children].sort(
+        (a, b) =>
+          (subtreeStats.get(b.path)?.tokens ?? 0) - (subtreeStats.get(a.path)?.tokens ?? 0),
+      )
+    : node.children;
 
   const isSelected = node.isDir
     ? subtree.allSelected && subtree.total > 0
@@ -1103,6 +1147,12 @@ function TreeItem({
           <span className="tree-size">{formatBytes(node.size)}</span>
         )}
 
+        {subtree.tokens > 0 && (
+          <span className="tree-tokens" title="Approximate tokens (bytes ÷ 3.8)">
+            ~{formatTokens(subtree.tokens)} tok
+          </span>
+        )}
+
         <label className="tree-check" onClick={(e) => e.stopPropagation()}>
           <input
             ref={checkRef}
@@ -1122,7 +1172,7 @@ function TreeItem({
 
       {hasChildren && showChildren && (
         <div role="group">
-          {node.children.map((child) => (
+          {children.map((child) => (
             <TreeItem
               key={child.path}
               node={child}
@@ -1137,6 +1187,8 @@ function TreeItem({
               onContextMenu={onContextMenu}
               focusedPath={focusedPath}
               previewPath={previewPath}
+              subtreeStats={subtreeStats}
+              tokenSort={tokenSort}
             />
           ))}
         </div>
@@ -1157,6 +1209,7 @@ function App() {
   const [stats, setStats] = useState({ files: 0, tokens: 0 });
   const [view, setView] = useState<ViewMode>('packed');
   const [listFormat, setListFormat] = useState<ListFormat>('tree');
+  const [tokenSort, setTokenSort] = useState(false);
   const [filterText, setFilterText] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [preset, setPreset] = useState<SelectionPreset>('source');
@@ -1198,6 +1251,10 @@ function App() {
   const generateTimer = useRef<number | null>(null);
   /** Browser-mode project (files in memory). Null in Tauri desktop mode. */
   const browserProjectRef = useRef<BrowserProject | null>(null);
+  const workspaceRevision = useRef(0);
+  const scanSeq = useRef(0);
+  const startupRequested = useRef(false);
+  const [fullOutputPreview, setFullOutputPreview] = useState(false);
   const [browserMode, setBrowserMode] = useState(!IN_TAURI);
   /** Newer release found by the Tauri updater (desktop builds only). */
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
@@ -1237,6 +1294,11 @@ function App() {
     () => filterTree(fileTree, filterText),
     [fileTree, filterText],
   );
+  const subtreeStats = useMemo(() => {
+    const stats = new Map<string, SubtreeStats>();
+    computeSubtree(filteredTree ?? fileTree, selectedSet, stats);
+    return stats;
+  }, [filteredTree, fileTree, selectedSet]);
 
   const fileListText = useMemo(
     () => (listFormat === 'tree' ? generateFileList(nodes) : generatePathsList(nodes)),
@@ -1244,6 +1306,9 @@ function App() {
   );
 
   const totalFiles = useMemo(() => nodes.filter((n) => !n.is_dir).length, [nodes]);
+
+  // Byte size of the output, computed once per output instead of on every render.
+  const outputBytes = useMemo(() => new Blob([output]).size, [output]);
 
   /* ─── Toasts ───────────────────────────────────────── */
 
@@ -1349,6 +1414,8 @@ function App() {
       generateTimer.current = null;
     }
     genSeq.current += 1;
+    scanSeq.current += 1;
+    workspaceRevision.current = 0;
     browserProjectRef.current = null;
     hasLoadedOnce.current = false;
     setCurrentPath('');
@@ -1379,6 +1446,7 @@ function App() {
       rootPath: string,
       fmt: OutputFormat,
     ) => {
+      const seq = ++genSeq.current;
       const sel = currentNodes
         .filter((n) => n.selected && !n.is_dir)
         .map((n) => normalizePath(n.path));
@@ -1389,7 +1457,6 @@ function App() {
         return;
       }
 
-      const seq = ++genSeq.current;
       setGenerating(true);
       try {
         let result: string;
@@ -1405,16 +1472,20 @@ function App() {
             path: rootPath,
             selectedPaths: sel,
             options: opts,
+            revision: workspaceRevision.current,
           });
         }
         if (seq !== genSeq.current) return;
         setOutput(result);
+        setFullOutputPreview(false);
         setStats({ files: sel.length, tokens: estimateTokens(result) });
         hasLoadedOnce.current = true;
       } catch (e) {
         if (seq !== genSeq.current) return;
         console.error(e);
-        pushToast('error', 'Failed to generate packed output');
+        setOutput('');
+        setStats({ files: 0, tokens: 0 });
+        pushToast('error', `Failed to generate packed output: ${String(e)}`);
       } finally {
         if (seq === genSeq.current) setGenerating(false);
       }
@@ -1438,6 +1509,7 @@ function App() {
         void generateNow(currentNodes, rootPath, fmt);
         return;
       }
+      ++genSeq.current;
       setGenerating(true);
       generateTimer.current = window.setTimeout(() => {
         generateTimer.current = null;
@@ -1530,23 +1602,38 @@ function App() {
         );
         return;
       }
+      const sequence = ++scanSeq.current;
+      ++genSeq.current;
+      if (generateTimer.current != null) window.clearTimeout(generateTimer.current);
       setScanning(true);
       setGenerating(false);
+      setOutput('');
       try {
         browserProjectRef.current = null;
-        const result = await invoke<FileNode[]>('scan_folder', { path });
-        await applyScanResult(result, path, nextPreset, false);
+        const result = await invoke<ScanResult>('scan_folder', { path });
+        if (sequence !== scanSeq.current) return;
+        workspaceRevision.current = result.revision;
+        await applyScanResult(result.nodes, result.root, nextPreset, false);
       } catch (e) {
         console.error(e);
         const msg = e instanceof Error ? e.message : String(e);
+        if (sequence !== scanSeq.current) return;
         pushToast('error', `Failed to scan folder: ${msg}`);
         setGenerating(false);
       } finally {
-        setScanning(false);
+        if (sequence === scanSeq.current) setScanning(false);
       }
     },
     [preset, applyScanResult, pushToast],
   );
+
+  useEffect(() => {
+    if (!IN_TAURI || startupRequested.current) return;
+    startupRequested.current = true;
+    invoke<string | null>('startup_folder')
+      .then((folder) => { if (folder) void scan(folder); })
+      .catch((error) => pushToast('error', `Cannot open startup folder: ${String(error)}`));
+  }, [scan, pushToast]);
 
   const openFolderBrowser = useCallback(async () => {
     setScanning(true);
@@ -2202,6 +2289,10 @@ function App() {
           setShowHistory(false);
           return;
         }
+        if (showCustom) {
+          setShowCustom(false);
+          return;
+        }
         if (filterText) {
           setFilterText('');
           filterRef.current?.blur();
@@ -2230,6 +2321,7 @@ function App() {
     showHelp,
     showAbout,
     showHistory,
+    showCustom,
   ]);
 
   /* ─── Resizable panel ──────────────────────────────── */
@@ -2636,6 +2728,15 @@ function App() {
                 <button type="button" className="panel-link" onClick={collapseAll}>
                   Collapse
                 </button>
+                <button
+                  type="button"
+                  className="panel-link"
+                  aria-pressed={tokenSort}
+                  title="Sort children by estimated token weight"
+                  onClick={() => setTokenSort((v) => !v)}
+                >
+                  {tokenSort ? 'Sort: tokens' : 'Sort: name'}
+                </button>
               </div>
             )}
           </div>
@@ -2664,6 +2765,8 @@ function App() {
                   onContextMenu={handleTreeContextMenu}
                   focusedPath={focusedPath}
                   previewPath={previewRelPath}
+                  subtreeStats={subtreeStats}
+                  tokenSort={tokenSort}
                 />
               ))
             ) : currentPath && filterText ? (
@@ -2874,7 +2977,17 @@ function App() {
               />
             ) : view === 'packed' ? (
               output ? (
-                <pre className="output-text">{output}</pre>
+                <div>
+                  {output.length > 150_000 && (
+                    <div className="preview-inline-actions">
+                      <span>{fullOutputPreview ? 'Full preview' : 'Preview limited to 100,000 characters'}. Copy and Save use the complete output.</span>
+                      <button type="button" className="btn" onClick={() => setFullOutputPreview((shown) => !shown)}>
+                        {fullOutputPreview ? 'Limit preview' : `Show full preview (${formatBytes(outputBytes)})`}
+                      </button>
+                    </div>
+                  )}
+                  <pre className="output-text">{output.length > 150_000 && !fullOutputPreview ? output.slice(0, 100_000) : output}</pre>
+                </div>
               ) : (
                 <div className="empty-state">
                   <div className="empty-icon">

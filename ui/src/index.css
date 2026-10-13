@@ -812,6 +812,16 @@ body {
   margin-right: 2px;
 }
 
+.tree-tokens {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
 .tree-check {
   display: flex;
   align-items: center;

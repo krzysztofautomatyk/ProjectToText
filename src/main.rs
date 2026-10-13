@@ -19,7 +19,33 @@ use tauri_plugin_dialog::DialogExt;
 use ptt::core::output::OutputFormat;
 use ptt::core::output::{WriteOptions, DEFAULT_MAX_FILE_SIZE};
 use ptt::core::preview::{load_preview, resolve_under_root, DEFAULT_PREVIEW_MAX};
-use ptt::core::walker::{normalize_rel_path, path_is_selected, walk};
+use ptt::core::walker::normalize_rel_path;
+use ptt::core::workspace::WorkspaceIndex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+#[derive(Default)]
+struct DesktopState {
+    workspace: Arc<WorkspaceIndex>,
+    startup_folder: Option<String>,
+    /// Bumped by every `generate_output` call so an older pack stops at its next file.
+    generation: Arc<AtomicU64>,
+}
+
+#[derive(Serialize)]
+struct ScanResult {
+    root: String,
+    revision: u64,
+    nodes: Vec<FileNode>,
+}
+
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| error.to_string())?
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileNode {
@@ -62,35 +88,46 @@ async fn select_folder(app: tauri::AppHandle) -> Result<Option<String>, String> 
 }
 
 #[tauri::command]
-async fn scan_folder(path: String) -> Result<Vec<FileNode>, String> {
-    let root = PathBuf::from(&path);
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {path}"));
-    }
+async fn scan_folder(
+    path: String,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<ScanResult, String> {
+    let index = state.workspace.clone();
+    blocking(move || {
+        let snapshot = index.scan(Path::new(&path))?;
+        let nodes: Vec<FileNode> = snapshot
+            .entries
+            .iter()
+            .map(|e| {
+                let path_str = normalize_rel_path(&e.path);
+                let name = e
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path_str.clone());
+                FileNode {
+                    path: path_str,
+                    name,
+                    is_dir: e.is_dir,
+                    size: e.size,
+                    children: None,
+                    selected: false,
+                }
+            })
+            .collect();
 
-    let entries = walk(&root).map_err(|e| e.to_string())?;
-
-    let nodes: Vec<FileNode> = entries
-        .into_iter()
-        .map(|e| {
-            let path_str = normalize_rel_path(&e.path);
-            let name = e
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path_str.clone());
-            FileNode {
-                path: path_str,
-                name,
-                is_dir: e.is_dir,
-                size: e.size,
-                children: None,
-                selected: false,
-            }
+        Ok(ScanResult {
+            root: snapshot.root.to_string_lossy().into_owned(),
+            revision: snapshot.revision,
+            nodes,
         })
-        .collect();
+    })
+    .await
+}
 
-    Ok(nodes)
+#[tauri::command]
+fn startup_folder(state: tauri::State<'_, DesktopState>) -> Option<String> {
+    state.startup_folder.clone()
 }
 
 #[tauri::command]
@@ -98,47 +135,38 @@ async fn generate_output(
     path: String,
     selected_paths: Vec<String>,
     options: PackOptions,
+    revision: u64,
+    state: tauri::State<'_, DesktopState>,
 ) -> Result<String, String> {
-    let root = PathBuf::from(&path);
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {path}"));
-    }
+    let generation = state.generation.clone();
+    let request = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let index = state.workspace.clone();
+    blocking(move || {
+        let snapshot = index.get(Path::new(&path), revision)?;
+        let root = &snapshot.root;
+        let filtered = snapshot.selected(&selected_paths);
 
-    let entries = walk(&root).map_err(|e| e.to_string())?;
+        let format = match options.format.as_str() {
+            "markdown" => OutputFormat::Markdown,
+            "json" => OutputFormat::Json,
+            "plain" => OutputFormat::Plain,
+            _ => OutputFormat::Xml,
+        };
 
-    let selected_norm: Vec<String> = selected_paths
-        .iter()
-        .map(|p| p.replace('\\', "/").trim_end_matches('/').to_string())
-        .filter(|p| !p.is_empty())
-        .collect();
+        let write_opts = WriteOptions {
+            format,
+            include_file_summary: options.include_summary,
+            max_file_size: options.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
+        };
 
-    let filtered: Vec<_> = entries
-        .into_iter()
-        .filter(|e| {
-            if e.is_dir {
-                return false;
-            }
-            selected_norm.iter().any(|sp| path_is_selected(&e.path, sp))
-        })
-        .collect();
+        let mut buf = Vec::new();
+        let is_superseded = || generation.load(Ordering::SeqCst) != request;
+        ptt::write_output_cancellable(&mut buf, &filtered, root, &write_opts, &is_superseded)
+            .map_err(|e| e.to_string())?;
 
-    let format = match options.format.as_str() {
-        "markdown" => OutputFormat::Markdown,
-        "json" => OutputFormat::Json,
-        "plain" => OutputFormat::Plain,
-        _ => OutputFormat::Xml,
-    };
-
-    let write_opts = WriteOptions {
-        format,
-        include_file_summary: options.include_summary,
-        max_file_size: options.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
-    };
-
-    let mut buf = Vec::new();
-    ptt::write_output(&mut buf, &filtered, &root, &write_opts).map_err(|e| e.to_string())?;
-
-    String::from_utf8(buf).map_err(|e| format!("Output is not valid UTF-8: {e}"))
+        String::from_utf8(buf).map_err(|e| format!("Output is not valid UTF-8: {e}"))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -147,20 +175,23 @@ async fn read_file_preview(
     relative_path: String,
     max_bytes: Option<u64>,
 ) -> Result<FilePreviewDto, String> {
-    let root_pb = PathBuf::from(&root);
-    let full = resolve_under_root(&root_pb, &relative_path).map_err(|e| e.to_string())?;
-    let max = max_bytes.unwrap_or(DEFAULT_PREVIEW_MAX);
-    let prev = load_preview(&full, max).map_err(|e| e.to_string())?;
-    Ok(FilePreviewDto {
-        path: prev.path,
-        relative_path: relative_path.replace('\\', "/"),
-        language: prev.language,
-        content: prev.content,
-        size: prev.size,
-        truncated: prev.truncated,
-        binary: prev.binary,
-        absolute_path: prev.absolute_path,
+    blocking(move || {
+        let root_pb = PathBuf::from(&root);
+        let full = resolve_under_root(&root_pb, &relative_path).map_err(|e| e.to_string())?;
+        let max = max_bytes.unwrap_or(DEFAULT_PREVIEW_MAX);
+        let prev = load_preview(&full, max).map_err(|e| e.to_string())?;
+        Ok(FilePreviewDto {
+            path: prev.path,
+            relative_path: relative_path.replace('\\', "/"),
+            language: prev.language,
+            content: prev.content,
+            size: prev.size,
+            truncated: prev.truncated,
+            binary: prev.binary,
+            absolute_path: prev.absolute_path,
+        })
     })
+    .await
 }
 
 /// Extensions that run code when opened. The default-app action refuses them, so one
@@ -193,6 +224,7 @@ fn validate_editor_command(app: &str) -> Result<&str, String> {
 /// Open a project file with the OS default application.
 #[tauri::command]
 async fn open_in_default_app(root: String, relative_path: String) -> Result<(), String> {
+    blocking(move || {
     let full =
         resolve_under_root(&PathBuf::from(&root), &relative_path).map_err(|e| e.to_string())?;
     if is_executable_like(&full) {
@@ -201,16 +233,21 @@ async fn open_in_default_app(root: String, relative_path: String) -> Result<(), 
                 .into(),
         );
     }
-    open::that(&full).map_err(|e| format!("Failed to open file: {e}"))
+    open::that(dunce::simplified(&full)).map_err(|e| format!("Failed to open file: {e}"))
+    }).await
 }
 
 /// Open a project file with one of the known editors (see `KNOWN_EDITORS`).
 #[tauri::command]
 async fn open_with_app(root: String, relative_path: String, app: String) -> Result<(), String> {
-    let full =
-        resolve_under_root(&PathBuf::from(&root), &relative_path).map_err(|e| e.to_string())?;
-    let app = validate_editor_command(&app)?;
-    open::with(&full, app).map_err(|e| format!("Failed to open with {app}: {e}"))
+    blocking(move || {
+        let full =
+            resolve_under_root(&PathBuf::from(&root), &relative_path).map_err(|e| e.to_string())?;
+        let app = validate_editor_command(&app)?;
+        open::with(dunce::simplified(&full), app)
+            .map_err(|e| format!("Failed to open with {app}: {e}"))
+    })
+    .await
 }
 
 /// Only https links may be opened from the UI (e.g. the About dialog's repository link).
@@ -228,8 +265,11 @@ fn validate_https_url(url: &str) -> Result<&str, String> {
 /// Open an https link in the system browser.
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), String> {
-    let link = validate_https_url(&url)?;
-    open::that(link).map_err(|e| format!("Failed to open link: {e}"))
+    blocking(move || {
+        let link = validate_https_url(&url)?;
+        open::that(link).map_err(|e| format!("Failed to open link: {e}"))
+    })
+    .await
 }
 
 /// Pick an application via file dialog, then open the project file with it.
@@ -240,9 +280,6 @@ async fn pick_app_and_open(
     root: String,
     relative_path: String,
 ) -> Result<bool, String> {
-    let full =
-        resolve_under_root(&PathBuf::from(&root), &relative_path).map_err(|e| e.to_string())?;
-
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
     #[cfg(target_os = "windows")]
     let filters = vec![("Applications", vec!["exe", "cmd", "bat"])];
@@ -262,9 +299,14 @@ async fn pick_app_and_open(
 
     match rx.await {
         Ok(Some(app_path)) => {
-            open::with(&full, &app_path)
-                .map_err(|e| format!("Failed to open with selected app: {e}"))?;
-            Ok(true)
+            blocking(move || {
+                let full = resolve_under_root(Path::new(&root), &relative_path)
+                    .map_err(|error| error.to_string())?;
+                open::with(dunce::simplified(&full), &app_path)
+                    .map_err(|e| format!("Failed to open with selected app: {e}"))?;
+                Ok(true)
+            })
+            .await
         }
         Ok(None) => Ok(false),
         Err(e) => Err(e.to_string()),
@@ -273,9 +315,12 @@ async fn pick_app_and_open(
 
 #[tauri::command]
 async fn copy_to_clipboard(text: String) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.set_text(text))
-        .map_err(|e| e.to_string())
+    blocking(move || {
+        arboard::Clipboard::new()
+            .and_then(|mut c| c.set_text(text))
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -300,8 +345,11 @@ async fn save_to_file(
         });
     match rx.await {
         Ok(Some(path)) => {
-            std::fs::write(&path, text.as_bytes()).map_err(|e| e.to_string())?;
-            Ok(true)
+            blocking(move || {
+                std::fs::write(&path, text.as_bytes()).map_err(|e| e.to_string())?;
+                Ok(true)
+            })
+            .await
         }
         Ok(None) => Ok(false),
         Err(e) => Err(e.to_string()),
@@ -330,16 +378,22 @@ fn main() {
     attach_parent_console();
 
     // Headless packing without launching the GUI webview.
-    if cli::maybe_run() {
-        return;
-    }
+    let startup = match cli::maybe_run() {
+        cli::Launch::Headless => return,
+        cli::Launch::Desktop(folder) => folder,
+    };
 
     tauri::Builder::default()
+        .manage(DesktopState {
+            startup_folder: startup,
+            ..Default::default()
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             select_folder,
+            startup_folder,
             scan_folder,
             generate_output,
             read_file_preview,

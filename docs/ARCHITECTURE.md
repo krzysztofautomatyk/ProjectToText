@@ -53,9 +53,13 @@ Uses the same `walk` + `write_output` path as the desktop packer (all files afte
 
 1. User picks a directory (dialog or drag-and-drop).
 2. `scan_folder` walks via Git or `ignore`, merges directory nodes, returns `FileNode[]`.
-3. UI applies presets / manual selection → selected relative paths.
-4. `generate_output` reads allowed files and writes the chosen format.
-5. User copies to clipboard or saves via dialog.
+3. `scan_folder` stores a single-workspace `Arc<WorkspaceSnapshot>` (canonical root, entries, ignore-file contents, revision) and returns `{ root, revision, nodes }`. UI applies presets / manual selection.
+4. `generate_output` receives the revision, validates the snapshot and indexed ignore files, filters through `SelectionMatcher`, validates file paths again, and writes the format without rerunning `walk`. Scan/generate/preview I/O runs through `tauri::async_runtime::spawn_blocking`.
+5. User copies to clipboard or saves via dialog. Full output is still transferred to JavaScript; the visible preview is bounded for large packs, not the underlying copy/save data.
+
+Refresh rebuilds membership; there is no file watcher yet. Generation rereads indexed file contents, checks existing indexed directory ignore-file contents, and rejects stale revisions. New files/directories and external Git ignore configuration changes require explicit refresh. Startup `ptt [DIR]` supplies an initial path through the `startup_folder` command.
+
+The shared `core::text` decoder supports strict UTF-8 and BOM-declared UTF-16; it does not guess legacy encodings. Path checks reject symlink/reparse components and require canonical containment, but do not eliminate filesystem TOCTOU races.
 
 ## Extension points
 

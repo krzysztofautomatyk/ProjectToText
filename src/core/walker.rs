@@ -2,9 +2,12 @@
 //! Respects .gitignore exactly like `git` (via the `ignore` crate / `git ls-files`).
 //! Also supports `.pttignore` for extra LLM-specific exclusions.
 
+use crate::core::preview::resolve_under_canonical_root;
 use ignore::WalkBuilder;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntryMeta {
@@ -17,7 +20,7 @@ pub struct DirEntryMeta {
 /// Normalize a path to a relative, forward-slash form for stable UI + packing.
 pub fn normalize_rel_path(path: &Path) -> String {
     let s = path.to_string_lossy();
-    let s = s.trim_start_matches("./");
+    let s = s.strip_prefix("./").unwrap_or(&s);
     s.replace('\\', "/")
 }
 
@@ -44,17 +47,33 @@ pub fn walk(root: &Path) -> std::io::Result<Vec<DirEntryMeta>> {
 
     // Prefer git ls-files for perfect fidelity when this is a git work tree.
     if let Ok(entries) = try_git_ls_files(&canonical_root) {
-        let filtered = apply_pttignore_on_git_results(entries, &canonical_root);
-        return Ok(filtered);
+        return apply_pttignore_on_git_results(entries, &canonical_root);
     }
 
     walk_with_ignore(&canonical_root)
 }
 
+/// `git` command that never opens a console window. The GUI build of ptt has no
+/// console, so on Windows each spawned child would otherwise flash a `cmd` window.
+fn git_command() -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = Command::new("git");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("git")
+    }
+}
+
 /// Fast path using actual git (best fidelity when available).
 fn try_git_ls_files(root: &Path) -> Result<Vec<DirEntryMeta>, ()> {
     // Only use this path inside a git repository.
-    let is_repo = Command::new("git")
+    let is_repo = git_command()
         .current_dir(root)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
@@ -64,7 +83,7 @@ fn try_git_ls_files(root: &Path) -> Result<Vec<DirEntryMeta>, ()> {
         return Err(());
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .current_dir(root)
         .args([
             "ls-files",
@@ -90,7 +109,10 @@ fn try_git_ls_files(root: &Path) -> Result<Vec<DirEntryMeta>, ()> {
         // Git always uses forward slashes in ls-files output.
         let rel_path = PathBuf::from(rel_str.replace('\\', "/"));
 
-        let full = root.join(&rel_path);
+        let full = match resolve_under_canonical_root(root, &rel_str) {
+            Ok(full) => full,
+            Err(_) => continue,
+        };
         // Skip entries that vanished between ls-files and stat. Symlinks are
         // skipped too: a tracked link can point at a file outside the project.
         match std::fs::symlink_metadata(&full) {
@@ -117,8 +139,6 @@ fn try_git_ls_files(root: &Path) -> Result<Vec<DirEntryMeta>, ()> {
 
 /// Ensure directory entries exist for tree UI (git ls-files only lists files).
 fn add_directory_entries(mut entries: Vec<DirEntryMeta>) -> Vec<DirEntryMeta> {
-    use std::collections::HashSet;
-
     let mut dir_paths: HashSet<PathBuf> = HashSet::new();
     for e in &entries {
         let mut current = e.path.parent();
@@ -130,8 +150,9 @@ fn add_directory_entries(mut entries: Vec<DirEntryMeta>) -> Vec<DirEntryMeta> {
             current = p.parent();
         }
     }
+    let existing: HashSet<_> = entries.iter().map(|e| e.path.clone()).collect();
     for d in dir_paths {
-        if !entries.iter().any(|e| e.path == d) {
+        if !existing.contains(&d) {
             entries.push(DirEntryMeta {
                 path: d,
                 is_dir: true,
@@ -144,25 +165,96 @@ fn add_directory_entries(mut entries: Vec<DirEntryMeta>) -> Vec<DirEntryMeta> {
 
 /// Apply .pttignore on top of git results (additional exclusions for LLM packing).
 fn apply_pttignore_on_git_results(
-    mut entries: Vec<DirEntryMeta>,
+    entries: Vec<DirEntryMeta>,
     root: &Path,
-) -> Vec<DirEntryMeta> {
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    let pttignore = root.join(".pttignore");
-    if pttignore.exists() {
-        let _ = builder.add(&pttignore);
+) -> std::io::Result<Vec<DirEntryMeta>> {
+    use ignore::gitignore::{Gitignore, GitignoreBuilder};
+    type Rules = Vec<Arc<Gitignore>>;
+    fn excluded(rules: &Rules, path: &Path, is_dir: bool) -> bool {
+        rules
+            .iter()
+            .rev()
+            .find_map(|rule| {
+                let matched = rule.matched(path, is_dir);
+                if matched.is_none() {
+                    None
+                } else {
+                    Some(matched.is_ignore())
+                }
+            })
+            .unwrap_or(false)
     }
-
-    if let Ok(matcher) = builder.build() {
-        entries.retain(|e| {
-            let matched = matcher.matched(&e.path, e.is_dir);
-            !matched.is_ignore()
-        });
+    fn load_rules(root: &Path, directory: &Path, mut rules: Rules) -> std::io::Result<Rules> {
+        let relative = directory.join(".pttignore");
+        match resolve_under_canonical_root(root, &relative.to_string_lossy()) {
+            Ok(path) => {
+                let mut builder = GitignoreBuilder::new(root.join(directory));
+                if let Some(error) = builder.add(&path) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+                }
+                rules.push(Arc::new(builder.build().map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                })?));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(rules)
     }
+    // Process directories top-down, just like a walker: an excluded parent cannot
+    // be resurrected by a child rule. Each nested file has its own pattern root.
+    let with_dirs = add_directory_entries(entries);
+    let mut directories: Vec<_> = with_dirs
+        .iter()
+        .filter(|e| e.is_dir)
+        .map(|e| e.path.clone())
+        .collect();
+    directories.sort_by_key(|path| path.components().count());
+    let mut contexts: HashMap<PathBuf, (Rules, bool)> = HashMap::new();
+    contexts.insert(
+        PathBuf::new(),
+        (load_rules(root, Path::new(""), Vec::new())?, false),
+    );
+    for directory in directories {
+        let parent = directory.parent().unwrap_or(Path::new(""));
+        let (rules, parent_excluded) = &contexts[parent];
+        let blocked = *parent_excluded || excluded(rules, &root.join(&directory), true);
+        let rules = if blocked {
+            rules.clone()
+        } else {
+            load_rules(root, &directory, rules.clone())?
+        };
+        contexts.insert(directory, (rules, blocked));
+    }
+    let mut filtered: Vec<_> = with_dirs
+        .into_iter()
+        .filter(|entry| {
+            if entry.is_dir {
+                return !contexts[&entry.path].1;
+            }
+            let parent = entry.path.parent().unwrap_or(Path::new(""));
+            let (rules, blocked) = &contexts[parent];
+            !blocked && !excluded(rules, &root.join(&entry.path), false)
+        })
+        .collect();
+    filtered.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(filtered)
+}
 
-    let mut with_dirs = add_directory_entries(entries);
-    with_dirs.sort_by(|a, b| a.path.cmp(&b.path));
-    with_dirs
+/// True when every failure belongs to a `.gitignore` file (parse or read error).
+fn is_foreign_gitignore_error(error: &ignore::Error) -> bool {
+    match error {
+        ignore::Error::Partial(errors) => {
+            !errors.is_empty() && errors.iter().all(is_foreign_gitignore_error)
+        }
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            is_foreign_gitignore_error(err)
+        }
+        ignore::Error::WithPath { path, .. } => {
+            path.file_name().is_some_and(|name| name == ".gitignore")
+        }
+        _ => false,
+    }
 }
 
 /// Fallback using the ignore crate (gitignore + .pttignore).
@@ -170,15 +262,15 @@ fn walk_with_ignore(root: &Path) -> std::io::Result<Vec<DirEntryMeta>> {
     let mut builder = WalkBuilder::new(root);
 
     builder
+        .standard_filters(true)
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true)
         .require_git(false)
         .parents(true)
-        .hidden(true)
+        .hidden(false)
         .ignore(false)
         .follow_links(false)
-        .standard_filters(true)
         .add_custom_ignore_filename(".pttignore");
 
     // Hard safety filters (junk that should never be included by default)
@@ -199,13 +291,29 @@ fn walk_with_ignore(root: &Path) -> std::io::Result<Vec<DirEntryMeta>> {
             Err(_) => continue,
         };
 
+        // A broken line in a project's own .gitignore is skipped, as Git does.
+        // Errors from .pttignore stay fail-closed: its rules must never be dropped silently.
+        if let Some(error) = entry.error() {
+            if !is_foreign_gitignore_error(error) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ));
+            }
+        }
         let path = entry.path();
 
-        // Reject path traversal / symlink escapes outside the root.
-        if let Ok(canon) = path.canonicalize() {
-            if !canon.starts_with(root) {
-                continue;
-            }
+        if path != root
+            && resolve_under_canonical_root(
+                root,
+                &path
+                    .strip_prefix(root)
+                    .map_err(std::io::Error::other)?
+                    .to_string_lossy(),
+            )
+            .is_err()
+        {
+            continue;
         }
 
         let meta = match entry.metadata() {
@@ -241,6 +349,41 @@ fn walk_with_ignore(root: &Path) -> std::io::Result<Vec<DirEntryMeta>> {
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+/// Selection is normalized once; each candidate checks only its own ancestors.
+pub struct SelectionMatcher {
+    paths: HashSet<String>,
+}
+
+impl SelectionMatcher {
+    pub fn new(selected: &[String]) -> Self {
+        Self {
+            paths: selected
+                .iter()
+                .map(|path| {
+                    normalize_rel_path(Path::new(path))
+                        .trim_end_matches('/')
+                        .to_owned()
+                })
+                .filter(|path| !path.is_empty())
+                .collect(),
+        }
+    }
+
+    pub fn is_selected(&self, candidate: &Path) -> bool {
+        let normalized = normalize_rel_path(candidate);
+        let mut prefix = normalized.as_str();
+        loop {
+            if self.paths.contains(prefix) {
+                return true;
+            }
+            match prefix.rfind('/') {
+                Some(index) => prefix = &prefix[..index],
+                None => return false,
+            }
+        }
+    }
 }
 
 /// Return true if `candidate` is the same path as `selected` or a descendant of it.

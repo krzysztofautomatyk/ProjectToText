@@ -2722,13 +2722,15 @@ dependencies = [
 
 [[package]]
 name = "ptt"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "arboard",
  "content_inspector",
+ "dunce",
  "encoding_rs",
  "ignore",
  "open",
+ "regex",
  "serde",
  "serde_json",
  "tauri",

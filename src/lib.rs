@@ -11,8 +11,11 @@
 
 pub mod core;
 
-pub use core::output::{write_output, OutputFormat, WriteOptions, DEFAULT_MAX_FILE_SIZE};
+pub use core::output::{
+    write_output, write_output_cancellable, OutputFormat, WriteOptions, DEFAULT_MAX_FILE_SIZE,
+};
 pub use core::preview::{
     guess_language, load_preview, resolve_under_root, FilePreview, DEFAULT_PREVIEW_MAX,
 };
+pub use core::secrets::redact_secrets;
 pub use core::walker::{normalize_rel_path, path_is_selected, walk, DirEntryMeta};

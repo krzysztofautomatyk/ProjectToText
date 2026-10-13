@@ -15,11 +15,13 @@ cd "${REPO_ROOT}"
 echo "Installing frontend dependencies..."
 npm --prefix ui ci
 
-echo "Building unsigned macOS .app and .dmg bundles..."
+echo "Building ad-hoc signed macOS .app and .dmg bundles..."
 # Extra arguments are forwarded, e.g.:
 #   ./installer/build-macos.sh --target aarch64-apple-darwin
 #   ./installer/build-macos.sh --target x86_64-apple-darwin
-cargo tauri build --ci --no-sign --bundles app,dmg "$@"
+# No --no-sign: tauri.macos.conf.json sets signingIdentity "-" (ad-hoc), matching the release workflow.
+# Updater artifacts are disabled for local builds: they need the updater private key, which only CI has.
+cargo tauri build --ci --bundles app,dmg --config '{"bundle":{"createUpdaterArtifacts":false}}' "$@"
 
 echo
 echo "macOS bundles are available under:"

@@ -1,7 +1,6 @@
 //! In-app file preview helpers (path safety, language guess, text load).
 
-use content_inspector;
-use encoding_rs;
+use crate::core::text::{decode_text, TextError};
 use std::path::{Component, Path, PathBuf};
 
 /// Default max bytes loaded into the in-app viewer.
@@ -20,6 +19,13 @@ pub struct FilePreview {
 
 /// Reject `..` and absolute segments; resolve under `root`.
 pub fn resolve_under_root(root: &Path, relative: &str) -> std::io::Result<PathBuf> {
+    let root_canon = std::fs::canonicalize(root)?;
+    resolve_under_canonical_root(&root_canon, relative)
+}
+
+/// Same checks as [`resolve_under_root`], for callers that already hold a canonical
+/// root. Avoids re-canonicalizing the root for every path in a directory walk.
+pub fn resolve_under_canonical_root(root_canon: &Path, relative: &str) -> std::io::Result<PathBuf> {
     let rel = relative.replace('\\', "/");
     if rel.is_empty() || rel == "." {
         return Err(std::io::Error::new(
@@ -46,16 +52,37 @@ pub fn resolve_under_root(root: &Path, relative: &str) -> std::io::Result<PathBu
         }
     }
 
-    let root_canon = std::fs::canonicalize(root)?;
-    let joined = root_canon.join(&rel);
-    let full = std::fs::canonicalize(&joined).unwrap_or(joined);
-    if !full.starts_with(&root_canon) {
+    let mut joined = root_canon.to_path_buf();
+    for component in Path::new(&rel).components() {
+        joined.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&joined)?;
+        if is_link(&metadata) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "symlinks and reparse points are not allowed",
+            ));
+        }
+    }
+    let full = std::fs::canonicalize(&joined)?;
+    if !full.starts_with(root_canon) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "path is outside the project root",
         ));
     }
     Ok(full)
+}
+
+pub(crate) fn is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 /// Map file extension / name → highlight.js-style language id.
@@ -142,7 +169,7 @@ pub fn load_preview(path: &Path, max_bytes: u64) -> std::io::Result<FilePreview>
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
 
-    let abs = path.display().to_string();
+    let abs = dunce::simplified(path).display().to_string();
 
     if size == 0 {
         return Ok(FilePreview {
@@ -164,10 +191,10 @@ pub fn load_preview(path: &Path, max_bytes: u64) -> std::io::Result<FilePreview>
         f.read_exact(&mut bytes)?;
     }
 
-    let sample_len = bytes.len().min(8192);
-    let binary = bytes.contains(&0) || content_inspector::inspect(&bytes[..sample_len]).is_binary();
+    let truncated = size > max_bytes;
+    let decoded = decode_text(&bytes, truncated);
 
-    if binary {
+    if decoded == Err(TextError::Binary) {
         return Ok(FilePreview {
             path: rel_display,
             language: "plaintext".into(),
@@ -179,9 +206,12 @@ pub fn load_preview(path: &Path, max_bytes: u64) -> std::io::Result<FilePreview>
         });
     }
 
-    let (decoded, _, _) = encoding_rs::UTF_8.decode(&bytes);
-    let mut content = decoded.into_owned();
-    let truncated = size > max_bytes;
+    let mut content = decoded.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid text encoding: use UTF-8 or UTF-16 with BOM",
+        )
+    })?;
     if truncated {
         content.push_str(&format!(
             "\n\n// … truncated for preview ({size} bytes total, showing first {max_bytes}) …"

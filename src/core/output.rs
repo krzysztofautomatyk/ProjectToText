@@ -5,9 +5,10 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::core::preview::resolve_under_canonical_root;
+use crate::core::secrets::redact_secrets;
+use crate::core::text::{decode_text, markdown_fence, TextError};
 use crate::core::walker::{normalize_rel_path, DirEntryMeta};
-use content_inspector;
-use encoding_rs;
 use serde_json::{json, Value};
 
 /// Default per-file size limit when the caller does not specify one.
@@ -47,13 +48,38 @@ pub fn write_output<W: Write>(
     root: &Path,
     options: &WriteOptions,
 ) -> std::io::Result<()> {
+    write_output_cancellable(writer, entries, root, options, &|| false)
+}
+
+/// Like `write_output`, but checks `cancelled` before reading each file and stops with
+/// `ErrorKind::Interrupted` once it returns true (e.g. a newer request superseded this one).
+pub fn write_output_cancellable<W: Write>(
+    writer: &mut W,
+    entries: &[DirEntryMeta],
+    root: &Path,
+    options: &WriteOptions,
+    cancelled: &dyn Fn() -> bool,
+) -> std::io::Result<()> {
+    let canonical_root = std::fs::canonicalize(root)?;
+    let root = canonical_root.as_path();
     let files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
 
     match options.format {
-        OutputFormat::Xml => write_xml(writer, &files, root, options),
-        OutputFormat::Markdown => write_markdown(writer, &files, root, options),
-        OutputFormat::Json => write_json(writer, &files, root, options),
-        OutputFormat::Plain => write_plain(writer, &files, root, options),
+        OutputFormat::Xml => write_xml(writer, &files, root, options, cancelled),
+        OutputFormat::Markdown => write_markdown(writer, &files, root, options, cancelled),
+        OutputFormat::Json => write_json(writer, &files, root, options, cancelled),
+        OutputFormat::Plain => write_plain(writer, &files, root, options, cancelled),
+    }
+}
+
+fn ensure_not_cancelled(cancelled: &dyn Fn() -> bool) -> std::io::Result<()> {
+    if cancelled() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "output superseded by a newer request",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -98,6 +124,7 @@ fn write_xml<W: Write>(
     files: &[&DirEntryMeta],
     root: &Path,
     options: &WriteOptions,
+    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     let root_disp = escape_xml_attr(&root_label(root));
     writeln!(w, "<project_context>")?;
@@ -108,18 +135,23 @@ fn write_xml<W: Write>(
     writeln!(w, "  <instruction>Below is the complete (curated) content of the project. Use it for code analysis, refactoring, or implementation tasks.</instruction>")?;
     writeln!(
         w,
-        "  <reading_info>Files were read respecting .gitignore (and .pttignore if present). Large files (&gt;{} bytes) and binaries are replaced with notes. Text files decoded preferring UTF-8.</reading_info>",
+        "  <reading_info>Files were read respecting .gitignore (and .pttignore if present). Large files (&gt;{} bytes) and binaries are replaced with notes. Text files decoded as UTF-8 or BOM-declared UTF-16.</reading_info>",
         options.max_file_size
     )?;
 
     if options.include_file_summary {
         writeln!(w, "  <file_summary>")?;
         writeln!(w, "    Total files included: {}", files.len())?;
-        let total_size: u64 = files.iter().filter_map(|f| f.size).sum();
+        // Oversized files are replaced by a note, so they are not counted as included bytes.
+        let total_size: u64 = files
+            .iter()
+            .filter_map(|f| f.size)
+            .filter(|&size| size <= options.max_file_size)
+            .sum();
         writeln!(w, "    Total size: {total_size} bytes")?;
         writeln!(
             w,
-            "    Note: File contents were read with size limits ({} bytes max), binary detection, and encoding handling (UTF-8 primary with fallbacks).",
+            "    Note: File contents were read with size limits ({} bytes max), binary detection, and UTF-8 / BOM-declared UTF-16 decoding.",
             options.max_file_size
         )?;
         writeln!(w, "  </file_summary>")?;
@@ -133,8 +165,8 @@ fn write_xml<W: Write>(
 
     writeln!(w, "  <files>")?;
     for f in files {
-        let full_path = root.join(&f.path);
-        let content = read_file_content(&full_path, options.max_file_size);
+        ensure_not_cancelled(cancelled)?;
+        let content = read_file_content(root, &f.path, options.max_file_size);
         let path_attr = escape_xml_attr(&display_path(&f.path));
 
         writeln!(w, "    <file path=\"{path_attr}\">")?;
@@ -151,6 +183,7 @@ fn write_markdown<W: Write>(
     files: &[&DirEntryMeta],
     root: &Path,
     options: &WriteOptions,
+    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     writeln!(w, "# Project Context")?;
     writeln!(w, "Generated from: `{}`", root_label(root))?;
@@ -161,17 +194,12 @@ fn write_markdown<W: Write>(
     )?;
 
     for f in files {
-        let full = root.join(&f.path);
-        let content = read_file_content(&full, options.max_file_size);
+        ensure_not_cancelled(cancelled)?;
+        let content = read_file_content(root, &f.path, options.max_file_size);
         let ext = f.path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let path = display_path(&f.path);
 
-        // Fence language from extension; avoid breaking fences if content has ```
-        let fence = if content.contains("```") {
-            "~~~~"
-        } else {
-            "```"
-        };
+        let fence = markdown_fence(&content);
 
         writeln!(w, "## `{path}`")?;
         writeln!(w, "{fence}{ext}")?;
@@ -187,25 +215,24 @@ fn write_json<W: Write>(
     files: &[&DirEntryMeta],
     root: &Path,
     options: &WriteOptions,
+    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
-    let file_objs: Vec<Value> = files
-        .iter()
-        .map(|f| {
-            let full = root.join(&f.path);
-            let content = read_file_content(&full, options.max_file_size);
-            json!({
-                "path": display_path(&f.path),
-                "size": f.size,
-                "content": content,
-            })
-        })
-        .collect();
+    let mut file_objs: Vec<Value> = Vec::with_capacity(files.len());
+    for f in files {
+        ensure_not_cancelled(cancelled)?;
+        let content = read_file_content(root, &f.path, options.max_file_size);
+        file_objs.push(json!({
+            "path": display_path(&f.path),
+            "size": f.size,
+            "content": content,
+        }));
+    }
 
     let doc = json!({
         "generator": "ptt (ProjectToText)",
         "root": root_label(root),
         "reading_info": format!(
-            "Files read with {} byte limit, binary detection, encoding handling (UTF-8 primary).",
+            "Files read with {} byte limit, binary detection, UTF-8 / BOM-declared UTF-16 decoding.",
             options.max_file_size
         ),
         "file_count": files.len(),
@@ -223,18 +250,19 @@ fn write_plain<W: Write>(
     files: &[&DirEntryMeta],
     root: &Path,
     options: &WriteOptions,
+    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     writeln!(w, "Project: {}", root_label(root))?;
     writeln!(
         w,
-        "Reading info: Data read with limits ({} bytes), binary skip, UTF-8+fallback.",
+        "Reading info: Data read with limits ({} bytes), binary skip, UTF-8 / BOM-declared UTF-16.",
         options.max_file_size
     )?;
     writeln!(w, "================================\n")?;
 
     for f in files {
-        let full = root.join(&f.path);
-        let content = read_file_content(&full, options.max_file_size);
+        ensure_not_cancelled(cancelled)?;
+        let content = read_file_content(root, &f.path, options.max_file_size);
         writeln!(w, ">>> {}", display_path(&f.path))?;
         writeln!(w, "{content}")?;
         writeln!(w, "--------------------------------\n")?;
@@ -249,13 +277,13 @@ fn root_label(root: &Path) -> String {
         .unwrap_or_else(|| "project".to_string())
 }
 
-fn read_file_content(path: &Path, max_file_size: u64) -> String {
-    // A symlink's target may live outside the project; never follow it.
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return "[Symlink skipped: its target may be outside the project]".to_string();
-    }
-
-    let meta = match std::fs::metadata(path) {
+/// `root` must already be canonical (`write_output` canonicalizes it once).
+fn read_file_content(root: &Path, relative: &Path, max_file_size: u64) -> String {
+    let path = match resolve_under_canonical_root(root, &relative.to_string_lossy()) {
+        Ok(path) => path,
+        Err(_) => return "[File skipped: inaccessible or unsafe project path]".into(),
+    };
+    let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
         Err(e) => return format!("[Error reading metadata: {e}]"),
     };
@@ -265,22 +293,31 @@ fn read_file_content(path: &Path, max_file_size: u64) -> String {
         return format!("[File too large: {file_size} bytes (limit {max_file_size}), skipped]");
     }
 
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let sample_len = bytes.len().min(8192);
-            let is_binary =
-                bytes.contains(&0) || content_inspector::inspect(&bytes[..sample_len]).is_binary();
-
-            if is_binary {
-                return format!(
-                    "[Binary file - {file_size} bytes, content omitted for LLM safety]"
-                );
-            }
-
-            let (decoded, _, _) = encoding_rs::UTF_8.decode(&bytes);
-            decoded.into_owned()
+    if !meta.is_file() {
+        return "[File skipped: not a regular file]".into();
+    }
+    // Enforce the limit while reading too, in case a file grows after metadata.
+    use std::io::Read;
+    let bytes = std::fs::File::open(&path).and_then(|file| {
+        let mut bytes = Vec::new();
+        file.take(max_file_size.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    match bytes {
+        Ok(bytes) if bytes.len() as u64 > max_file_size => {
+            format!("[File too large: limit {max_file_size} bytes, skipped]")
         }
-        Err(e) => format!("[Error reading file: {e}]"),
+        Ok(bytes) => match decode_text(&bytes, false) {
+            Ok(text) => redact_secrets(&text).into_owned(),
+            Err(TextError::Binary) => {
+                format!("[Binary file - {file_size} bytes, content omitted for LLM safety]")
+            }
+            Err(TextError::Encoding) => {
+                "[Invalid text encoding: use UTF-8 or UTF-16 with BOM]".into()
+            }
+        },
+        Err(_) => "[Error reading project file]".into(),
     }
 }
 
@@ -424,7 +461,7 @@ mod tests {
         };
         write_output(&mut buf, &entries, root, &opts).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("~~~~"));
+        assert!(s.contains("````md"));
     }
 
     #[cfg(unix)]

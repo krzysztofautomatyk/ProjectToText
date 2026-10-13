@@ -13,7 +13,7 @@ Run on macOS from the repository root:
 ./installer/build-macos.sh
 ```
 
-This creates an unsigned `.app` and `.dmg`. To build a specific architecture:
+This creates an ad-hoc signed `.app` and `.dmg`. The app is not notarized. To build a specific architecture:
 
 ```bash
 ./installer/build-macos.sh --target aarch64-apple-darwin

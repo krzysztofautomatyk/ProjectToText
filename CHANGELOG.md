@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-13
+
+### Added
+
+- **Token estimates in the file tree**: every folder and file shows an approximate token count (`~N tok`, bytes ÷ 3.8, the same heuristic as the badge). A Sort name/tokens toggle orders each folder's children by token weight. Nothing is read from disk for this, so the scan cost does not change.
+
+### Fixed
+
+- Git scanning now honors directory and nested `.pttignore` rules with scoped overrides and parent-directory pruning; fallback scanning no longer accidentally re-enables hidden-file filtering or `.ignore` rules.
+- Packing and preview reject unsafe relative paths, intermediate symlinks/reparse points, and failed canonicalization. Editor paths are safely simplified on Windows; concurrent filesystem races remain outside these checks.
+- UTF-8 / BOM-declared UTF-16 decoding works in native and browser pack/preview, with strict malformed-encoding reporting and safe truncated Unicode previews.
+- Markdown fences are longer than any backtick run in the file, including mixed backtick/tilde content.
+- Custom projects responds to Escape; invalid CLI commands no longer silently launch the GUI.
+
+### Changed
+
+- Desktop generation reuses a revisioned workspace scan; Refresh rebuilds membership and changed indexed ignore files require refresh. Blocking command I/O runs in the blocking pool.
+- Selection uses ancestor HashSet lookups and tree statistics are computed once per update. Large packed previews are bounded by default without truncating copied/saved output.
+- `ptt [DIR]` opens the desktop workspace on startup. CLI writes through a buffered writer and refuses to overwrite an existing input file; JSON still builds a document in memory.
+- Removed unused frontend Tailwind/autoprefixer/direct PostCSS dependencies and configuration.
+- Replaced the unsupported perfect-score expert review with regression evidence, a reproducible benchmark, and explicit limitations.
+
 ## [0.2.5] - 2026-10-13
 
 ### Fixed
