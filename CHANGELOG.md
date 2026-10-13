@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-13
+
+### Added
+
+- **Automatic updates**: the app checks for a new release on startup. When one is available, an "Update to vX" button appears in the header; clicking it downloads, installs and restarts the app. Updates are signed and verified before installation.
+- **About dialog** (About button in the footer): shows the app version, author, link to the GitHub repository and the list of frontend and Rust libraries.
+
+### Changed
+
+- Release workflow signs updater artifacts and publishes `latest.json`, and verifies that the manifest contains all four platforms.
+
 ## [0.2.0] - 2026-10-12
 
 ### Added

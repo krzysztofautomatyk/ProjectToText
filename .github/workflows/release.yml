@@ -18,13 +18,13 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: --ci --no-sign --target aarch64-apple-darwin
+            args: --ci --target aarch64-apple-darwin
           - platform: macos-latest
-            args: --ci --no-sign --target x86_64-apple-darwin
+            args: --ci --target x86_64-apple-darwin
           - platform: ubuntu-22.04
-            args: --ci --no-sign
+            args: --ci
           - platform: windows-latest
-            args: --ci --no-sign
+            args: --ci
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -59,6 +59,9 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing (separate from OS code signing; no OS certificates are configured, so that step is skipped).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.app_version.outputs.version) }}
           releaseName: ProjectToText ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}-dev', steps.app_version.outputs.version) }}
@@ -66,3 +69,20 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+  # tauri-action merges each platform into latest.json from parallel jobs, which can race.
+  # Fail the release if any platform is missing so auto-update never silently skips users.
+  verify-updater-manifest:
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check latest.json lists every platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          json=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/latest.json")
+          echo "$json" | jq -r '.version'
+          for key in darwin-aarch64 darwin-x86_64 linux-x86_64 windows-x86_64; do
+            echo "$json" | jq -e --arg k "$key" '.platforms[$k].url and .platforms[$k].signature' > /dev/null \
+              || { echo "latest.json is missing platform: $key"; exit 1; }
+          done

@@ -187,6 +187,25 @@ async fn open_with_app(root: String, relative_path: String, app: String) -> Resu
     open::with(&full, app).map_err(|e| format!("Failed to open with {app}: {e}"))
 }
 
+/// Only https links may be opened from the UI (e.g. the About dialog's repository link).
+fn validate_https_url(url: &str) -> Result<&str, String> {
+    let trimmed = url.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .ok_or("Only https:// links can be opened")?;
+    if rest.is_empty() || rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("Invalid link".into());
+    }
+    Ok(trimmed)
+}
+
+/// Open an https link in the system browser.
+#[tauri::command]
+async fn open_url(url: String) -> Result<(), String> {
+    let link = validate_https_url(&url)?;
+    open::that(link).map_err(|e| format!("Failed to open link: {e}"))
+}
+
 /// Pick an application via file dialog, then open the project file with it.
 /// Returns `true` if opened, `false` if the dialog was cancelled.
 #[tauri::command]
@@ -291,6 +310,8 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             select_folder,
             scan_folder,
@@ -298,10 +319,25 @@ fn main() {
             read_file_preview,
             open_in_default_app,
             open_with_app,
+            open_url,
             pick_app_and_open,
             copy_to_clipboard,
             save_to_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_https_url;
+
+    #[test]
+    fn open_url_accepts_only_https_links() {
+        assert!(validate_https_url("https://github.com/krzysztofautomatyk/ProjectToText").is_ok());
+        assert!(validate_https_url("http://example.com").is_err());
+        assert!(validate_https_url("file:///etc/passwd").is_err());
+        assert!(validate_https_url("https://").is_err());
+        assert!(validate_https_url("https://exa mple.com").is_err());
+    }
 }

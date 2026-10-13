@@ -12,6 +12,8 @@ import {
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { check, type Update } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import {
   Check,
@@ -552,6 +554,90 @@ function tokenBadgeClass(tokens: number): string {
 
 /* ─── Small components ───────────────────────────────── */
 
+const ABOUT_REPO_URL = 'https://github.com/krzysztofautomatyk/ProjectToText';
+const ABOUT_AUTHOR = 'Krzysztof Wozniczak';
+const ABOUT_FRONTEND_LIBS = [
+  '@tauri-apps/api',
+  '@tauri-apps/plugin-dialog',
+  '@tauri-apps/plugin-process',
+  '@tauri-apps/plugin-updater',
+  'react',
+  'react-dom',
+  'lucide-react',
+  'highlight.js',
+  'tailwindcss',
+];
+const ABOUT_BACKEND_LIBS = [
+  'tauri',
+  'tauri-plugin-dialog',
+  'tauri-plugin-process',
+  'tauri-plugin-updater',
+  'serde',
+  'serde_json',
+  'ignore',
+  'content_inspector',
+  'encoding_rs',
+  'tokio',
+  'arboard',
+  'open',
+];
+
+function AboutDialog({
+  onClose,
+  onOpenRepo,
+}: {
+  onClose: () => void;
+  onOpenRepo: () => void;
+}) {
+  const libList = { display: 'flex', flexWrap: 'wrap', gap: 6, listStyle: 'none', padding: 0, margin: 0 } as const;
+  return (
+    <div className="help-overlay" role="presentation" onClick={onClose}>
+      <div
+        className="help-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="about-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="help-header">
+          <h2 id="about-title">About ptt</h2>
+          <button
+            type="button"
+            className="btn btn-ghost btn-icon"
+            onClick={onClose}
+            aria-label="Close about"
+          >
+            <X size={14} />
+          </button>
+        </div>
+        <p>
+          ProjectToText (ptt) · version {APP_VERSION}
+        </p>
+        <p>
+          Author: <strong>{ABOUT_AUTHOR}</strong>
+        </p>
+        <p>
+          <button type="button" className="panel-link" onClick={onOpenRepo}>
+            <ExternalLink size={12} aria-hidden /> {ABOUT_REPO_URL}
+          </button>
+        </p>
+        <h3>Frontend libraries</h3>
+        <ul style={libList}>
+          {ABOUT_FRONTEND_LIBS.map((lib) => (
+            <li key={lib} className="kbd">{lib}</li>
+          ))}
+        </ul>
+        <h3>Backend libraries (Rust)</h3>
+        <ul style={libList}>
+          {ABOUT_BACKEND_LIBS.map((lib) => (
+            <li key={lib} className="kbd">{lib}</li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
 function ToastViewport({
   toasts,
   onDismiss,
@@ -901,7 +987,7 @@ function TreeItem({
 }) {
   const checkRef = useRef<HTMLInputElement>(null);
   const hasChildren = node.children.length > 0;
-  const isExpanded = expanded.has(node.path) || (depth < 1 && !filterText);
+  const isExpanded = expanded.has(node.path);
   // When filtering, auto-expand matched branches
   const showChildren = hasChildren && (isExpanded || !!filterText.trim());
 
@@ -1094,6 +1180,7 @@ function App() {
   const [dragOver, setDragOver] = useState(false);
   const [focusedPath, setFocusedPath] = useState<string | null>(null);
   const [showHelp, setShowHelp] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [folderHistory, setFolderHistory] = useState<FolderHistoryEntry[]>(() =>
     IN_TAURI ? readFolderHistory() : [],
@@ -1113,6 +1200,32 @@ function App() {
   /** Browser-mode project (files in memory). Null in Tauri desktop mode. */
   const browserProjectRef = useRef<BrowserProject | null>(null);
   const [browserMode, setBrowserMode] = useState(!IN_TAURI);
+  /** Newer release found by the Tauri updater (desktop builds only). */
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Silent startup check. Skipped in dev, where no signed latest.json exists.
+    if (!IN_TAURI || import.meta.env.DEV) return;
+    check()
+      .then((update) => setAvailableUpdate(update))
+      .catch((err) => console.warn('Update check failed:', err));
+  }, []);
+
+  const installUpdate = async () => {
+    if (!availableUpdate || updateBusy) return;
+    setUpdateBusy(true);
+    setUpdateError(null);
+    try {
+      await availableUpdate.downloadAndInstall();
+      await relaunch();
+    } catch (err) {
+      console.error('Update install failed:', err);
+      setUpdateError(String(err));
+      setUpdateBusy(false);
+    }
+  };
 
   const selectedSet = useMemo(
     () => new Set(nodes.filter((n) => n.selected && !n.is_dir).map((n) => n.path)),
@@ -2083,6 +2196,10 @@ function App() {
           setShowHelp(false);
           return;
         }
+        if (showAbout) {
+          setShowAbout(false);
+          return;
+        }
         if (showHistory) {
           setShowHistory(false);
           return;
@@ -2113,6 +2230,7 @@ function App() {
     output,
     filterText,
     showHelp,
+    showAbout,
     showHistory,
   ]);
 
@@ -2233,6 +2351,29 @@ function App() {
         </div>
 
         <div className="header-right">
+          {availableUpdate && (
+            <button
+              type="button"
+              className="btn btn-primary update-button"
+              onClick={installUpdate}
+              disabled={updateBusy}
+              title={
+                updateError
+                  ? `Update failed: ${updateError}. Click to retry.`
+                  : `Version ${availableUpdate.version} is available. Click to install and restart.`
+              }
+              data-testid="update-button"
+            >
+              {updateBusy ? <Loader2 size={14} className="spin" /> : <Download size={14} />}
+              <span>
+                {updateBusy
+                  ? 'Installing…'
+                  : updateError
+                    ? 'Update failed, retry'
+                    : `Update to v${availableUpdate.version}`}
+              </span>
+            </button>
+          )}
           <button
             type="button"
             className="btn btn-icon theme-toggle"
@@ -2924,6 +3065,15 @@ function App() {
           >
             Shortcuts <span className="kbd">?</span>
           </button>
+          <span className="sep">|</span>
+          <button
+            type="button"
+            className="panel-link"
+            onClick={() => setShowAbout(true)}
+            title="About ptt"
+          >
+            About
+          </button>
         </div>
       </footer>
 
@@ -3050,6 +3200,21 @@ function App() {
             </p>
           </div>
         </div>
+      )}
+
+      {showAbout && (
+        <AboutDialog
+          onClose={() => setShowAbout(false)}
+          onOpenRepo={() => {
+            if (IN_TAURI) {
+              invoke('open_url', { url: ABOUT_REPO_URL }).catch((err) =>
+                pushToast('error', `Could not open link: ${String(err)}`),
+              );
+            } else {
+              window.open(ABOUT_REPO_URL, '_blank', 'noopener,noreferrer');
+            }
+          }}
+        />
       )}
 
       <ToastViewport toasts={toasts} onDismiss={dismissToast} />
