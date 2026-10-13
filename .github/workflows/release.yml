@@ -15,6 +15,9 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
+      # One platform at a time: each job merges its entry into the shared latest.json,
+      # and parallel jobs overwrote each other (darwin-x86_64 went missing).
+      max-parallel: 1
       matrix:
         include:
           # Apple Silicon (M1 and newer).
@@ -61,7 +64,7 @@ jobs:
         shell: bash
         run: echo "version=$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Updater signing (separate from OS code signing; no OS certificates are configured, so that step is skipped).

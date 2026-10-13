@@ -464,7 +464,10 @@ mod tests {
             };
             write_output(&mut buf, &entries, root, &opts).unwrap();
             let s = String::from_utf8(buf).unwrap();
-            assert!(!s.contains("TOP-SECRET-TOKEN"), "symlink target leaked: {format:?}");
+            assert!(
+                !s.contains("TOP-SECRET-TOKEN"),
+                "symlink target leaked: {format:?}"
+            );
             assert!(
                 !s.contains(&root.display().to_string()),
                 "absolute root leaked: {format:?}"
