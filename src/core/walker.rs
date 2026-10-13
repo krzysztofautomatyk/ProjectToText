@@ -91,9 +91,12 @@ fn try_git_ls_files(root: &Path) -> Result<Vec<DirEntryMeta>, ()> {
         let rel_path = PathBuf::from(rel_str.replace('\\', "/"));
 
         let full = root.join(&rel_path);
-        // Skip entries that vanished between ls-files and stat.
-        if !full.exists() {
-            continue;
+        // Skip entries that vanished between ls-files and stat. Symlinks are
+        // skipped too: a tracked link can point at a file outside the project.
+        match std::fs::symlink_metadata(&full) {
+            Ok(m) if m.file_type().is_symlink() => continue,
+            Ok(_) => {}
+            Err(_) => continue,
         }
         let is_dir = full.is_dir();
         let size = if !is_dir {
@@ -325,6 +328,38 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p == "secret.env"),
             "secret.env must be ignored, got {paths:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_tracked_symlinks_pointing_outside_repo() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("id_rsa");
+        fs::write(&secret, "PRIVATE").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        fs::write(root.join("keep.rs"), "ok").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("link")).unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(root)
+            .status();
+
+        let entries = walk(root).expect("walk");
+        let paths: Vec<String> = entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| normalize_rel_path(&e.path))
+            .collect();
+
+        assert!(paths.iter().any(|p| p == "keep.rs"), "paths={paths:?}");
+        assert!(
+            !paths.iter().any(|p| p == "link"),
+            "symlink must be skipped, got {paths:?}"
         );
     }
 

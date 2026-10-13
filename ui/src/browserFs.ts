@@ -398,7 +398,7 @@ async function readPackContent(file: File): Promise<string> {
       return `[Binary file - ${file.size} bytes, content omitted for LLM safety]`;
     }
     const text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
-    return `// [ptt read info] size=${file.size} bytes, encoding=utf-8, browser-mode=true\n${text}`;
+    return text;
   } catch (e) {
     return `[Error reading file: ${e instanceof Error ? e.message : String(e)}]`;
   }

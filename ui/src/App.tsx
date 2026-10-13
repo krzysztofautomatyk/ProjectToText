@@ -105,7 +105,6 @@ interface FileNode {
 interface PackOptions {
   format: string;
   include_summary: boolean;
-  relative_paths: boolean;
   max_file_size?: number;
 }
 
@@ -1401,7 +1400,6 @@ function App() {
           const opts: PackOptions = {
             format: fmt,
             include_summary: true,
-            relative_paths: true,
           };
           result = await invoke<string>('generate_output', {
             path: rootPath,

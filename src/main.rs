@@ -13,7 +13,7 @@
 mod cli;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri_plugin_dialog::DialogExt;
 
 use ptt::core::output::OutputFormat;
@@ -35,7 +35,6 @@ pub struct FileNode {
 pub struct PackOptions {
     pub format: String,
     pub include_summary: bool,
-    pub relative_paths: bool,
     pub max_file_size: Option<u64>,
 }
 
@@ -136,8 +135,6 @@ async fn generate_output(
         max_file_size: options.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
     };
 
-    let _ = options.relative_paths;
-
     let mut buf = Vec::new();
     ptt::write_output(&mut buf, &filtered, &root, &write_opts).map_err(|e| e.to_string())?;
 
@@ -166,24 +163,53 @@ async fn read_file_preview(
     })
 }
 
+/// Extensions that run code when opened. The default-app action refuses them, so one
+/// click on a script from a cloned repo cannot execute it.
+const EXECUTABLE_EXTENSIONS: &[&str] = &[
+    "exe", "bat", "cmd", "com", "scr", "msi", "msix", "ps1", "psm1", "vbs", "vbe", "js", "jse",
+    "wsf", "wsh", "hta", "lnk", "reg", "jar", "sh", "command", "app", "pkg", "dmg", "appimage",
+];
+
+fn is_executable_like(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| EXECUTABLE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Editors the UI may launch by name. Anything else must go through the file picker.
+const KNOWN_EDITORS: &[&str] = &["code", "code-insiders", "cursor", "notepad++"];
+
+fn validate_editor_command(app: &str) -> Result<&str, String> {
+    let app = app.trim();
+    if KNOWN_EDITORS.contains(&app) {
+        Ok(app)
+    } else {
+        Err(format!(
+            "\"{app}\" is not a known editor. Use \"Choose program\u{2026}\" to pick one."
+        ))
+    }
+}
+
 /// Open a project file with the OS default application.
 #[tauri::command]
 async fn open_in_default_app(root: String, relative_path: String) -> Result<(), String> {
     let full =
         resolve_under_root(&PathBuf::from(&root), &relative_path).map_err(|e| e.to_string())?;
+    if is_executable_like(&full) {
+        return Err(
+            "Executables and scripts are not opened with the default app. Use \"Open with\u{2026}\" to choose a program."
+                .into(),
+        );
+    }
     open::that(&full).map_err(|e| format!("Failed to open file: {e}"))
 }
 
-/// Open a project file with a specific application / shell command
-/// (e.g. `code`, `notepad++`, full path to an `.exe` / `.app`).
+/// Open a project file with one of the known editors (see `KNOWN_EDITORS`).
 #[tauri::command]
 async fn open_with_app(root: String, relative_path: String, app: String) -> Result<(), String> {
     let full =
         resolve_under_root(&PathBuf::from(&root), &relative_path).map_err(|e| e.to_string())?;
-    let app = app.trim();
-    if app.is_empty() {
-        return Err("Application path/command is empty".into());
-    }
+    let app = validate_editor_command(&app)?;
     open::with(&full, app).map_err(|e| format!("Failed to open with {app}: {e}"))
 }
 
@@ -330,7 +356,28 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_https_url;
+    use super::{is_executable_like, validate_editor_command, validate_https_url};
+    use std::path::Path;
+
+    #[test]
+    fn open_with_app_accepts_only_known_editors() {
+        assert_eq!(validate_editor_command("code"), Ok("code"));
+        assert_eq!(validate_editor_command(" notepad++ "), Ok("notepad++"));
+        assert!(validate_editor_command("/bin/sh").is_err());
+        assert!(validate_editor_command("C:\\evil\\run.exe").is_err());
+        assert!(validate_editor_command("").is_err());
+    }
+
+    #[test]
+    fn default_app_blocks_executables_and_scripts() {
+        assert!(is_executable_like(Path::new("install.ps1")));
+        assert!(is_executable_like(Path::new("RUN.BAT")));
+        assert!(is_executable_like(Path::new("tool.exe")));
+        assert!(is_executable_like(Path::new("setup.sh")));
+        assert!(!is_executable_like(Path::new("README.md")));
+        assert!(!is_executable_like(Path::new("src/main.rs")));
+        assert!(!is_executable_like(Path::new("Makefile")));
+    }
 
     #[test]
     fn open_url_accepts_only_https_links() {

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-13
+
+### Fixed
+
+- Packing no longer follows symlinks: a tracked link pointing outside the project is skipped, so its target's contents never end up in the output.
+- Packed output no longer contains the absolute project path; only the folder name is written.
+- Removed the `// [ptt read info]` line that was prepended to every packed file.
+- "Open with" only launches the known editors (VS Code, Cursor, Notepad++); other programs go through "Choose program".
+- "Open with default app" refuses executables and scripts (for example `.exe`, `.bat`, `.ps1`, `.sh`).
+
+### Removed
+
+- The unused `relative_paths` pack option.
+
 ## [0.2.1] - 2026-10-13
 
 ### Added

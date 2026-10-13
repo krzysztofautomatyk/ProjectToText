@@ -99,7 +99,7 @@ fn write_xml<W: Write>(
     root: &Path,
     options: &WriteOptions,
 ) -> std::io::Result<()> {
-    let root_disp = escape_xml_attr(&root.display().to_string());
+    let root_disp = escape_xml_attr(&root_label(root));
     writeln!(w, "<project_context>")?;
     writeln!(
         w,
@@ -153,7 +153,7 @@ fn write_markdown<W: Write>(
     options: &WriteOptions,
 ) -> std::io::Result<()> {
     writeln!(w, "# Project Context")?;
-    writeln!(w, "Generated from: `{}`", root.display())?;
+    writeln!(w, "Generated from: `{}`", root_label(root))?;
     writeln!(
         w,
         "Reading info: Files processed with size/binary limits (max {} bytes) and encoding handling.\n",
@@ -203,7 +203,7 @@ fn write_json<W: Write>(
 
     let doc = json!({
         "generator": "ptt (ProjectToText)",
-        "root": root.display().to_string(),
+        "root": root_label(root),
         "reading_info": format!(
             "Files read with {} byte limit, binary detection, encoding handling (UTF-8 primary).",
             options.max_file_size
@@ -224,7 +224,7 @@ fn write_plain<W: Write>(
     root: &Path,
     options: &WriteOptions,
 ) -> std::io::Result<()> {
-    writeln!(w, "Project: {}", root.display())?;
+    writeln!(w, "Project: {}", root_label(root))?;
     writeln!(
         w,
         "Reading info: Data read with limits ({} bytes), binary skip, UTF-8+fallback.",
@@ -242,7 +242,19 @@ fn write_plain<W: Write>(
     Ok(())
 }
 
+/// Project folder name only, so packed output never exposes the absolute path.
+fn root_label(root: &Path) -> String {
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "project".to_string())
+}
+
 fn read_file_content(path: &Path, max_file_size: u64) -> String {
+    // A symlink's target may live outside the project; never follow it.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return "[Symlink skipped: its target may be outside the project]".to_string();
+    }
+
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) => return format!("[Error reading metadata: {e}]"),
@@ -265,13 +277,8 @@ fn read_file_content(path: &Path, max_file_size: u64) -> String {
                 );
             }
 
-            let (decoded, encoding_used, had_errors) = encoding_rs::UTF_8.decode(&bytes);
-            let content = decoded.to_string();
-
-            format!(
-                "// [ptt read info] size={file_size} bytes, encoding={}, replacement_chars={had_errors}\n{content}",
-                encoding_used.name(),
-            )
+            let (decoded, _, _) = encoding_rs::UTF_8.decode(&bytes);
+            decoded.into_owned()
         }
         Err(e) => format!("[Error reading file: {e}]"),
     }
@@ -418,6 +425,51 @@ mod tests {
         write_output(&mut buf, &entries, root, &opts).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("~~~~"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_output_skips_symlinks_and_hides_absolute_root() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.env");
+        fs::write(&secret, "TOP-SECRET-TOKEN").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("readme.md"), "hello\n").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("link.env")).unwrap();
+        let entries = vec![
+            DirEntryMeta {
+                path: PathBuf::from("readme.md"),
+                is_dir: false,
+                size: Some(6),
+            },
+            DirEntryMeta {
+                path: PathBuf::from("link.env"),
+                is_dir: false,
+                size: Some(16),
+            },
+        ];
+
+        for format in [
+            OutputFormat::Xml,
+            OutputFormat::Markdown,
+            OutputFormat::Json,
+            OutputFormat::Plain,
+        ] {
+            let mut buf = Vec::new();
+            let opts = WriteOptions {
+                format,
+                ..Default::default()
+            };
+            write_output(&mut buf, &entries, root, &opts).unwrap();
+            let s = String::from_utf8(buf).unwrap();
+            assert!(!s.contains("TOP-SECRET-TOKEN"), "symlink target leaked: {format:?}");
+            assert!(
+                !s.contains(&root.display().to_string()),
+                "absolute root leaked: {format:?}"
+            );
+        }
     }
 
     #[test]
