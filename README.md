@@ -88,9 +88,10 @@ Download the installer for your OS from the latest GitHub Release:
 
 | Platform | Typical assets |
 |----------|----------------|
-| **macOS** | `.dmg` / `.app` (Apple Silicon + Intel builds) |
-| **Windows** | `.msi` / `.exe` |
-| **Linux** | `.AppImage` / `.deb` (when produced by the release pipeline) |
+| **macOS, Apple Silicon** (M1 and newer) | `ptt-<version>-macos-apple-silicon.dmg` |
+| **macOS, Intel** | `ptt-<version>-macos-intel.dmg` |
+| **Windows** | `ptt-<version>-windows-x64.msi` or `ptt-<version>-windows-x64-setup.exe` |
+| **Linux** | `ptt-<version>-linux-x64.AppImage`, `.deb` or `.rpm` |
 
 After install, launch **ptt** from Applications / Start Menu, or run the binary from a terminal.
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-13
+
+### Changed
+
+- Release files now have readable names that state the platform: `ptt-<version>-macos-apple-silicon.dmg` (M1 and newer), `ptt-<version>-macos-intel.dmg`, `ptt-<version>-windows-x64.msi`, `ptt-<version>-windows-x64-setup.exe`, `ptt-<version>-linux-x64.AppImage`, `.deb` and `.rpm`.
+
 ## [0.2.2] - 2026-10-13
 
 ### Fixed

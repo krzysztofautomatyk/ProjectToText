@@ -17,14 +17,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Apple Silicon (M1 and newer).
           - platform: macos-latest
             args: --ci --target aarch64-apple-darwin
+            asset_pattern: ptt-[version]-macos-apple-silicon[ext]
           - platform: macos-latest
             args: --ci --target x86_64-apple-darwin
+            asset_pattern: ptt-[version]-macos-intel[ext]
           - platform: ubuntu-22.04
             args: --ci
+            asset_pattern: ptt-[version]-linux-x64[ext]
           - platform: windows-latest
             args: --ci
+            asset_pattern: ptt-[version]-windows-x64[setup][ext]
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -65,10 +70,11 @@ jobs:
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.app_version.outputs.version) }}
           releaseName: ProjectToText ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}-dev', steps.app_version.outputs.version) }}
-          releaseBody: "Download the macOS .dmg or Windows .msi/.exe installer from the assets. Use: ptt pack . -o context.xml"
+          releaseBody: "Pick the file for your system: macOS Apple Silicon (M1 and newer) .dmg, macOS Intel .dmg, Windows .msi/.exe, or Linux .AppImage/.deb/.rpm. Use: ptt pack . -o context.xml"
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+          releaseAssetNamePattern: ${{ matrix.asset_pattern }}
 
   # tauri-action merges each platform into latest.json from parallel jobs, which can race.
   # Fail the release if any platform is missing so auto-update never silently skips users.
