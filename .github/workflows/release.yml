@@ -81,17 +81,51 @@ jobs:
 
   # tauri-action merges each platform into latest.json from parallel jobs, which can race.
   # Fail the release if any platform is missing so auto-update never silently skips users.
+  # tauri-action also writes API asset URLs (api.github.com/.../releases/assets/ID). The updater
+  # does a plain GET, which returns JSON for those, so rewrite them to public download links.
   verify-updater-manifest:
     needs: publish-tauri
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Read app version
+        id: app_version
+        shell: bash
+        run: echo "tag=v$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite latest.json URLs to public download links
+        shell: bash
+        env:
+          TAG: ${{ steps.app_version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          gh release download "$TAG" --repo "$REPO" --pattern latest.json --dir "$work" --clobber
+          # Map each API asset URL to the name of the file it points at.
+          map='{}'
+          while read -r url; do
+            endpoint=${url#https://api.github.com/}
+            name=$(gh api "$endpoint" --jq .name)
+            map=$(jq -c --arg u "$url" --arg n "$name" '. + {($u): $n}' <<< "$map")
+          done < <(jq -r '[.platforms[].url | select(startswith("https://api.github.com/"))] | unique | .[]' "$work/latest.json")
+          jq --arg base "https://github.com/$REPO/releases/download/$TAG/" --argjson map "$map" \
+            '.platforms |= map_values(.url |= (if startswith("https://api.github.com/") then $base + $map[.] else . end))' "$work/latest.json" > "$work/rewritten.json"
+          mv "$work/rewritten.json" "$work/latest.json"
+          gh release upload "$TAG" "$work/latest.json" --repo "$REPO" --clobber
+
       - name: Check latest.json lists every platform
         shell: bash
         run: |
           set -euo pipefail
-          json=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/latest.json")
+          json=$(curl -fsSL "https://github.com/${REPO}/releases/latest/download/latest.json")
           echo "$json" | jq -r '.version'
           for key in darwin-aarch64 darwin-x86_64 linux-x86_64 windows-x86_64; do
             echo "$json" | jq -e --arg k "$key" '.platforms[$k].url and .platforms[$k].signature' > /dev/null \
               || { echo "latest.json is missing platform: $key"; exit 1; }
+            echo "$json" | jq -e --arg k "$key" '.platforms[$k].url | startswith("https://github.com/")' > /dev/null \
+              || { echo "latest.json URL for $key is not a download link"; exit 1; }
           done
