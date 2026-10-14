@@ -310,7 +310,7 @@ The browser fallback uses browser file APIs and common junk-directory filters. I
 | Local packing | Reading files and generating context do not require an AI service or API key. |
 | Update checks | Desktop release builds contact GitHub for update metadata and, when requested, artifacts. Local packing does not mean the entire app is network-free. |
 | File handling | The Rust packer checks path components and canonical root containment, rejects links/reparse points, and replaces binary or oversized contents with notes. These checks are not a race-proof sandbox against concurrent filesystem mutation. |
-| Secret awareness | Ignore rules and presets are **not secret detection or redaction**. Selected text can still contain keys, credentials, or proprietary code. |
+| Secret masking | Packed output (desktop, CLI and browser mode, all formats) replaces recognizable credentials with `[REDACTED: <KIND>]`: provider tokens (AWS, OpenAI, GitHub, Slack), PEM private key blocks, and `Password=` / `*_PASSWORD=` pairs. This is **best-effort**: secrets without a recognizable shape are not detected, and ignore rules and presets do not redact anything. Review the pack before sharing. |
 | Context limits | The token badge estimates `characters ÷ 3.8`. There is no automatic fit-to-model context budget, and the file limit is not a total-pack limit. |
 
 Review both the selection and the generated pack before sharing. Treat source files as untrusted context, not instructions for an assistant to execute.

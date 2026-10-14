@@ -234,8 +234,11 @@ fn markdown_fence_is_longer_than_every_content_run() {
 #[test]
 fn packed_output_masks_secrets_in_every_format() {
     let dir = tempfile::tempdir().unwrap();
-    let content = "AWS_KEY=AKIAIOSFODNN7EXAMPLE\nServer=db;Password=Sup3r;\n";
-    fs::write(dir.path().join("app.config"), content).unwrap();
+    // Split literals so packing this repo with ptt keeps its own tests readable.
+    let aws = concat!("AK", "IAIOSFODNN7EXAMPLE");
+    let pwd = concat!("Password=", "Sup3r");
+    let content = format!("AWS_KEY={aws}\nServer=db;{pwd};\n");
+    fs::write(dir.path().join("app.config"), &content).unwrap();
     for format in [
         OutputFormat::Xml,
         OutputFormat::Markdown,
@@ -244,10 +247,10 @@ fn packed_output_masks_secrets_in_every_format() {
     ] {
         let output = pack(dir.path(), &["app.config"], format);
         assert!(
-            !output.contains("AKIAIOSFODNN7EXAMPLE"),
+            !output.contains(concat!("AK", "IAIOSFODNN7EXAMPLE")),
             "{format:?}: {output}"
         );
-        assert!(!output.contains("Sup3r"), "{format:?}: {output}");
+        assert!(!output.contains(concat!("Sup", "3r")), "{format:?}: {output}");
         assert!(
             output.contains("[REDACTED: AWS_ACCESS_KEY]"),
             "{format:?}: {output}"

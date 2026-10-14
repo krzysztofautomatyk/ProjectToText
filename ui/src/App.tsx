@@ -251,6 +251,15 @@ function normalizePath(p: string): string {
   return p.replace(/\\/g, '/');
 }
 
+/** Unchecks files the user previously excluded in this project's Custom replay list. */
+function applySavedDeselects(nodes: FileNode[], deselectPaths: string[]): FileNode[] {
+  if (deselectPaths.length === 0) return nodes;
+  const excluded = new Set(deselectPaths.map((p) => normalizePath(p)));
+  return nodes.map((n) =>
+    !n.is_dir && excluded.has(normalizePath(n.path)) ? { ...n, selected: false } : n,
+  );
+}
+
 function readThemePref(): ThemePref {
   try {
     const raw = localStorage.getItem(THEME_KEY);
@@ -609,6 +618,7 @@ const ABOUT_BACKEND_LIBS = [
   'arboard',
   'open',
   'dunce',
+  'regex',
 ];
 
 function AboutDialog({
@@ -1349,10 +1359,6 @@ function App() {
     setCustomProjects((prev) => setProjectNote(prev, entry.path, note));
   }, []);
 
-  const clearCustomDeselect = useCallback((entry: ProjectPref) => {
-    setCustomProjects((prev) => clearDeselectPaths(prev, entry.path));
-  }, []);
-
   const removeCustomProject = useCallback((entry: ProjectPref) => {
     setCustomProjects((prev) => removeProject(prev, entry.path));
   }, []);
@@ -1531,17 +1537,7 @@ function App() {
       const saved = customProjects.find(
         (p) => projectPrefKey(p.path) === projectPrefKey(pathLabel),
       );
-      const savedDeselect = new Set(
-        saved ? saved.deselectPaths.map((p) => p.replace(/\\/g, '/')) : [],
-      );
-      const withSelection =
-        savedDeselect.size > 0
-          ? withBase.map((n) =>
-              !n.is_dir && savedDeselect.has(normalizePath(n.path))
-                ? { ...n, selected: false }
-                : n,
-            )
-          : withBase;
+      const withSelection = applySavedDeselects(withBase, saved?.deselectPaths ?? []);
       setNodes(withSelection);
       setCurrentPath(pathLabel);
       setBrowserMode(fromBrowser);
@@ -2005,8 +2001,15 @@ function App() {
       updated = nodes.map((n) => ({ ...n, selected: !n.is_dir }));
     }
     setNodes(updated);
-    if (currentPath) generate(updated, currentPath, format, true);
-  }, [nodes, currentPath, format, generate, filterText, filteredTree]);
+    if (currentPath) {
+      // Select-all must forget exclusions, otherwise a later preset/refresh re-deselects them.
+      const turnedOn = updated
+        .filter((n) => !n.is_dir && n.selected)
+        .map((n) => normalizePath(n.path));
+      recordDeselectionDelta(turnedOn, true);
+      generate(updated, currentPath, format, true);
+    }
+  }, [nodes, currentPath, format, generate, filterText, filteredTree, recordDeselectionDelta]);
 
   const deselectAll = useCallback(() => {
     if (generateTimer.current != null) {
@@ -2030,14 +2033,17 @@ function App() {
     setNodes(updated);
     const remaining = updated.filter((n) => n.selected && !n.is_dir).length;
     if (currentPath) {
-      // Deselect-all is an explicit user action: previously-selected matched files
-      // become exclusions in the Custom replay list.
-      const toggled = updated
-        .filter((n) => !n.is_dir && !n.selected)
+      // Record only files this action actually unchecked. Recording every
+      // currently-unselected file would also persist preset/filter gaps
+      // (e.g. docs excluded by the Source preset) as user deselections.
+      const toggled = nodes
+        .filter((n, i) => !n.is_dir && n.selected && !updated[i].selected)
         .map((n) => normalizePath(n.path));
       recordDeselectionDelta(toggled, false);
     }
     if (remaining === 0) {
+      // Invalidate any generation still in flight so its late result cannot repopulate the output.
+      genSeq.current += 1;
       setOutput('');
       setStats({ files: 0, tokens: 0 });
       setGenerating(false);
@@ -2050,7 +2056,11 @@ function App() {
     (next: SelectionPreset) => {
       setPreset(next);
       if (nodes.length === 0) return;
-      const updated = applyPreset(nodes, next);
+      // Presets must keep files the user excluded in the Custom replay list unchecked.
+      const saved = customProjects.find(
+        (p) => projectPrefKey(p.path) === projectPrefKey(currentPath),
+      );
+      const updated = applySavedDeselects(applyPreset(nodes, next), saved?.deselectPaths ?? []);
       setNodes(updated);
       if (currentPath) generate(updated, currentPath, format, true);
       const labels: Record<SelectionPreset, string> = {
@@ -2060,7 +2070,26 @@ function App() {
       };
       pushToast('info', labels[next]);
     },
-    [nodes, currentPath, format, generate, pushToast],
+    [nodes, currentPath, format, generate, pushToast, customProjects],
+  );
+
+  const clearCustomDeselect = useCallback(
+    (entry: ProjectPref) => {
+      const isCurrent =
+        !!currentPath && projectPrefKey(entry.path) === projectPrefKey(currentPath);
+      setCustomProjects((prev) => clearDeselectPaths(prev, entry.path));
+      if (isCurrent && entry.deselectPaths.length > 0 && nodes.length > 0) {
+        // Clearing the current project must immediately re-check its files;
+        // otherwise the tree stays deselected until a preset change or refresh.
+        const excluded = new Set(entry.deselectPaths.map((p) => normalizePath(p)));
+        const updated = nodes.map((n) =>
+          !n.is_dir && excluded.has(normalizePath(n.path)) ? { ...n, selected: true } : n,
+        );
+        setNodes(updated);
+        if (currentPath) generate(updated, currentPath, format, true);
+      }
+    },
+    [currentPath, nodes, format, generate],
   );
 
   const toggleExpand = useCallback((path: string) => {

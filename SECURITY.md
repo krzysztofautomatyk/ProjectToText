@@ -4,14 +4,14 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
-| < 0.1   | No        |
+| 0.2.x   | Yes       |
+| < 0.2   | No        |
 
 ## What this app does with your data
 
 ProjectToText runs **locally**. It reads files you select on disk to build packed text for LLMs. It does not upload project contents to a remote packing service as part of core functionality.
 
-Still treat packed output as sensitive: it may include API keys, credentials, or proprietary code if those files are selected and not ignored.
+Packed output masks a fixed set of recognizable credential shapes (provider API tokens, PEM private key blocks, `Password=` pairs and `*_PASSWORD=` assignments). This is best-effort: other secret formats are not detected, so still treat packed output as sensitive, since it may include credentials or proprietary code if those files are selected and not ignored.
 
 ## Recommendations
 

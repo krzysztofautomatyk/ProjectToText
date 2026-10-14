@@ -43,13 +43,20 @@ test.describe('ProjectToText browser shell', () => {
 
   test('browser pack decodes BOM text and preserves Markdown fences', async ({ page }) => {
     await page.goto('/');
-    const source = ts.transpileModule(readFileSync('src/browserFs.ts', 'utf8'), {
-      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
-    }).outputText;
-    const result = await page.evaluate(async (source) => {
-      const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    const transpile = (file: string) =>
+      ts.transpileModule(readFileSync(file, 'utf8'), {
+        compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+      }).outputText;
+    const source = transpile('src/browserFs.ts');
+    const secretsSource = transpile('src/secrets.ts');
+    const result = await page.evaluate(async ({ source, secretsSource }) => {
+      // browserFs.ts imports ./secrets; load that module from its own blob and point the import at it.
+      const secretsUrl = URL.createObjectURL(new Blob([secretsSource], { type: 'text/javascript' }));
+      const rewritten = source.replace(/from\s*(["'])\.\/secrets\1/, `from "${secretsUrl}"`);
+      const url = URL.createObjectURL(new Blob([rewritten], { type: 'text/javascript' }));
       const { generateBrowserOutput, readBrowserFilePreview } = await import(url);
       URL.revokeObjectURL(url);
+      URL.revokeObjectURL(secretsUrl);
       const text = 'Zażółć 😀';
       const bytes = [0xff, 0xfe];
       for (let i = 0; i < text.length; i++) bytes.push(text.charCodeAt(i) & 255, text.charCodeAt(i) >> 8);
@@ -62,7 +69,7 @@ test.describe('ProjectToText browser shell', () => {
       const preview = await readBrowserFilePreview(project, 'view.xaml');
       const markdown = await generateBrowserOutput(project, ['notes.md'], 'markdown');
       return { decoded: json.files[0].content, preview: preview.content, binary: preview.binary, markdown };
-    }, source);
+    }, { source, secretsSource });
     expect(result.decoded).toBe('Zażółć 😀');
     expect(result.preview).toBe('Zażółć 😀');
     expect(result.binary).toBe(false);

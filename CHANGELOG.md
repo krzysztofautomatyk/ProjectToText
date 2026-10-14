@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
+### Added
+
+- **Secret masking in packed output**: recognizable credentials (AWS, OpenAI, GitHub and Slack tokens, PEM private key blocks, `Password=` connection-string pairs and `*_PASSWORD=` assignments) are replaced with `[REDACTED: <KIND>]` in every format, in the desktop app, the CLI and browser mode. This is best-effort, not a guarantee.
+
+### Fixed
+
+- Generation superseded by a newer request stops before reading the next file, so stale output is not produced.
+- Git scanning on Windows no longer flashes console windows.
+- A malformed entry in a project's own `.gitignore` no longer aborts the scan, matching Git; a malformed `.pttignore` still fails closed.
+- `<file_summary>` in XML output no longer counts files skipped by `max_file_size` toward `Total size`.
+- Deselect all cancels an in-flight generation so its late result cannot repopulate the output.
+- Preset buttons keep files excluded in the Custom replay list unchecked.
+
 ## [0.2.6] - 2026-10-13
 
 ### Added

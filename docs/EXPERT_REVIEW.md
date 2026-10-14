@@ -64,7 +64,7 @@ Numbers vary with machine, filesystem, path depth, directory count, and backgrou
 3. **No full UI virtualization.** The tree still mounts expanded rows; the full output remains in JavaScript and crosses IPC. Preview bounding and one-pass statistics reduce work but do not fix every large-repository bottleneck. Concurrent background generation is not cancelled/coalesced in Rust.
 4. **No automatic legacy charset detection.** Convert Windows-1250/1252 and other BOM-less legacy encodings to UTF-8; UTF-16 without a BOM is not inferred. Mixed-encoding files are not supported.
 5. **No native release QA in this pass.** Native startup via the actual macOS WebView, Windows/Linux installation, managed-machine policies, code-signing, and notarization are not certified by browser tests.
-6. **No DLP, AST compression, Git diff context, MCP, CLI presets, or clipboard CLI flag.** Those are product milestones, not repaired vulnerabilities in this phase.
+6. **No full DLP.** Packed output masks a fixed set of recognizable credential shapes (`src/core/secrets.rs`, mirrored in `ui/src/secrets.ts`). There is no entropy-based or context-aware detection, no measured false-positive/false-negative rate, and no user control to disable redaction. AST compression, Git diff context, MCP, CLI presets, and clipboard CLI flag are also not implemented.
 7. **No exact model token counts.** A tokenizer is exact only for its actual encoding/model. `tiktoken` is not an exact generic tokenizer for Claude and Gemini; do not label approximation as precision.
 8. **No measured 70–85% compression or Top-3 ranking.** Compression requires language-specific correctness tests and representative measurements; competitive claims require current evidence and a stated methodology.
 

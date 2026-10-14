@@ -6,6 +6,8 @@
  * with a hidden <input webkitdirectory> fallback.
  */
 
+import { redactSecrets } from './secrets';
+
 export interface BrowserFileNode {
   path: string;
   name: string;
@@ -436,7 +438,7 @@ async function readPackContent(file: File): Promise<string> {
   try {
     const buf = new Uint8Array(await file.arrayBuffer());
     const decoded = decodeText(buf);
-    if (decoded.ok) return decoded.text;
+    if (decoded.ok) return redactSecrets(decoded.text);
     if (decoded.reason === 'encoding') return INVALID_ENCODING_MESSAGE;
     return `[Binary file - ${file.size} bytes, content omitted for LLM safety]`;
   } catch (e) {
