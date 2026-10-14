@@ -9,6 +9,62 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+/// Canonical list of junk / build-output directory names excluded from scans and presets.
+pub const JUNK_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    ".vite",
+    ".next",
+    "coverage",
+    "__pycache__",
+    ".venv",
+    ".turbo",
+    ".cache",
+    ".idea",
+    ".vs",
+    "vendor",
+    "bin",
+    "obj",
+    "packages",
+    "TestResults",
+];
+
+/// Returns true if `name` (a single directory component) is a known junk folder.
+pub fn is_junk_dir_name(name: &str) -> bool {
+    JUNK_DIRS
+        .iter()
+        .any(|&junk| junk.eq_ignore_ascii_case(name))
+}
+
+/// Lockfiles and generated manifests: unchecked by every preset (still visible in the tree).
+pub const DEFAULT_EXCLUDED_FILE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "poetry.lock",
+    "uv.lock",
+];
+
+/// Generated directories (relative, forward-slash, with trailing slash) excluded by presets.
+pub const DEFAULT_EXCLUDED_DIR_PREFIXES: &[&str] = &["gen/schemas/"];
+
+/// True when a relative path is a lockfile or generated schema that presets leave unchecked.
+pub fn is_default_excluded_path(rel: &str) -> bool {
+    let normalized = rel.replace('\\', "/");
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    DEFAULT_EXCLUDED_FILE_NAMES.contains(&name)
+        || DEFAULT_EXCLUDED_DIR_PREFIXES
+            .iter()
+            .any(|&p| normalized.starts_with(p))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntryMeta {
     /// Relative path using forward slashes (LLM-friendly, cross-platform stable).
@@ -275,11 +331,14 @@ fn walk_with_ignore(root: &Path) -> std::io::Result<Vec<DirEntryMeta>> {
 
     // Hard safety filters (junk that should never be included by default)
     builder.filter_entry(|entry| {
-        let name = entry.file_name();
-        !matches!(
-            name.to_str(),
-            Some(".git" | "node_modules" | "target" | ".idea" | ".venv" | "__pycache__")
-        )
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            if let Some(name) = entry.file_name().to_str() {
+                if is_junk_dir_name(name) {
+                    return false;
+                }
+            }
+        }
+        true
     });
 
     let walker = builder.build();
@@ -549,6 +608,15 @@ mod tests {
         assert!(files
             .iter()
             .any(|e| normalize_rel_path(&e.path) == "src/lib.rs"));
+    }
+
+    #[test]
+    fn default_excluded_paths_cover_lockfiles_and_generated_schemas() {
+        assert!(is_default_excluded_path("ui/package-lock.json"));
+        assert!(is_default_excluded_path("Cargo.lock"));
+        assert!(is_default_excluded_path("gen/schemas/desktop-schema.json"));
+        assert!(!is_default_excluded_path("src/main.rs"));
+        assert!(!is_default_excluded_path("docs/gen/schemas-notes.md"));
     }
 
     #[test]

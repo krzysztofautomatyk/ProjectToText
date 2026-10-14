@@ -1,8 +1,8 @@
 /**
  * App version, resolved at build time by Vite from package.json.
- * Falls back to '0.3.0' so the bundler never fails on a missing import.
+ * Falls back to '0.4.0' so the bundler never fails on a missing import.
  */
 import pkg from '../package.json';
 
 const version = (pkg as { version?: string }).version;
-export default version || '0.3.0';
+export default version || '0.4.0';

@@ -76,6 +76,52 @@ test.describe('ProjectToText browser shell', () => {
     expect(result.markdown).toContain('\n```````md\n');
   });
 
+  test('browser pack emits source before docs and keeps the directory listing alphabetical', async ({
+    page,
+  }) => {
+    await page.goto('/');
+    const transpile = (file: string) =>
+      ts.transpileModule(readFileSync(file, 'utf8'), {
+        compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+      }).outputText;
+    const source = transpile('src/browserFs.ts');
+    const secretsSource = transpile('src/secrets.ts');
+    const xml = await page.evaluate(async ({ source, secretsSource }) => {
+      const secretsUrl = URL.createObjectURL(new Blob([secretsSource], { type: 'text/javascript' }));
+      const rewritten = source.replace(/from\s*(["'])\.\/secrets\1/, `from "${secretsUrl}"`);
+      const url = URL.createObjectURL(new Blob([rewritten], { type: 'text/javascript' }));
+      const { generateBrowserOutput } = await import(url);
+      URL.revokeObjectURL(url);
+      URL.revokeObjectURL(secretsUrl);
+      const paths = ['README.md', '.github/workflows/ci.yml', 'src/main.rs', 'tests/smoke.rs', 'Cargo.toml'];
+      const project = {
+        rootName: 'fixture',
+        files: new Map(paths.map((p) => [p, new File([`// ${p}\n`], p.split('/').pop() ?? p)])),
+      };
+      return generateBrowserOutput(project, paths, 'xml');
+    }, { source, secretsSource });
+    const filePaths = [...xml.matchAll(/<file path="([^"]+)"/g)].map((m) => m[1]);
+    expect(filePaths).toEqual([
+      'src/main.rs',
+      'Cargo.toml',
+      'tests/smoke.rs',
+      '.github/workflows/ci.yml',
+      'README.md',
+    ]);
+    const structure = xml.slice(xml.indexOf('<directory_structure>'), xml.indexOf('</directory_structure>'));
+    const listed = structure
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.includes('/') || line.includes('.'));
+    expect(listed).toEqual([
+      '.github/workflows/ci.yml',
+      'Cargo.toml',
+      'README.md',
+      'src/main.rs',
+      'tests/smoke.rs',
+    ]);
+  });
+
   test('help shortcut opens shortcuts dialog', async ({ page }) => {
     await page.goto('/');
     await page.keyboard.press('?');

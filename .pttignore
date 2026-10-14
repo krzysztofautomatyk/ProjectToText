@@ -1,7 +1,29 @@
-# Example project-level exclusions for LLM packing.
-# Same syntax as .gitignore. Safe to keep empty or customize per repo.
+# Exclusions for LLM packing of this repository. Same syntax as .gitignore.
 #
-# Uncomment patterns you never want in packed LLM context:
+# Tauri auto-generated ACL schemas (large JSON boilerplate)
+gen/schemas/**
+
+# Lockfiles (high token cost, low LLM value unless debugging dependencies)
+Cargo.lock
+ui/package-lock.json
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Marketing binary/SVG screenshot assets
+docs/screenshots/**
+
+# Packed context outputs
+project.xml
+project.md
+project.json
+project.txt
+context.xml
+context.md
+context.json
+context.txt
+
+# Other examples you may want in your own repos:
 # *.log
 # *.min.js
 # **/fixtures/large/**

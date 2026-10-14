@@ -2145,3 +2145,250 @@ input:focus-visible {
   flex-shrink: 0;
   margin-top: 1px;
 }
+
+/* ─── Phase 0-4 Upgrades: Budget Bar, Skeleton Pills, Git Badges & Prompt Studio ─── */
+
+.tree-virtual-container {
+  position: relative;
+  width: 100%;
+}
+
+.tree-git-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: 3px;
+  font-size: 9.5px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.tree-git-badge.git-M {
+  background: var(--warning-soft);
+  color: var(--warning);
+  border: 1px solid var(--warning-soft-border);
+}
+
+.tree-git-badge.git-A,
+.tree-git-badge.git-U {
+  background: var(--success-soft);
+  color: var(--success);
+  border: 1px solid var(--success-soft-border);
+}
+
+.tree-git-badge.git-D {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border: 1px solid var(--danger-soft-border);
+}
+
+.tree-skel-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 16px;
+  min-width: 18px;
+  padding: 0 3px;
+  border-radius: 3px;
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.1s ease, background 0.1s ease, color 0.1s ease;
+}
+
+.tree-item:hover .tree-skel-btn,
+.tree-skel-btn.is-active {
+  opacity: 1;
+}
+
+.tree-skel-btn.is-active {
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-border);
+  color: var(--accent);
+}
+
+.tree-skel-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.budget-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 16px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-default);
+  font-size: 11.5px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.budget-meter-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 180px;
+}
+
+.budget-track {
+  width: 110px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--bg-overlay);
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+}
+
+.budget-fill {
+  height: 100%;
+  background: var(--success);
+  transition: width 0.18s ease, background 0.18s ease;
+}
+
+.budget-fill.is-warn {
+  background: var(--warning);
+}
+
+.budget-fill.is-over {
+  background: var(--danger);
+}
+
+.budget-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.redact-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--success-soft);
+  border: 1px solid var(--success-soft-border);
+  color: var(--success);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.disk-changed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--warning-soft);
+  border: 1px solid var(--warning-soft-border);
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.top-consumers-drawer {
+  margin: 8px 12px 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+.top-consumers-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+
+.top-consumers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 170px;
+  overflow: auto;
+}
+
+.top-consumer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-muted);
+}
+
+.top-consumer-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.top-consumer-tokens {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.prompt-studio-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-default);
+  flex-shrink: 0;
+}
+
+.prompt-studio-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.prompt-studio-textarea {
+  width: 100%;
+  min-height: 54px;
+  max-height: 130px;
+  resize: vertical;
+  padding: 6px 8px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.prompt-studio-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-soft);
+}
+

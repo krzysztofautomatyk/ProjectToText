@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-14
+
+### Added
+
+- **Exact token counts**: `tiktoken` BPE counts (`o200k_base` by default, `cl100k_base` available) per file and per pack. Claude and Gemini profiles scale the `o200k_base` count and are approximations.
+- **Context budget**: a target-window selector (32k to 1M, or custom), a progress bar, a Top Token Consumers list with Skeleton and Exclude actions, and **Auto-Fit** to 90% of the budget. CLI: `--max-tokens`.
+- **AST skeletons**: tree-sitter bodies removal for Rust, TypeScript/TSX, JavaScript, Python, Go, C#, Java, C, and C++, with a brace or indentation fallback. Per-file and per-folder `[S]` toggles and a `Core Full + Rest Skeleton` preset.
+- **Git context**: status badges (modified, added, untracked, deleted), **Select Git Modified**, **Select Branch Changes**, and an **Include `<git_diff>`** option. CLI: `--git-modified`, `--git-branch`, `--git-diff`.
+- **Dependency neighbors** (desktop): select a file's imports, importers, or related tests from its context menu.
+- **Prompt templates**: a collapsible prompt bar (architecture review, bug investigation, security audit, test writing, custom). The task is emitted as `<task_instructions>` at the end of the pack.
+- **CLI parity**: `--preset`, `--include`, `--exclude`, `--skeleton [GLOB]`, `-c/--copy` (system clipboard), `--prompt`, and `--no-redact`.
+- **MCP server**: `ptt mcp [DIR]` speaks JSON-RPC 2.0 over stdio with `ptt_get_project_map`, `ptt_pack_files`, and `ptt_get_git_context`.
+- **Secret masking** extended to Anthropic, Google, and Stripe keys, URL basic-auth passwords, and `.env` `*_SECRET`/`*_TOKEN`/`*_API_KEY`/`*_PRIVATE_KEY` assignments. Documentation placeholders (`...`, `***`) are not masked. The desktop app shows a masked-count badge.
+- **Default exclusions**: presets leave lockfiles and `gen/schemas/` unchecked. A root `.pttignore` covers this repository's generated files and packed outputs.
+- **Architectural ordering**: `<files>` content is emitted source first, then manifests, tests, and docs/CI. `<directory_structure>` stays alphabetical.
+- **File watcher**: the desktop app emits `workspace-changed` when the project changes.
+
+### Changed
+
+- Zero-copy IPC: packed output stays in Rust memory and only a bounded preview crosses to the UI. Copy and Save use the complete output.
+- Parallel reading, decoding, skeletonization, redaction, and token counting with `rayon`. Output is byte-identical to sequential packing.
+- Ignore-rule freshness checks use cached directory and file metadata. Selection matching uses a normalized path set.
+- The file tree is built in O(N log B) with memoized sorting and viewport virtualization for large repositories.
+- Minimum supported Rust version is 1.90, the highest minimum among resolved dependencies.
+
 ## [0.3.0] - 2026-10-14
 
 ### Added

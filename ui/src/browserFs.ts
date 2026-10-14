@@ -6,7 +6,7 @@
  * with a hidden <input webkitdirectory> fallback.
  */
 
-import { redactSecrets } from './secrets';
+import { redactSecrets, redactSecretsWithReport, type RedactionSummary } from './secrets';
 
 export interface BrowserFileNode {
   path: string;
@@ -16,27 +16,30 @@ export interface BrowserFileNode {
   selected: boolean;
 }
 
-const JUNK_DIR_NAMES = new Set([
-  'node_modules',
+export const CANONICAL_JUNK_DIRS = [
   '.git',
+  'node_modules',
   'target',
   'dist',
-  // note: do NOT skip generic "build"/"out" at all levels too aggressively for small projects;
-  // keep common heavyweight folders only
+  'build',
+  'out',
+  '.vite',
   '.next',
   'coverage',
   '__pycache__',
+  '.venv',
   '.turbo',
   '.cache',
   '.idea',
   '.vs',
   'vendor',
-  // .NET build outputs (folder names only, not file extensions)
   'bin',
   'obj',
   'packages',
   'TestResults',
-]);
+] as const;
+
+const JUNK_DIR_NAMES = new Set(CANONICAL_JUNK_DIRS.map((d) => d.toLowerCase()));
 
 export type BrowserFileMap = Map<string, File>;
 
@@ -431,26 +434,156 @@ function escapeXmlAttr(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
-async function readPackContent(file: File): Promise<string> {
+export interface BrowserGenerateOptions {
+  redactSecrets?: boolean;
+  skeletonFiles?: Set<string>;
+  taskPrompt?: string;
+}
+
+function extractBrowserSkeleton(content: string): string {
+  const lines = content.split('\n');
+  const out: string[] = [];
+  let braceDepth = 0;
+  let elidedAt: number | null = null;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const opens = (line.match(/\{/g) || []).length;
+    const closes = (line.match(/\}/g) || []).length;
+
+    if (elidedAt !== null) {
+      braceDepth += opens - closes;
+      if (braceDepth < elidedAt) {
+        elidedAt = null;
+      }
+      continue;
+    }
+
+    const isType =
+      /^(?:export\s+)?(?:interface|type|class|enum|struct|trait|impl|mod|namespace)\b/.test(
+        trimmed,
+      );
+    const preDepth = braceDepth;
+    braceDepth += opens - closes;
+
+    if (opens > closes && preDepth >= 0 && !isType && trimmed.includes('(')) {
+      const idx = line.lastIndexOf('{');
+      if (idx !== -1) {
+        out.push(`${line.slice(0, idx).trimEnd()} { /* ... */ }`);
+        elidedAt = braceDepth;
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+async function readPackContentWithReport(
+  file: File,
+  doRedact = true,
+  isSkeleton = false,
+): Promise<{ content: string; summary: RedactionSummary }> {
+  const emptySummary: RedactionSummary = { totalRedactions: 0, kinds: [] };
   if (file.size > PACK_MAX) {
-    return `[File too large: ${file.size} bytes (limit ${PACK_MAX}), skipped]`;
+    return {
+      content: `[File too large: ${file.size} bytes (limit ${PACK_MAX}), skipped]`,
+      summary: emptySummary,
+    };
   }
   try {
     const buf = new Uint8Array(await file.arrayBuffer());
     const decoded = decodeText(buf);
-    if (decoded.ok) return redactSecrets(decoded.text);
-    if (decoded.reason === 'encoding') return INVALID_ENCODING_MESSAGE;
-    return `[Binary file - ${file.size} bytes, content omitted for LLM safety]`;
+    if (decoded.ok) {
+      let text = decoded.text;
+      let summary = emptySummary;
+      if (doRedact) {
+        const res = redactSecretsWithReport(text);
+        text = res.text;
+        summary = res.summary;
+      } else {
+        // silence unused import if needed
+        void redactSecrets;
+      }
+      if (isSkeleton) {
+        text = extractBrowserSkeleton(text);
+      }
+      return { content: text, summary };
+    }
+    if (decoded.reason === 'encoding') {
+      return { content: INVALID_ENCODING_MESSAGE, summary: emptySummary };
+    }
+    return {
+      content: `[Binary file - ${file.size} bytes, content omitted for LLM safety]`,
+      summary: emptySummary,
+    };
   } catch (e) {
-    return `[Error reading file: ${e instanceof Error ? e.message : String(e)}]`;
+    return {
+      content: `[Error reading file: ${e instanceof Error ? e.message : String(e)}]`,
+      summary: emptySummary,
+    };
   }
 }
 
-export async function generateBrowserOutput(
+/**
+ * Architectural emission tier for `<files>` content (lower is emitted first). Mirrors
+ * `architectural_tier` in src/core/output.rs: 0 source, 1 manifests, 2 tests/examples,
+ * 3 docs, CI metadata and everything else.
+ */
+export function architecturalTier(path: string): number {
+  const lower = path.replace(/\\/g, '/').toLowerCase();
+  const name = lower.slice(lower.lastIndexOf('/') + 1);
+  const inDir = (dir: string) => lower.startsWith(`${dir}/`) || lower.includes(`/${dir}/`);
+
+  const manifests = [
+    'cargo.toml',
+    'package.json',
+    'tauri.conf.json',
+    'pyproject.toml',
+    'go.mod',
+    'makefile',
+    'dockerfile',
+    'build.rs',
+  ];
+  if (manifests.includes(name) || (name.startsWith('tsconfig') && name.endsWith('.json'))) {
+    return 1;
+  }
+
+  const isTestName =
+    name.includes('.test.') ||
+    name.includes('.spec.') ||
+    name.includes('_test.') ||
+    name.startsWith('test_');
+  if (isTestName || ['tests', 'e2e', 'examples', 'benches'].some(inDir)) {
+    return 2;
+  }
+
+  const sourceExts = [
+    '.rs', '.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.cs', '.java', '.c', '.cpp', '.h', '.hpp',
+  ];
+  const isRootSource = !lower.includes('/') && sourceExts.some((e) => lower.endsWith(e));
+  const sourceDirs = ['src', 'lib', 'app', 'pkg', 'cmd', 'internal', 'crates', 'packages'];
+  if (isRootSource || sourceDirs.some(inDir)) {
+    return 0;
+  }
+
+  return 3;
+}
+
+export async function generateBrowserOutputWithStats(
   project: BrowserProject,
   selectedPaths: string[],
   format: string,
-): Promise<string> {
+  opts: BrowserGenerateOptions = {},
+): Promise<{
+  text: string;
+  redactions: RedactionSummary;
+  fileTokens: { path: string; bytes: number; tokens: number; mode: 'full' | 'skeleton' }[];
+}> {
+  const doRedact = opts.redactSecrets !== false;
+  const skelSet = opts.skeletonFiles ?? new Set<string>();
+  const taskPrompt = opts.taskPrompt?.trim() || '';
+
   const selected = new Set(selectedPaths.map((p) => p.replace(/\\/g, '/').replace(/\/+$/, '')));
   const isSelected = (path: string): boolean => {
     let prefix = path;
@@ -470,29 +603,61 @@ export async function generateBrowserOutput(
   }
   entries.sort((a, b) => a.path.localeCompare(b.path));
 
-  // Cap pack size in browser to keep UI responsive
+  // Content is emitted by architectural tier (stable, so ties stay alphabetical). The file cap
+  // applies after this ordering, so the cap drops docs and CI metadata before source code.
   const MAX_PACK_FILES = 400;
-  const limited = entries.slice(0, MAX_PACK_FILES);
+  const contentOrder = [...entries].sort((a, b) => architecturalTier(a.path) - architecturalTier(b.path));
+  const limited = contentOrder.slice(0, MAX_PACK_FILES);
   const truncatedNote =
     entries.length > MAX_PACK_FILES
       ? `\n<!-- packed first ${MAX_PACK_FILES} of ${entries.length} selected files (browser limit) -->\n`
       : '';
 
-  if (format === 'json') {
-    const files = [];
-    for (const e of limited) {
-      files.push({ path: e.path, size: e.file.size, content: await readPackContent(e.file) });
+  let totalRedactions = 0;
+  const kindMap = new Map<string, number>();
+  const fileTokens: { path: string; bytes: number; tokens: number; mode: 'full' | 'skeleton' }[] = [];
+
+  const prepared: { path: string; size: number; content: string; isSkel: boolean }[] = [];
+  for (const e of limited) {
+    const isSkel = skelSet.has(e.path);
+    const { content, summary } = await readPackContentWithReport(e.file, doRedact, isSkel);
+    totalRedactions += summary.totalRedactions;
+    for (const [k, c] of summary.kinds) {
+      kindMap.set(k, (kindMap.get(k) ?? 0) + c);
     }
-    return JSON.stringify(
-      {
-        generator: 'ptt (ProjectToText) browser-mode',
-        root: project.rootName,
-        file_count: files.length,
-        files,
-      },
-      null,
-      2,
+    const tokens = Math.max(0, Math.round(content.length / 3.8));
+    fileTokens.push({
+      path: e.path,
+      bytes: content.length,
+      tokens,
+      mode: isSkel ? 'skeleton' : 'full',
+    });
+    prepared.push({ path: e.path, size: e.file.size, content, isSkel });
+  }
+
+  const redactions: RedactionSummary = {
+    totalRedactions,
+    kinds: Array.from(kindMap.entries()),
+  };
+
+  if (format === 'json') {
+    const files = prepared.map((p) =>
+      p.isSkel
+        ? { path: p.path, size: p.size, mode: 'skeleton', content: p.content }
+        : { path: p.path, size: p.size, content: p.content },
     );
+    const doc: Record<string, unknown> = {
+      generator: 'ptt (ProjectToText) browser-mode',
+      root: project.rootName,
+      file_count: files.length,
+      files,
+    };
+    if (taskPrompt) doc.task_instructions = taskPrompt;
+    return {
+      text: JSON.stringify(doc, null, 2),
+      redactions,
+      fileTokens,
+    };
   }
 
   if (format === 'markdown') {
@@ -501,13 +666,16 @@ export async function generateBrowserOutput(
       `Generated from: \`${project.rootName}\` (browser mode)\n`,
       truncatedNote,
     ];
-    for (const e of limited) {
-      const content = await readPackContent(e.file);
-      const ext = e.path.includes('.') ? e.path.split('.').pop() : '';
-      const fence = markdownFence(content);
-      parts.push(`## \`${e.path}\`\n${fence}${ext}\n${content}\n${fence}\n`);
+    for (const p of prepared) {
+      const ext = p.path.includes('.') ? p.path.split('.').pop() : '';
+      const fence = markdownFence(p.content);
+      const header = p.isSkel ? `## \`${p.path}\` *(skeleton)*` : `## \`${p.path}\``;
+      parts.push(`${header}\n${fence}${ext}\n${p.content}\n${fence}\n`);
     }
-    return parts.join('\n');
+    if (taskPrompt) {
+      parts.push(`<task_instructions>\n${taskPrompt}\n</task_instructions>`);
+    }
+    return { text: parts.join('\n'), redactions, fileTokens };
   }
 
   if (format === 'plain') {
@@ -516,10 +684,17 @@ export async function generateBrowserOutput(
       '================================\n',
       truncatedNote,
     ];
-    for (const e of limited) {
-      parts.push(`>>> ${e.path}`, await readPackContent(e.file), '--------------------------------\n');
+    for (const p of prepared) {
+      parts.push(
+        p.isSkel ? `>>> ${p.path} [skeleton]` : `>>> ${p.path}`,
+        p.content,
+        '--------------------------------\n',
+      );
     }
-    return parts.join('\n');
+    if (taskPrompt) {
+      parts.push(`<task_instructions>\n${taskPrompt}\n</task_instructions>`);
+    }
+    return { text: parts.join('\n'), redactions, fileTokens };
   }
 
   // XML default
@@ -533,21 +708,44 @@ export async function generateBrowserOutput(
     '  </file_summary>',
     '  <directory_structure>',
   ].filter(Boolean) as string[];
-  for (const e of limited) lines.push(`    ${e.path}`);
+  // The directory listing stays alphabetical; only the <files> content follows tier order.
+  for (const p of [...prepared].sort((a, b) => a.path.localeCompare(b.path))) {
+    lines.push(`    ${p.path}`);
+  }
   lines.push('  </directory_structure>', '  <files>');
-  for (const e of limited) {
-    const content = await readPackContent(e.file);
-    const safe = content.split(']]>').join(']]]]><![CDATA[>');
+  for (const p of prepared) {
+    const safe = p.content.split(']]>').join(']]]]><![CDATA[>');
+    const attr = p.isSkel
+      ? `path="${escapeXmlAttr(p.path)}" mode="skeleton"`
+      : `path="${escapeXmlAttr(p.path)}"`;
     lines.push(
-      `    <file path="${escapeXmlAttr(e.path)}">`,
+      `    <file ${attr}>`,
       '      <![CDATA[',
       safe,
       '      ]]>',
       '    </file>',
     );
   }
-  lines.push('  </files>', '</project_context>');
-  return lines.join('\n');
+  lines.push('  </files>');
+  if (taskPrompt) {
+    lines.push('  <task_instructions>');
+    for (const line of taskPrompt.split('\n')) {
+      lines.push(`    ${line}`);
+    }
+    lines.push('  </task_instructions>');
+  }
+  lines.push('</project_context>');
+  return { text: lines.join('\n'), redactions, fileTokens };
+}
+
+export async function generateBrowserOutput(
+  project: BrowserProject,
+  selectedPaths: string[],
+  format: string,
+  opts: BrowserGenerateOptions = {},
+): Promise<string> {
+  const res = await generateBrowserOutputWithStats(project, selectedPaths, format, opts);
+  return res.text;
 }
 
 export function downloadText(filename: string, text: string) {

@@ -1,80 +1,89 @@
 # Architecture
 
-ProjectToText (`ptt`) is a **Tauri v2** desktop application with a thin UI shell and a pure Rust packing engine. A browser fallback (Vite-only) reimplements scan/pack in TypeScript for environments without the native shell.
+ProjectToText (`ptt`) is a **Tauri v2** desktop application, a headless CLI, and an MCP server, all sharing one Rust core crate. A browser fallback (Vite-only) reimplements scan, selection, and pack in TypeScript for environments without the native shell.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  ui/  (React + TypeScript + Vite)                        │
-│  tree · presets · preview · theme · browser pack path    │
-│  Playwright e2e smoke (browser shell)                    │
+│  ui/  (React 19 + TypeScript + Vite)                     │
+│  virtualized tree · presets · budget bar · prompt bar    │
+│  preview · theme · browser pack path (File System API)   │
 └────────────────────────────┬─────────────────────────────┘
-                             │  Tauri IPC  (desktop)
+                             │  Tauri IPC (desktop)
                              │  or in-browser FS APIs
 ┌────────────────────────────▼─────────────────────────────┐
-│  src/main.rs  (binary)                                   │
-│  GUI: scan · generate · preview · save/copy · open_with  │
-│  CLI: `ptt pack` (src/cli.rs) — no webview               │
+│  src/main.rs  (desktop binary)                           │
+│  scan_folder · generate_output · copy/save_packed_output │
+│  resolve_related_files · preview · workspace watcher     │
+├──────────────────────────────────────────────────────────┤
+│  src/cli.rs   `ptt pack`  (headless, no webview)         │
+│  src/mcp.rs   `ptt mcp`   (JSON-RPC 2.0 over stdio)      │
 └────────────────────────────┬─────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────┐
-│  src/lib.rs  →  ptt core crate                           │
-│  ├── walker   git ls-files / ignore crate + .pttignore   │
-│  ├── output   XML · Markdown · JSON · plain              │
-│  └── preview  safe path resolve + text load              │
+│  src/lib.rs  →  ptt core crate (src/core/)               │
+│  ├── walker     git ls-files / ignore crate + .pttignore │
+│  ├── workspace  revisioned scan snapshot + ignore cache  │
+│  ├── output     XML · Markdown · JSON · plain (rayon)    │
+│  ├── secrets    best-effort credential masking           │
+│  ├── tokenizer  tiktoken BPE counts + model profiles     │
+│  ├── skeleton   tree-sitter AST skeletons                │
+│  ├── deps       import / importer / test graph           │
+│  ├── git        status, branch changes, diff             │
+│  ├── text       strict UTF-8 / UTF-16 BOM decoding       │
+│  └── preview    root-constrained path resolve + load     │
 └──────────────────────────────────────────────────────────┘
 ```
 
-### Headless CLI
+## Modules
 
-```bash
-ptt pack [DIR] [-f xml|markdown|json|plain] [-o FILE] [--no-summary] [--max-size N]
-```
-
-Uses the same `walk` + `write_output` path as the desktop packer (all files after ignore rules; selection UI is desktop-only).
-
-## Design goals
-
-1. **Git fidelity** — prefer `git ls-files --exclude-standard`; fall back to the `ignore` crate.
-2. **LLM-safe packing** — size limits, binary detection, correct escaping (XML CDATA / JSON).
-3. **Testable core** — walker, output, and preview live in the library crate (unit tests, no GUI).
-4. **Local-only** — no network packing service; user explicitly copies or saves output.
-5. **Progressive enhancement** — browser mode for pack/preview; desktop for dialogs and open-with.
-
-## Key types
-
-| Type | Location | Role |
-|------|----------|------|
-| `DirEntryMeta` | `core::walker` | Relative path, dir flag, size |
-| `WriteOptions` | `core::output` | Format, summary flag, max file size |
-| `FileNode` / `PackOptions` | `main` | IPC DTOs for the frontend |
-| `BrowserProject` | `ui/browserFs.ts` | In-memory scan result for web mode |
+| Module | Responsibility |
+| --- | --- |
+| `core::walker` | Git-first discovery, `ignore` fallback, `.pttignore`, junk directories, default exclusions for lockfiles and `gen/schemas/`. `SelectionMatcher` checks each candidate's ancestors against a normalized set. |
+| `core::workspace` | A revisioned `Arc<WorkspaceSnapshot>`. Ignore-rule freshness uses cached `(mtime, len)` metadata. Also holds the dependency graph. |
+| `core::output` | Writers for the four formats. Reads, decodes, skeletonizes, redacts, and counts tokens per file in parallel. `architectural_tier` orders `<files>` content; `<directory_structure>` stays alphabetical. |
+| `core::secrets` | Regex rules for provider tokens, PEM blocks, URL passwords, `Password=` pairs, and `.env` secrets. Placeholders are skipped. `redact_secrets_with_report` returns per-kind counts. |
+| `core::tokenizer` | `tiktoken-rs` encodings (`o200k_base`, `cl100k_base`). Claude and Gemini profiles scale the `o200k_base` count by fixed factors. |
+| `core::skeleton` | tree-sitter grammars for Rust, TypeScript/TSX, JavaScript, Python, Go, C#, Java, C, and C++; brace/indentation fallback for other text. |
+| `core::deps` | One-hop import, importer, and test relationships used by the desktop context menu. |
+| `core::git` | `git status --porcelain`, branch-changed files versus the base branch, and unified diff. Uses `git_command()`, which suppresses console windows on Windows. |
+| `core::text` | Strict UTF-8 and BOM-declared UTF-16 decoding; Markdown fences longer than any backtick run. |
+| `core::preview` | Canonical-root containment, symlink and reparse-point rejection, bounded text previews. |
+| `mcp` | Three tools: `ptt_get_project_map`, `ptt_pack_files`, `ptt_get_git_context`. |
 
 ## Data flow (desktop pack)
 
-1. User picks a directory (dialog or drag-and-drop).
-2. `scan_folder` walks via Git or `ignore`, merges directory nodes, returns `FileNode[]`.
-3. `scan_folder` stores a single-workspace `Arc<WorkspaceSnapshot>` (canonical root, entries, ignore-file contents, revision) and returns `{ root, revision, nodes }`. UI applies presets / manual selection.
-4. `generate_output` receives the revision, validates the snapshot and indexed ignore files, filters through `SelectionMatcher`, validates file paths again, and writes the format without rerunning `walk`. Scan/generate/preview I/O runs through `tauri::async_runtime::spawn_blocking`.
-5. User copies to clipboard or saves via dialog. Full output is still transferred to JavaScript; the visible preview is bounded for large packs, not the underlying copy/save data.
+1. The user picks a directory (dialog, drag-and-drop, or `ptt [DIR]` at startup).
+2. `scan_folder` walks the project through Git or the `ignore` crate, stores a single `Arc<WorkspaceSnapshot>` with its revision, and returns the tree to the UI.
+3. The UI applies a preset or manual selection. The budget bar counts exact tokens per selected file. Auto-Fit deselects low-priority files until the selection is at most 90% of the budget.
+4. `generate_output` validates the snapshot revision and indexed ignore files, filters through `SelectionMatcher`, re-validates paths, and runs the writer on `rayon`. The complete output is stored in Rust as a `PackedArtifact` behind an `Arc<String>`.
+5. Only a **bounded preview** crosses IPC. `copy_packed_output` and `save_packed_output` read the full artifact from Rust memory, so multi-megabyte output is not serialized back to JavaScript.
+6. A `notify` watcher emits `workspace-changed` so the UI can prompt for Refresh. Refresh rebuilds membership; generation rereads indexed file contents and rejects stale revisions.
 
-Refresh rebuilds membership; there is no file watcher yet. Generation rereads indexed file contents, checks existing indexed directory ignore-file contents, and rejects stale revisions. New files/directories and external Git ignore configuration changes require explicit refresh. Startup `ptt [DIR]` supplies an initial path through the `startup_folder` command.
+## Other entry points
 
-The shared `core::text` decoder supports strict UTF-8 and BOM-declared UTF-16; it does not guess legacy encodings. Path checks reject symlink/reparse components and require canonical containment, but do not eliminate filesystem TOCTOU races.
+- **CLI** (`ptt pack`) uses the same `walk`, filters (`--preset`, `--include`, `--exclude`, `--skeleton`, Git flags), auto-fit (`--max-tokens`), and `write_output` path. It writes through a buffered writer and refuses to overwrite an input file.
+- **MCP** (`ptt mcp [DIR]`) answers JSON-RPC 2.0 requests on stdio. A tool call may name a directory; results go through the same ignore and redaction rules as `ptt pack`.
 
-## Extension points
+## Browser mode
 
-- **`.pttignore`** — extra exclusions on top of Git ignore rules.
-- **Output formats** — add a variant in `OutputFormat` + a writer in `output.rs`.
-- **Selection presets** — frontend-only heuristics (source / docs / all clean).
-- **Syntax languages** — extend `ui/src/syntax.ts` + highlight.js registration.
+`ui/src/browserFs.ts` reimplements scan and pack in TypeScript. It emits `<files>` in the same architectural tier order, keeps `<directory_structure>` alphabetical, and caps the pack at 400 files **after** tier ordering so the cap drops docs before source. Secret rules live in `ui/src/secrets.ts`, which mirrors `src/core/secrets.rs`. Browser mode does not run Git and does not implement `.gitignore` or `.pttignore`.
 
 ## Security notes
 
-- Symlink escapes outside the project root are skipped in the ignore walk.
-- Preview resolves paths under the project root only.
-- Packed content may still include secrets if the user selects those files; encourage `.gitignore` / `.pttignore`.
+- Symlinks and reparse points are rejected. Relative paths are validated component by component, and canonical containment is checked before each read.
+- Preview and pack resolve paths under the project root only. These checks are not a race-proof sandbox against concurrent filesystem changes.
+- Secret masking is best-effort. Selected files that contain credentials in an unrecognized shape are not masked.
+- Tauri commands are not a sandbox against a compromised frontend.
+
+## Extension points
+
+- **`.pttignore`** adds exclusions on top of Git ignore rules.
+- **Output formats**: add a variant to `OutputFormat` and a writer in `output.rs`, then mirror it in `browserFs.ts`.
+- **Presets and default exclusions**: `applyPreset` in `ui/src/App.tsx` and `matches_preset` in `src/cli.rs` share the same rules.
+- **Secret rules**: change `src/core/secrets.rs` and `ui/src/secrets.ts` together and add matching cases to both test suites.
+- **Skeleton languages**: add a grammar and a case in `core::skeleton::language_for_path`.
 
 ## Related docs
 
-- [Screenshots](screenshots/) — marketing and SVG mockups for README
-- [Expert review](EXPERT_REVIEW.md) — publish readiness scorecard
+- [Screenshots](screenshots/): README assets
+- [Engineering review](EXPERT_REVIEW.md): measurements and known limits

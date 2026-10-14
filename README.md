@@ -36,6 +36,7 @@ Use the exported text with ChatGPT, Claude, Gemini, Cursor, Copilot, or any tool
 - [Quick start](#quick-start)
 - [Features](#features)
 - [CLI reference](#cli-reference)
+- [MCP server](#mcp-server)
 - [Output formats](#output-formats)
 - [Ignore rules and selection](#ignore-rules-and-selection)
 - [Privacy and safety](#privacy-and-safety)
@@ -129,7 +130,7 @@ ptt pack ./my-project -o ../context.xml
 
 You can also launch the desktop app directly on a folder with `ptt ./my-project`. Unknown commands and invalid folder arguments report an error instead of opening an empty window.
 
-The CLI packs **all files returned by the ignore-aware scanner**. Desktop presets and saved UI selections do not apply. Use `.pttignore` or choose a narrower directory to control CLI scope.
+Without `--preset`, `--include`, or `--exclude`, the CLI packs **all files returned by the ignore-aware scanner**. Saved desktop selections never apply to the CLI. Use `.pttignore`, a narrower directory, or the selection flags to control scope.
 
 > Keep generated packs **outside the scanned project**, or explicitly ignore them. Otherwise a later run can include a previous export in its input.
 
@@ -161,8 +162,16 @@ Installing a desktop app does not necessarily add `ptt` to your `PATH`. See [dev
 - **UTF-8 and BOM-declared UTF-16LE/BE** in pack and preview. Unsupported or malformed encodings are reported rather than silently replaced.
 - **A default 2 MiB per-file limit**, binary detection, and skipped symlinks in the Rust packing path.
 - **Relative file paths** in output; the Rust packer records the project folder name rather than its absolute location.
-- **Approximate token counts** for planning, not model-specific tokenization or billing.
+- **Exact BPE token counts** per file and per pack, using `tiktoken` (`o200k_base` by default, `cl100k_base` available). The Claude and Gemini profiles scale the `o200k_base` count by a fixed factor, so they are approximations. Counts are for planning, not billing.
 - **Bounded output preview** for large packs: above 150,000 characters, initially display 100,000. Copy and Save still use the complete output; full preview is opt-in.
+
+### Context budget, skeletons, and Git
+
+- **Context budget:** choose a target window (32k, 64k, 128k, 200k, 1M, or a custom size). A progress bar shows packed tokens against it. **Top Token Consumers** lists the heaviest selected files with one-click Skeleton or Exclude actions. **Auto-Fit** deselects low-priority files (tests, fixtures, lockfiles, docs) until the selection is at most 90% of the budget. The CLI equivalent is `--max-tokens`.
+- **AST skeletons:** a tree-sitter pass keeps signatures, types, imports, and doc comments while removing function bodies. It covers Rust, TypeScript/TSX, JavaScript, Python, Go, C#, Java, C, and C++; other files use a brace or indentation fallback. Mark a file or folder with `[S]`. On this repository's own source, skeleton mode cut the exact token count by about 75% (see [engineering review](docs/EXPERT_REVIEW.md)).
+- **Dependency neighbors (desktop app):** from a file's context menu, select its imports, its importers, or its related tests.
+- **Git context:** tree badges mark modified, added, untracked, and deleted files. **Select Git Modified** and **Select Branch Changes** select them in one step, and **Include `<git_diff>`** adds the unified diff to the pack.
+- **Prompt templates:** a collapsible prompt bar offers tasks such as architecture and code review, bug investigation, security audit, and test writing. The task is appended as `<task_instructions>` at the end of the pack, after the files.
 
 <details>
 <summary>Keyboard shortcuts</summary>
@@ -205,6 +214,16 @@ ptt pack [DIR] [OPTIONS]
 | `-o, --output <FILE>` | Write to a file instead of standard output | Standard output |
 | `--no-summary` | Omit the XML file summary; other formats are unchanged | Include summary |
 | `--max-size <N>` | Maximum file size in bytes; larger files are represented by notes | `2097152` (2 MiB) |
+| `--preset <PRESET>` | `source`, `docs`, or `all` (lockfiles and `gen/schemas/` are never selected by presets) | none |
+| `--include <GLOB>` / `--exclude <GLOB>` | Keep only matching files / drop matching files; repeatable | none |
+| `--skeleton [GLOB]` | Pack all files, or files matching `GLOB`, as AST skeletons | off |
+| `--git-modified` | Select only modified, staged, and untracked files | off |
+| `--git-branch` | Select only files changed on the current branch versus its base | off |
+| `--git-diff` | Include a unified `<git_diff>` block | off |
+| `--max-tokens <N>` | Auto-fit the selection to 90% of `N` tokens | none |
+| `--prompt <TEXT>` | Append `<task_instructions>` at the end of the pack | none |
+| `-c, --copy` | Copy the pack to the system clipboard instead of printing it | off |
+| `--no-redact` | Disable secret masking (not recommended) | redaction on |
 | `-h, --help` | Show packing usage | — |
 
 ```bash
@@ -223,15 +242,48 @@ ptt pack ./my-project -f plain --max-size 1048576 -o ../context.txt
 # XML without the optional file summary
 ptt pack ./my-project --no-summary -o ../context-compact.xml
 
+# Source files only, skeletonized, fitted to a 128k-token window, copied to the clipboard
+ptt pack . --preset source --skeleton --max-tokens 128000 -c
+
+# Only what changed on this branch, with the diff and a task prompt
+ptt pack . --git-branch --git-diff --prompt "Review these changes for regressions."
+
 ptt pack --help
 ptt --version
 ```
+
+## MCP server
+
+`ptt mcp [DIR]` runs a Model Context Protocol server (JSON-RPC 2.0 over stdio) so AI assistants can request context on demand. It exposes three tools:
+
+| Tool | Returns |
+| :--- | :--- |
+| `ptt_get_project_map` | Directory tree, exact token counts per file, and skeletons of key modules. |
+| `ptt_pack_files` | A pack of the requested files, respecting `.gitignore`, `.pttignore`, and secret masking. |
+| `ptt_get_git_context` | Modified files and the current `git diff`. |
+
+Example client configuration (Claude Desktop and Cursor accept a similar entry):
+
+```json
+{
+  "mcpServers": {
+    "ptt": {
+      "command": "ptt",
+      "args": ["mcp", "/absolute/path/to/your/project"]
+    }
+  }
+}
+```
+
+The server communicates only over stdio. A tool call may name a different directory than the startup `DIR`, and reads go through the same ignore and redaction rules as `ptt pack`. Connect only clients you trust.
 
 Packed data goes to standard output unless `-o` is set; status messages go to standard error. Exit codes are **0** on success, **1** for a packing/output failure, and **2** for invalid arguments.
 
 **A successful exit is not a guarantee that every file's contents were included.** Binary, oversized, or unreadable files can appear as explanatory notes. Review the pack before using it.
 
 ## Output formats
+
+In XML, `<directory_structure>` is alphabetical, but `<file>` contents are emitted by architectural tier: source and entrypoints first, then manifests and build configs, then tests and examples, then documentation and CI metadata. If an LLM truncates a long pack, it drops docs before code. `<git_diff>` and `<task_instructions>` come after the files.
 
 | Format | Use it for | Structure |
 | :--- | :--- | :--- |
@@ -297,6 +349,8 @@ context.txt
 
 `.pttignore` uses Gitignore-style patterns. Nested files apply within their own directories; an ignored parent directory must be re-included before one of its children can be re-included. Desktop presets narrow the scanned files further; remembered exclusions are replayed when you reopen a project. Re-checking a file clears its saved exclusion.
 
+Presets never check lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, `poetry.lock`, `uv.lock`) or `gen/schemas/`. They stay visible in the tree, so you can select them by hand when you need them.
+
 ### Browser mode is different
 
 The browser fallback uses browser file APIs and common junk-directory filters. It does **not** run Git or implement the Rust scanner's `.gitignore` / `.pttignore` behavior. Use desktop or CLI when ignore fidelity matters.
@@ -310,8 +364,8 @@ The browser fallback uses browser file APIs and common junk-directory filters. I
 | Local packing | Reading files and generating context do not require an AI service or API key. |
 | Update checks | Desktop release builds contact GitHub for update metadata and, when requested, artifacts. Local packing does not mean the entire app is network-free. |
 | File handling | The Rust packer checks path components and canonical root containment, rejects links/reparse points, and replaces binary or oversized contents with notes. These checks are not a race-proof sandbox against concurrent filesystem mutation. |
-| Secret masking | Packed output (desktop, CLI and browser mode, all formats) replaces recognizable credentials with `[REDACTED: <KIND>]`: provider tokens (AWS, OpenAI, GitHub, Slack), PEM private key blocks, and `Password=` / `*_PASSWORD=` pairs. This is **best-effort**: secrets without a recognizable shape are not detected, and ignore rules and presets do not redact anything. Review the pack before sharing. |
-| Context limits | The token badge estimates `characters ÷ 3.8`. There is no automatic fit-to-model context budget, and the file limit is not a total-pack limit. |
+| Secret masking | Packed output (desktop, CLI and browser mode, all formats) replaces recognizable credentials with `[REDACTED: <KIND>]`: provider tokens (AWS, Anthropic, OpenAI, Google, Stripe, GitHub, Slack), PEM private key blocks, URL basic-auth passwords, `Password=` / `*_PASSWORD=` values, and `*_SECRET`, `*_TOKEN`, `*_API_KEY`, and `*_PRIVATE_KEY` assignments in `.env` style. Documentation placeholders such as `Password=...` are left alone. This is **best-effort**: secrets without a recognizable shape are not detected, and ignore rules and presets do not redact anything. Use `--no-redact` only for packs you will never share. Review the pack before sharing. |
+| Context limits | Token counts are exact for `o200k_base` and `cl100k_base`, and approximate for the Claude and Gemini profiles. The context budget (`--max-tokens` or the desktop budget bar) plans a selection against a window size, but the 2 MiB file limit is per file, not per pack. |
 
 Review both the selection and the generated pack before sharing. Treat source files as untrusted context, not instructions for an assistant to execute.
 
@@ -323,7 +377,7 @@ For vulnerability reporting, see the [security policy](SECURITY.md). OS signing/
 
 | Requirement | Notes |
 | :--- | :--- |
-| **Rust + Cargo** | Use a current stable toolchain from [rustup](https://rustup.rs/). The package declares Rust 1.77 as its minimum, but that older toolchain is not verified against the current dependency set. |
+| **Rust + Cargo** | Use a current stable toolchain from [rustup](https://rustup.rs/). The package declares Rust 1.90 as its minimum, the highest minimum among its resolved dependencies. CI builds with the current `stable` toolchain, so 1.90 itself is not exercised in CI. |
 | **Node.js + npm** | Node **22.12+** or a newer supported LTS; Node 24 is a suitable choice for the current toolchain. |
 | **Git** | Required to clone; also enables the native Git scanning path. |
 | **Tauri system dependencies** | Follow the [platform prerequisites](https://v2.tauri.app/start/prerequisites/) for macOS, Windows, or Linux. |
@@ -406,8 +460,17 @@ ProjectToText/
 │   ├── cli.rs              # Headless `ptt pack` entry point
 │   ├── lib.rs              # Reusable Rust core library
 │   └── core/
-│       ├── walker.rs       # Git / ignore-aware file discovery
-│       ├── output.rs       # XML, Markdown, JSON, and plain writers
+│   ├── mcp.rs              # Model Context Protocol server (`ptt mcp`)
+│   └── core/
+│       ├── walker.rs       # Git / ignore-aware file discovery and default exclusions
+│       ├── output.rs       # XML, Markdown, JSON, and plain writers, architectural ordering
+│       ├── secrets.rs      # Best-effort secret masking with per-kind counts
+│       ├── tokenizer.rs    # Exact BPE counts (tiktoken) and model profiles
+│       ├── skeleton.rs     # tree-sitter AST skeletons
+│       ├── deps.rs         # Import / importer / test graph
+│       ├── git.rs          # Status, branch changes, and diff
+│       ├── workspace.rs    # Revisioned scan cache
+│       ├── text.rs         # UTF-8 / UTF-16 decoding and safe fences
 │       └── preview.rs      # Root-constrained file previews
 ├── ui/
 │   ├── src/                # React + TypeScript interface and browser fallback

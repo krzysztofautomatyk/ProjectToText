@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
@@ -24,6 +25,7 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  GitBranch,
   History as HistoryIcon,
   Info,
   List,
@@ -35,7 +37,9 @@ import {
   RefreshCw,
   Save,
   Search,
+  Shield,
   SlidersHorizontal,
+  Sparkles,
   MessageSquare,
   Download,
   Upload,
@@ -48,8 +52,9 @@ import {
 } from 'lucide-react';
 import FileViewer, { type FilePreviewData } from './FileViewer';
 import {
+  CANONICAL_JUNK_DIRS,
   downloadText,
-  generateBrowserOutput,
+  generateBrowserOutputWithStats,
   isCancelledError,
   pickDirectoryWithInput,
   pickDirectoryWithPicker,
@@ -59,6 +64,7 @@ import {
   UserCancelledError,
   type BrowserProject,
 } from './browserFs';
+import { redactSecretsWithReport, type RedactionSummary } from './secrets';
 import {
   folderHistoryKey,
   readFolderHistory,
@@ -88,6 +94,7 @@ import {
 } from './prefTransfer';
 import APP_VERSION from './version';
 import { isTauriRuntime } from './tauriEnv';
+import { formatShortcut, isModKey } from './platform';
 import './index.css';
 
 const IN_TAURI = isTauriRuntime();
@@ -100,18 +107,62 @@ interface FileNode {
   is_dir: boolean;
   size?: number;
   selected: boolean;
+  git_status?: string;
+}
+
+interface GitRepoContext {
+  isGitRepo: boolean;
+  currentBranch?: string | null;
+  baseBranch?: string | null;
+  fileStatuses: Record<string, string>;
+  modifiedFiles: string[];
+  branchChangedFiles: string[];
+  recentCommits: string[];
 }
 
 interface ScanResult {
   root: string;
   revision: number;
   nodes: FileNode[];
+  junkDirs?: string[];
+  gitContext?: GitRepoContext;
 }
 
 interface PackOptions {
   format: string;
   include_summary: boolean;
   max_file_size?: number;
+  redact_secrets?: boolean;
+  full_preview?: boolean;
+  skeleton_files?: string[];
+  include_git_diff?: boolean;
+  task_prompt?: string;
+  tokenizer_model?: string;
+}
+
+interface FileTokenStat {
+  path: string;
+  bytes: number;
+  tokens: number;
+  mode: 'full' | 'skeleton';
+}
+
+interface GenerateOutputResponse {
+  preview: string;
+  truncatedPreview: boolean;
+  totalBytes: number;
+  totalChars: number;
+  totalTokens: number;
+  filesPacked: number;
+  fileTokens?: FileTokenStat[];
+  redactions: RedactionSummary;
+}
+
+interface RelatedFiles {
+  target: string;
+  imports: string[];
+  importers: string[];
+  tests: string[];
 }
 
 interface TreeNode {
@@ -120,14 +171,64 @@ interface TreeNode {
   isDir: boolean;
   size?: number;
   selected: boolean;
+  gitStatus?: string;
   children: TreeNode[];
+}
+
+interface VisibleTreeRow {
+  node: TreeNode;
+  depth: number;
+  hasChildren: boolean;
+  showChildren: boolean;
 }
 
 type OutputFormat = 'xml' | 'markdown' | 'json' | 'plain';
 type ViewMode = 'packed' | 'list' | 'file';
 type ListFormat = 'tree' | 'paths';
-type SelectionPreset = 'source' | 'docs' | 'all';
+type SelectionPreset = 'source' | 'docs' | 'all' | 'core_skeleton';
 type ToastKind = 'success' | 'error' | 'info';
+type BudgetPreset = '32k' | '64k' | '128k' | '200k' | '1m' | 'custom';
+
+const BUDGET_LIMITS: Record<Exclude<BudgetPreset, 'custom'>, number> = {
+  '32k': 32_000,
+  '64k': 64_000,
+  '128k': 128_000,
+  '200k': 200_000,
+  '1m': 1_000_000,
+};
+
+const PROMPT_TEMPLATES: { id: string; label: string; prompt: string }[] = [
+  { id: 'none', label: 'No task prompt', prompt: '' },
+  {
+    id: 'review',
+    label: 'Architecture & Code Review',
+    prompt:
+      'Review the attached project context for architectural soundness, correctness, edge cases, and maintainability. Cite exact file paths and line numbers for every finding and propose concrete, minimal fixes.',
+  },
+  {
+    id: 'bug',
+    label: 'Bug Investigation & Root Cause',
+    prompt:
+      'Investigate the defect described below using the provided project context. Trace the data and control flow, identify the exact root cause, and provide a regression-tested fix.',
+  },
+  {
+    id: 'security',
+    label: 'Security & Vulnerability Audit',
+    prompt:
+      'Perform a thorough security audit of the attached codebase. Check for path traversal, injection, authentication/authorization flaws, unsafe deserialization, and secret exposure. Rate severity and provide remediation diffs.',
+  },
+  {
+    id: 'tests',
+    label: 'Write Unit / Integration Tests',
+    prompt:
+      'Write comprehensive unit and integration tests for the selected modules, covering happy paths, boundary conditions, error handling, and security invariants.',
+  },
+  {
+    id: 'custom',
+    label: 'Custom Task Prompt…',
+    prompt: '',
+  },
+];
 
 interface ContextMenuState {
   x: number;
@@ -144,23 +245,7 @@ interface ToastItem {
 
 /* ─── Constants ──────────────────────────────────────── */
 
-const JUNK_DIRS = [
-  'node_modules',
-  'dist',
-  '.vite',
-  'build',
-  'out',
-  'target',
-  '.git',
-  'bin',
-  'obj',
-  '.next',
-  'coverage',
-  '__pycache__',
-  '.turbo',
-  '.cache',
-  'vendor',
-];
+const JUNK_DIRS: readonly string[] = CANONICAL_JUNK_DIRS;
 
 const SOURCE_EXTS = [
   // Web / JS
@@ -234,10 +319,6 @@ const DOC_EXTS = ['.md', '.txt', '.rst', '.adoc'];
 
 const TOKEN_SOFT = 80_000;
 const TOKEN_HARD = 150_000;
-
-const isMac =
-  typeof navigator !== 'undefined' &&
-  /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
 
 const TREE_WIDTH_KEY = 'ptt.treeWidth';
 const THEME_KEY = 'ptt.theme';
@@ -334,9 +415,9 @@ function estimateTokensFromBytes(bytes: number): number {
 const TOKEN_ESTIMATE_HINT =
   'Approximate only (chars ÷ 3.8). Not a model-specific tokenizer.';
 
-function isJunkPath(path: string): boolean {
+function isJunkPath(path: string, junkDirs: readonly string[] = JUNK_DIRS): boolean {
   const lower = normalizePath(path).toLowerCase();
-  return JUNK_DIRS.some(
+  return junkDirs.some(
     (d) =>
       lower.includes(`/${d}/`) ||
       lower.startsWith(`${d}/`) ||
@@ -345,11 +426,52 @@ function isJunkPath(path: string): boolean {
   );
 }
 
-function applyPreset(nodes: FileNode[], preset: SelectionPreset): FileNode[] {
+function isLowPriorityPath(path: string): boolean {
+  const lower = normalizePath(path).toLowerCase();
+  return (
+    lower.includes('test') ||
+    lower.includes('spec') ||
+    lower.includes('fixture') ||
+    lower.includes('bench') ||
+    lower.includes('example') ||
+    lower.endsWith('.lock') ||
+    lower.endsWith('-lock.json') ||
+    lower.endsWith('.md') ||
+    lower.endsWith('.txt')
+  );
+}
+
+/** Lockfiles and generated manifests: visible in the tree, unchecked by every preset. */
+const DEFAULT_EXCLUDED_FILE_NAMES = new Set([
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'Cargo.lock',
+  'composer.lock',
+  'Gemfile.lock',
+  'poetry.lock',
+  'uv.lock',
+]);
+const DEFAULT_EXCLUDED_DIR_PREFIXES = ['gen/schemas/'];
+
+function isDefaultExcludedPath(path: string): boolean {
+  const normalized = normalizePath(path);
+  const name = normalized.slice(normalized.lastIndexOf('/') + 1);
+  return (
+    DEFAULT_EXCLUDED_FILE_NAMES.has(name) ||
+    DEFAULT_EXCLUDED_DIR_PREFIXES.some((p) => normalized.startsWith(p))
+  );
+}
+
+function applyPreset(
+  nodes: FileNode[],
+  preset: SelectionPreset,
+  junkDirs: readonly string[] = JUNK_DIRS,
+): FileNode[] {
   return nodes.map((n) => {
     if (n.is_dir) return { ...n, selected: false };
     const lower = n.path.toLowerCase();
-    const junk = isJunkPath(n.path);
+    const junk = isJunkPath(n.path, junkDirs) || isDefaultExcludedPath(n.path);
 
     if (preset === 'all') {
       return { ...n, selected: !junk };
@@ -357,6 +479,9 @@ function applyPreset(nodes: FileNode[], preset: SelectionPreset): FileNode[] {
     if (preset === 'docs') {
       const isDoc = DOC_EXTS.some((ext) => lower.endsWith(ext));
       return { ...n, selected: (isSourcePath(n.path) || isDoc) && !junk };
+    }
+    if (preset === 'core_skeleton') {
+      return { ...n, selected: isSourcePath(n.path) && !junk };
     }
     // source (default) — includes .xaml, .csproj, Blazor, etc.
     return { ...n, selected: isSourcePath(n.path) && !junk };
@@ -421,18 +546,21 @@ function generatePathsList(nodes: FileNode[]): string {
     .join('\n');
 }
 
+interface BuildTreeNode extends TreeNode {
+  childMap?: Map<string, BuildTreeNode>;
+}
+
 function buildFileTree(flatNodes: FileNode[]): TreeNode {
-  const root: TreeNode = {
+  const root: BuildTreeNode = {
     name: '',
     path: '',
     isDir: true,
     selected: false,
     children: [],
+    childMap: new Map(),
   };
 
-  const sorted = [...flatNodes].sort((a, b) => a.path.localeCompare(b.path));
-
-  for (const node of sorted) {
+  for (const node of flatNodes) {
     const parts = node.path.split(/[/\\]/).filter(Boolean);
     let current = root;
     let currentPath = '';
@@ -441,7 +569,8 @@ function buildFileTree(flatNodes: FileNode[]): TreeNode {
       const part = parts[i];
       currentPath = currentPath ? `${currentPath}/${part}` : part;
 
-      let child = current.children.find((c) => c.name === part);
+      if (!current.childMap) current.childMap = new Map();
+      let child = current.childMap.get(part);
       if (!child) {
         child = {
           name: part,
@@ -449,27 +578,77 @@ function buildFileTree(flatNodes: FileNode[]): TreeNode {
           isDir: i < parts.length - 1 || node.is_dir,
           size: i === parts.length - 1 ? node.size : undefined,
           selected: i === parts.length - 1 ? node.selected : false,
+          gitStatus: i === parts.length - 1 ? node.git_status : undefined,
           children: [],
+          childMap: new Map(),
         };
-        current.children.push(child);
+        current.childMap.set(part, child);
       } else if (i === parts.length - 1) {
         child.selected = node.selected;
         child.size = node.size;
         child.isDir = node.is_dir;
+        child.gitStatus = node.git_status;
       }
       current = child;
     }
   }
 
-  function sortChildren(node: TreeNode) {
-    node.children.sort((a, b) => {
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-    node.children.forEach(sortChildren);
+  function finalizeAndSort(node: BuildTreeNode) {
+    if (node.childMap && node.childMap.size > 0) {
+      node.children = Array.from(node.childMap.values());
+      node.children.sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      for (const c of node.children) {
+        finalizeAndSort(c as BuildTreeNode);
+      }
+    }
+    delete node.childMap;
   }
-  sortChildren(root);
+  finalizeAndSort(root);
   return root;
+}
+
+function sortTreeByTokens(
+  node: TreeNode,
+  tokenSort: boolean,
+  subtreeStats: Map<string, SubtreeStats>,
+): TreeNode {
+  if (!tokenSort || node.children.length === 0) return node;
+  const sortedChildren = [...node.children]
+    .sort(
+      (a, b) =>
+        (subtreeStats.get(b.path)?.tokens ?? 0) - (subtreeStats.get(a.path)?.tokens ?? 0),
+    )
+    .map((c) => sortTreeByTokens(c, tokenSort, subtreeStats));
+  return { ...node, children: sortedChildren };
+}
+
+function flattenVisibleTree(
+  root: TreeNode | null,
+  expanded: Set<string>,
+  filterText: string,
+): VisibleTreeRow[] {
+  if (!root || root.children.length === 0) return [];
+  const rows: VisibleTreeRow[] = [];
+  const hasFilter = !!filterText.trim();
+
+  function walk(node: TreeNode, depth: number) {
+    const hasChildren = node.children.length > 0;
+    const showChildren = hasChildren && (expanded.has(node.path) || hasFilter);
+    rows.push({ node, depth, hasChildren, showChildren });
+    if (showChildren) {
+      for (const child of node.children) {
+        walk(child, depth + 1);
+      }
+    }
+  }
+
+  for (const child of root.children) {
+    walk(child, 0);
+  }
+  return rows;
 }
 
 type SubtreeStats = {
@@ -477,6 +656,7 @@ type SubtreeStats = {
   total: number;
   partial: boolean;
   allSelected: boolean;
+  allSkeleton: boolean;
   /** Estimated tokens of every file in the subtree (selected or not). */
   tokens: number;
 };
@@ -484,15 +664,18 @@ type SubtreeStats = {
 function computeSubtree(
   node: TreeNode,
   selectedSet: Set<string>,
+  skeletonSet: Set<string>,
   stats: Map<string, SubtreeStats>,
 ): SubtreeStats {
   if (!node.isDir) {
     const sel = selectedSet.has(node.path);
+    const skel = skeletonSet.has(node.path);
     const result: SubtreeStats = {
       selected: sel ? 1 : 0,
       total: 1,
       partial: false,
       allSelected: sel,
+      allSkeleton: skel,
       tokens: estimateTokensFromBytes(node.size ?? 0),
     };
     stats.set(node.path, result);
@@ -503,15 +686,17 @@ function computeSubtree(
   let total = 0;
   let allSelected = true;
   let anySelected = false;
+  let allSkeleton = true;
   let tokens = 0;
 
   for (const child of node.children) {
-    const res = computeSubtree(child, selectedSet, stats);
+    const res = computeSubtree(child, selectedSet, skeletonSet, stats);
     selected += res.selected;
     total += res.total;
     tokens += res.tokens;
     if (!res.allSelected) allSelected = false;
     if (res.selected > 0) anySelected = true;
+    if (!res.allSkeleton) allSkeleton = false;
   }
 
   const result: SubtreeStats = {
@@ -519,6 +704,7 @@ function computeSubtree(
     total,
     partial: anySelected && !allSelected,
     allSelected: total > 0 && allSelected,
+    allSkeleton: total > 0 && allSkeleton,
     tokens,
   };
   stats.set(node.path, result);
@@ -997,63 +1183,55 @@ function FolderHistoryPanel({
   );
 }
 
-function TreeItem({
-  node,
-  depth,
-  expanded,
+function TreeRow({
+  row,
   selectedSet,
+  skeletonSet,
   filterText,
   onToggleExpand,
   onToggleSelect,
+  onToggleSkeleton,
   onFocusPath,
   onOpenFile,
   onContextMenu,
   focusedPath,
   previewPath,
   subtreeStats,
-  tokenSort,
 }: {
-  node: TreeNode;
-  depth: number;
-  expanded: Set<string>;
+  row: VisibleTreeRow;
   selectedSet: Set<string>;
+  skeletonSet: Set<string>;
   filterText: string;
   onToggleExpand: (path: string) => void;
   onToggleSelect: (path: string, isDir: boolean) => void;
+  onToggleSkeleton: (path: string, isDir: boolean) => void;
   onFocusPath: (path: string) => void;
   onOpenFile: (path: string) => void;
   onContextMenu: (e: ReactMouseEvent, path: string, isDir: boolean) => void;
   focusedPath: string | null;
   previewPath: string | null;
   subtreeStats: Map<string, SubtreeStats>;
-  tokenSort: boolean;
 }) {
+  const { node, depth, hasChildren, showChildren } = row;
   const checkRef = useRef<HTMLInputElement>(null);
-  const hasChildren = node.children.length > 0;
-  const isExpanded = expanded.has(node.path);
-  // When filtering, auto-expand matched branches
-  const showChildren = hasChildren && (isExpanded || !!filterText.trim());
 
   const subtree = subtreeStats.get(node.path) ?? {
     selected: 0,
     total: 0,
     partial: false,
     allSelected: false,
+    allSkeleton: false,
     tokens: 0,
   };
-  // Children ordered by estimated token weight (heaviest first) when sorting by tokens.
-  const children = tokenSort
-    ? [...node.children].sort(
-        (a, b) =>
-          (subtreeStats.get(b.path)?.tokens ?? 0) - (subtreeStats.get(a.path)?.tokens ?? 0),
-      )
-    : node.children;
 
   const isSelected = node.isDir
     ? subtree.allSelected && subtree.total > 0
     : selectedSet.has(node.path);
   const isPartial = node.isDir && subtree.partial;
   const isPreviewing = !node.isDir && previewPath === node.path;
+  const isSkeleton = node.isDir
+    ? subtree.allSkeleton && subtree.total > 0
+    : skeletonSet.has(node.path);
 
   useEffect(() => {
     if (checkRef.current) {
@@ -1086,123 +1264,121 @@ function TreeItem({
       node.path.toLowerCase().includes(filterText.toLowerCase()));
 
   return (
-    <div role={node.isDir ? 'group' : undefined}>
-      <div
-        className={[
-          'tree-item',
-          isSelected && !isPartial ? 'is-selected' : '',
-          isPartial ? 'is-partial' : '',
-          isPreviewing ? 'is-previewing' : '',
-          matchesFilter ? 'is-filtered-match' : '',
-        ]
-          .filter(Boolean)
-          .join(' ')}
-        style={{ paddingLeft: `${depth * 14 + 4}px` } as CSSProperties}
-        onClick={handleRowClick}
-        onContextMenu={(e) => onContextMenu(e, node.path, node.isDir)}
-        onKeyDown={handleKeyDown}
-        tabIndex={0}
-        role="treeitem"
-        aria-expanded={hasChildren ? showChildren : undefined}
-        aria-selected={isSelected || isPartial}
-        data-path={node.path}
-        data-focused={focusedPath === node.path || undefined}
-      >
-        {hasChildren ? (
-          <button
-            type="button"
-            className="tree-chevron"
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleExpand(node.path);
+    <div
+      className={[
+        'tree-item',
+        isSelected && !isPartial ? 'is-selected' : '',
+        isPartial ? 'is-partial' : '',
+        isPreviewing ? 'is-previewing' : '',
+        matchesFilter ? 'is-filtered-match' : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+      style={{ paddingLeft: `${depth * 14 + 4}px`, height: '28px' } as CSSProperties}
+      onClick={handleRowClick}
+      onContextMenu={(e) => onContextMenu(e, node.path, node.isDir)}
+      onKeyDown={handleKeyDown}
+      tabIndex={0}
+      role="treeitem"
+      aria-expanded={hasChildren ? showChildren : undefined}
+      aria-selected={isSelected || isPartial}
+      data-path={node.path}
+      data-focused={focusedPath === node.path || undefined}
+    >
+      {hasChildren ? (
+        <button
+          type="button"
+          className="tree-chevron"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleExpand(node.path);
+          }}
+          aria-label={showChildren ? 'Collapse folder' : 'Expand folder'}
+          tabIndex={-1}
+        >
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            style={{
+              transform: showChildren ? 'rotate(90deg)' : 'rotate(0deg)',
+              transition: 'transform 0.12s ease',
             }}
-            aria-label={showChildren ? 'Collapse folder' : 'Expand folder'}
-            tabIndex={-1}
           >
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              style={{
-                transform: showChildren ? 'rotate(90deg)' : 'rotate(0deg)',
-                transition: 'transform 0.12s ease',
-              }}
-            >
-              <path d="m9 18 6-6-6-6" />
-            </svg>
-          </button>
-        ) : (
-          <span className="tree-chevron" aria-hidden style={{ visibility: 'hidden' }} />
-        )}
+            <path d="m9 18 6-6-6-6" />
+          </svg>
+        </button>
+      ) : (
+        <span className="tree-chevron" aria-hidden style={{ visibility: 'hidden' }} />
+      )}
 
-        <span className="tree-icon" aria-hidden>
-          {node.isDir ? <Folder size={15} /> : <File size={15} />}
-        </span>
+      <span className="tree-icon" aria-hidden>
+        {node.isDir ? <Folder size={15} /> : <File size={15} />}
+      </span>
 
-        <span className="tree-name">
-          {highlightMatch(node.name, filterText)}
-          {hasChildren && subtree.total > 0 && (
-            <span className="tree-count">
-              {subtree.selected}/{subtree.total}
-            </span>
-          )}
-        </span>
-
-        {!node.isDir && node.size != null && node.size > 0 && (
-          <span className="tree-size">{formatBytes(node.size)}</span>
-        )}
-
-        {subtree.tokens > 0 && (
-          <span className="tree-tokens" title="Approximate tokens (bytes ÷ 3.8)">
-            ~{formatTokens(subtree.tokens)} tok
+      <span className="tree-name">
+        {highlightMatch(node.name, filterText)}
+        {hasChildren && subtree.total > 0 && (
+          <span className="tree-count">
+            {subtree.selected}/{subtree.total}
           </span>
         )}
+      </span>
 
-        <label className="tree-check" onClick={(e) => e.stopPropagation()}>
-          <input
-            ref={checkRef}
-            type="checkbox"
-            checked={isSelected}
-            onChange={() => onToggleSelect(node.path, node.isDir)}
-            aria-label={
-              node.isDir
-                ? isPartial
-                  ? `Partially selected folder ${node.name}`
-                  : `Select folder ${node.name}`
-                : `Select file ${node.name}`
-            }
-          />
-        </label>
-      </div>
-
-      {hasChildren && showChildren && (
-        <div role="group">
-          {children.map((child) => (
-            <TreeItem
-              key={child.path}
-              node={child}
-              depth={depth + 1}
-              expanded={expanded}
-              selectedSet={selectedSet}
-              filterText={filterText}
-              onToggleExpand={onToggleExpand}
-              onToggleSelect={onToggleSelect}
-              onFocusPath={onFocusPath}
-              onOpenFile={onOpenFile}
-              onContextMenu={onContextMenu}
-              focusedPath={focusedPath}
-              previewPath={previewPath}
-              subtreeStats={subtreeStats}
-              tokenSort={tokenSort}
-            />
-          ))}
-        </div>
+      {!node.isDir && node.gitStatus && (
+        <span
+          className={`tree-git-badge git-${node.gitStatus}`}
+          title={`Git status: ${node.gitStatus}`}
+          data-testid={`git-badge-${node.path}`}
+        >
+          {node.gitStatus}
+        </span>
       )}
+
+      <button
+        type="button"
+        className={`tree-skel-btn${isSkeleton ? ' is-active' : ''}`}
+        title="Pack signatures only (~80% fewer tokens)"
+        aria-label={`Toggle skeleton mode for ${node.name}`}
+        aria-pressed={isSkeleton}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleSkeleton(node.path, node.isDir);
+        }}
+      >
+        S
+      </button>
+
+      {!node.isDir && node.size != null && node.size > 0 && (
+        <span className="tree-size">{formatBytes(node.size)}</span>
+      )}
+
+      {subtree.tokens > 0 && (
+        <span className="tree-tokens" title="Approximate tokens (bytes ÷ 3.8)">
+          ~{formatTokens(subtree.tokens)} tok
+        </span>
+      )}
+
+      <label className="tree-check" onClick={(e) => e.stopPropagation()}>
+        <input
+          ref={checkRef}
+          type="checkbox"
+          checked={isSelected}
+          onChange={() => onToggleSelect(node.path, node.isDir)}
+          aria-label={
+            node.isDir
+              ? isPartial
+                ? `Partially selected folder ${node.name}`
+                : `Select folder ${node.name}`
+              : `Select file ${node.name}`
+          }
+        />
+      </label>
     </div>
   );
 }
@@ -1265,11 +1441,65 @@ function App() {
   const scanSeq = useRef(0);
   const startupRequested = useRef(false);
   const [fullOutputPreview, setFullOutputPreview] = useState(false);
+  const [fullOutputText, setFullOutputText] = useState<string | null>(null);
+  const [truncatedPreview, setTruncatedPreview] = useState(false);
+  const [totalBytes, setTotalBytes] = useState(0);
+  const [redactSecretsEnabled, setRedactSecretsEnabled] = useState(true);
+  const [redactionSummary, setRedactionSummary] = useState<RedactionSummary>({
+    totalRedactions: 0,
+    kinds: [],
+  });
+  const [skeletonSet, setSkeletonSet] = useState<Set<string>>(new Set());
+  const [fileTokens, setFileTokens] = useState<FileTokenStat[]>([]);
+  const [budgetPreset, setBudgetPreset] = useState<BudgetPreset>('128k');
+  const [customBudget, setCustomBudget] = useState(128_000);
+  const [showTopConsumers, setShowTopConsumers] = useState(false);
+  const [junkDirs, setJunkDirs] = useState<readonly string[]>(CANONICAL_JUNK_DIRS);
+  const [gitContext, setGitContext] = useState<GitRepoContext | null>(null);
+  const [includeGitDiff, setIncludeGitDiff] = useState(false);
+  const [showPromptStudio, setShowPromptStudio] = useState(false);
+  const [promptTemplateId, setPromptTemplateId] = useState('none');
+  const [taskPrompt, setTaskPrompt] = useState('');
+  const [workspaceChangedOnDisk, setWorkspaceChangedOnDisk] = useState(false);
+  const [treeScrollTop, setTreeScrollTop] = useState(0);
+  const [treeViewportHeight, setTreeViewportHeight] = useState(600);
+  const treeScrollRef = useRef<HTMLDivElement>(null);
   const [browserMode, setBrowserMode] = useState(!IN_TAURI);
   /** Newer release found by the Tauri updater (desktop builds only). */
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!IN_TAURI) return;
+    let unlisten: (() => void) | undefined;
+    listen<string>('workspace-changed', () => {
+      setWorkspaceChangedOnDisk(true);
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        /* ignore in mock/test environments */
+      });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const el = treeScrollRef.current;
+    if (!el) return;
+    const updateHeight = () => {
+      setTreeViewportHeight(el.clientHeight || 600);
+    };
+    updateHeight();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(updateHeight);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+  }, [currentPath]);
 
   useEffect(() => {
     // Silent startup check. Skipped in dev, where no signed latest.json exists.
@@ -1306,9 +1536,33 @@ function App() {
   );
   const subtreeStats = useMemo(() => {
     const stats = new Map<string, SubtreeStats>();
-    computeSubtree(filteredTree ?? fileTree, selectedSet, stats);
+    computeSubtree(filteredTree ?? fileTree, selectedSet, skeletonSet, stats);
     return stats;
-  }, [filteredTree, fileTree, selectedSet]);
+  }, [filteredTree, fileTree, selectedSet, skeletonSet]);
+
+  const sortedDisplayTree = useMemo(
+    () =>
+      filteredTree ? sortTreeByTokens(filteredTree, tokenSort, subtreeStats) : null,
+    [filteredTree, tokenSort, subtreeStats],
+  );
+
+  const visibleTreeRows = useMemo(
+    () => flattenVisibleTree(sortedDisplayTree, expanded, filterText),
+    [sortedDisplayTree, expanded, filterText],
+  );
+
+  const ROW_HEIGHT = 28;
+  const OVERSCAN = 15;
+  const totalTreeHeight = visibleTreeRows.length * ROW_HEIGHT;
+  const startRowIdx = Math.max(0, Math.floor(treeScrollTop / ROW_HEIGHT) - OVERSCAN);
+  const endRowIdx = Math.min(
+    visibleTreeRows.length,
+    Math.ceil((treeScrollTop + treeViewportHeight) / ROW_HEIGHT) + OVERSCAN,
+  );
+  const virtualSlice = visibleTreeRows.slice(startRowIdx, endRowIdx);
+
+  const targetBudgetTokens =
+    budgetPreset === 'custom' ? Math.max(1000, customBudget) : BUDGET_LIMITS[budgetPreset];
 
   const fileListText = useMemo(
     () => (listFormat === 'tree' ? generateFileList(nodes) : generatePathsList(nodes)),
@@ -1317,8 +1571,10 @@ function App() {
 
   const totalFiles = useMemo(() => nodes.filter((n) => !n.is_dir).length, [nodes]);
 
-  // Byte size of the output, computed once per output instead of on every render.
-  const outputBytes = useMemo(() => new Blob([output]).size, [output]);
+  const outputBytes = useMemo(
+    () => (totalBytes > 0 ? totalBytes : new Blob([output]).size),
+    [totalBytes, output],
+  );
 
   /* ─── Toasts ───────────────────────────────────────── */
 
@@ -1427,6 +1683,15 @@ function App() {
     setCurrentPath('');
     setNodes([]);
     setOutput('');
+    setFullOutputText(null);
+    setTruncatedPreview(false);
+    setTotalBytes(0);
+    setRedactionSummary({ totalRedactions: 0, kinds: [] });
+    setSkeletonSet(new Set());
+    setFileTokens([]);
+    setGitContext(null);
+    setIncludeGitDiff(false);
+    setWorkspaceChangedOnDisk(false);
     setStats({ files: 0, tokens: 0 });
     setScanning(false);
     setGenerating(false);
@@ -1446,11 +1711,20 @@ function App() {
 
   /* ─── Generate ─────────────────────────────────────── */
 
+  interface GenerateOverrides {
+    redact?: boolean;
+    skeletons?: Set<string>;
+    gitDiff?: boolean;
+    prompt?: string;
+    fullPreview?: boolean;
+  }
+
   const generateNow = useCallback(
     async (
       currentNodes: FileNode[],
       rootPath: string,
       fmt: OutputFormat,
+      overrides: GenerateOverrides = {},
     ) => {
       const seq = ++genSeq.current;
       const sel = currentNodes
@@ -1458,45 +1732,108 @@ function App() {
         .map((n) => normalizePath(n.path));
       if (sel.length === 0 || !rootPath) {
         setOutput('');
+        setFullOutputText(null);
+        setTruncatedPreview(false);
+        setTotalBytes(0);
+        setRedactionSummary({ totalRedactions: 0, kinds: [] });
+        setFileTokens([]);
         setStats({ files: 0, tokens: 0 });
         setGenerating(false);
         return;
       }
 
+      const activeRedact = overrides.redact ?? redactSecretsEnabled;
+      const activeSkeletons = overrides.skeletons ?? skeletonSet;
+      const activeGitDiff = overrides.gitDiff ?? includeGitDiff;
+      const activePrompt = overrides.prompt ?? taskPrompt;
+      const wantFullPreview = overrides.fullPreview ?? false;
+
       setGenerating(true);
       try {
-        let result: string;
         const browserProject = browserProjectRef.current;
         if (browserProject) {
-          result = await generateBrowserOutput(browserProject, sel, fmt);
+          const res = await generateBrowserOutputWithStats(browserProject, sel, fmt, {
+            redactSecrets: activeRedact,
+            skeletonFiles: activeSkeletons,
+            taskPrompt: activePrompt,
+          });
+          if (seq !== genSeq.current) return;
+          setOutput(res.text);
+          setFullOutputText(res.text);
+          setTruncatedPreview(res.text.length > 150_000 && !wantFullPreview);
+          setTotalBytes(new Blob([res.text]).size);
+          setRedactionSummary(res.redactions);
+          setFileTokens(res.fileTokens);
+          setFullOutputPreview(wantFullPreview);
+          setStats({ files: sel.length, tokens: estimateTokens(res.text) });
+          hasLoadedOnce.current = true;
         } else {
           const opts: PackOptions = {
             format: fmt,
             include_summary: true,
+            redact_secrets: activeRedact,
+            full_preview: wantFullPreview,
+            skeleton_files: Array.from(activeSkeletons),
+            include_git_diff: activeGitDiff,
+            task_prompt: activePrompt.trim() ? activePrompt : undefined,
           };
-          result = await invoke<string>('generate_output', {
+          const raw = await invoke<GenerateOutputResponse | string>('generate_output', {
             path: rootPath,
             selectedPaths: sel,
             options: opts,
             revision: workspaceRevision.current,
           });
+          if (seq !== genSeq.current) return;
+
+          if (typeof raw === 'string') {
+            // Backward-compatible string return (e.g. legacy mock in tests)
+            const rep = activeRedact
+              ? redactSecretsWithReport(raw).summary
+              : { totalRedactions: 0, kinds: [] };
+            setOutput(raw);
+            setFullOutputText(raw);
+            setTruncatedPreview(raw.length > 150_000 && !wantFullPreview);
+            setTotalBytes(new Blob([raw]).size);
+            setRedactionSummary(rep);
+            setFullOutputPreview(wantFullPreview);
+            setStats({ files: sel.length, tokens: estimateTokens(raw) });
+          } else {
+            setOutput(raw.preview);
+            setFullOutputText(raw.truncatedPreview ? null : raw.preview);
+            setTruncatedPreview(raw.truncatedPreview);
+            setTotalBytes(raw.totalBytes);
+            setRedactionSummary(
+              raw.redactions ?? { totalRedactions: 0, kinds: [] },
+            );
+            setFileTokens(raw.fileTokens ?? []);
+            setFullOutputPreview(wantFullPreview);
+            setStats({
+              files: raw.filesPacked ?? sel.length,
+              tokens: raw.totalTokens || estimateTokens(raw.preview),
+            });
+          }
+          hasLoadedOnce.current = true;
         }
-        if (seq !== genSeq.current) return;
-        setOutput(result);
-        setFullOutputPreview(false);
-        setStats({ files: sel.length, tokens: estimateTokens(result) });
-        hasLoadedOnce.current = true;
       } catch (e) {
         if (seq !== genSeq.current) return;
         console.error(e);
         setOutput('');
+        setFullOutputText(null);
+        setTruncatedPreview(false);
+        setTotalBytes(0);
         setStats({ files: 0, tokens: 0 });
         pushToast('error', `Failed to generate packed output: ${String(e)}`);
       } finally {
         if (seq === genSeq.current) setGenerating(false);
       }
     },
-    [pushToast],
+    [
+      pushToast,
+      redactSecretsEnabled,
+      skeletonSet,
+      includeGitDiff,
+      taskPrompt,
+    ],
   );
 
   /** Immediate generate (scan/format) or debounced (rapid selection toggles). */
@@ -1506,20 +1843,21 @@ function App() {
       rootPath: string,
       fmt: OutputFormat,
       immediate = false,
+      overrides: GenerateOverrides = {},
     ) => {
       if (generateTimer.current != null) {
         window.clearTimeout(generateTimer.current);
         generateTimer.current = null;
       }
       if (immediate) {
-        void generateNow(currentNodes, rootPath, fmt);
+        void generateNow(currentNodes, rootPath, fmt, overrides);
         return;
       }
       ++genSeq.current;
       setGenerating(true);
       generateTimer.current = window.setTimeout(() => {
         generateTimer.current = null;
-        void generateNow(currentNodes, rootPath, fmt);
+        void generateNow(currentNodes, rootPath, fmt, overrides);
       }, 180);
     },
     [generateNow],
@@ -1532,12 +1870,21 @@ function App() {
       nextPreset: SelectionPreset,
       fromBrowser: boolean,
     ) => {
-      const withBase = applyPreset(result, nextPreset);
+      const withBase = applyPreset(result, nextPreset, junkDirs);
       // Apply saved per-project deselects (files user unchecked previously)
       const saved = customProjects.find(
         (p) => projectPrefKey(p.path) === projectPrefKey(pathLabel),
       );
       const withSelection = applySavedDeselects(withBase, saved?.deselectPaths ?? []);
+      const nextSkels = new Set<string>();
+      if (nextPreset === 'core_skeleton') {
+        for (const n of withSelection) {
+          if (!n.is_dir && n.selected && isLowPriorityPath(n.path)) {
+            nextSkels.add(normalizePath(n.path));
+          }
+        }
+      }
+      setSkeletonSet(nextSkels);
       setNodes(withSelection);
       setCurrentPath(pathLabel);
       setBrowserMode(fromBrowser);
@@ -1584,9 +1931,9 @@ function App() {
       );
 
       // Pack after tree is visible
-      await generateNow(withSelection, pathLabel, format);
+      await generateNow(withSelection, pathLabel, format, { skeletons: nextSkels });
     },
-    [format, generateNow, pushToast, rememberLoadedFolder, customProjects],
+    [format, generateNow, pushToast, rememberLoadedFolder, customProjects, junkDirs],
   );
 
   const scan = useCallback(
@@ -1609,6 +1956,11 @@ function App() {
         const result = await invoke<ScanResult>('scan_folder', { path });
         if (sequence !== scanSeq.current) return;
         workspaceRevision.current = result.revision;
+        if (result.junkDirs && result.junkDirs.length > 0) {
+          setJunkDirs(result.junkDirs);
+        }
+        setGitContext(result.gitContext ?? null);
+        setWorkspaceChangedOnDisk(false);
         await applyScanResult(result.nodes, result.root, nextPreset, false);
       } catch (e) {
         console.error(e);
@@ -2060,18 +2412,245 @@ function App() {
       const saved = customProjects.find(
         (p) => projectPrefKey(p.path) === projectPrefKey(currentPath),
       );
-      const updated = applySavedDeselects(applyPreset(nodes, next), saved?.deselectPaths ?? []);
+      const updated = applySavedDeselects(
+        applyPreset(nodes, next, junkDirs),
+        saved?.deselectPaths ?? [],
+      );
       setNodes(updated);
-      if (currentPath) generate(updated, currentPath, format, true);
+
+      let nextSkels = new Set<string>();
+      if (next === 'core_skeleton') {
+        for (const n of updated) {
+          if (!n.is_dir && n.selected && isLowPriorityPath(n.path)) {
+            nextSkels.add(normalizePath(n.path));
+          }
+        }
+      }
+      setSkeletonSet(nextSkels);
+
+      if (currentPath) generate(updated, currentPath, format, true, { skeletons: nextSkels });
       const labels: Record<SelectionPreset, string> = {
         source: 'Source files selected',
         docs: 'Source + docs selected',
         all: 'All non-junk files selected',
+        core_skeleton: 'Core Full + Rest Skeleton applied',
       };
       pushToast('info', labels[next]);
     },
-    [nodes, currentPath, format, generate, pushToast, customProjects],
+    [nodes, currentPath, format, generate, pushToast, customProjects, junkDirs],
   );
+
+  const toggleSkeleton = useCallback(
+    (path: string, isDir: boolean) => {
+      const norm = normalizePath(path);
+      setSkeletonSet((prev) => {
+        const next = new Set(prev);
+        if (isDir) {
+          const descendants = nodes.filter(
+            (n) =>
+              !n.is_dir &&
+              (normalizePath(n.path) === norm ||
+                normalizePath(n.path).startsWith(norm + '/')),
+          );
+          const allSkel =
+            descendants.length > 0 &&
+            descendants.every((n) => next.has(normalizePath(n.path)));
+          for (const d of descendants) {
+            const p = normalizePath(d.path);
+            if (allSkel) next.delete(p);
+            else next.add(p);
+          }
+        } else {
+          if (next.has(norm)) next.delete(norm);
+          else next.add(norm);
+        }
+        if (currentPath) {
+          generate(nodes, currentPath, format, false, { skeletons: next });
+        }
+        return next;
+      });
+    },
+    [nodes, currentPath, format, generate],
+  );
+
+  const toggleRedactSecrets = useCallback(() => {
+    setRedactSecretsEnabled((prev) => {
+      const next = !prev;
+      if (currentPath && nodes.length > 0) {
+        generate(nodes, currentPath, format, true, { redact: next });
+      }
+      pushToast(
+        'info',
+        next ? 'Secret masking enabled' : 'Secret masking disabled',
+      );
+      return next;
+    });
+  }, [currentPath, nodes, format, generate, pushToast]);
+
+  const toggleIncludeGitDiff = useCallback(() => {
+    setIncludeGitDiff((prev) => {
+      const next = !prev;
+      if (currentPath && nodes.length > 0) {
+        generate(nodes, currentPath, format, true, { gitDiff: next });
+      }
+      return next;
+    });
+  }, [currentPath, nodes, format, generate]);
+
+  const selectGitFiles = useCallback(
+    (kind: 'modified' | 'branch') => {
+      if (!gitContext) return;
+      const list =
+        kind === 'modified'
+          ? gitContext.modifiedFiles
+          : gitContext.branchChangedFiles;
+      if (list.length === 0) {
+        pushToast(
+          'info',
+          kind === 'modified'
+            ? 'No modified or untracked files in working tree'
+            : 'No branch changes detected vs base branch',
+        );
+        return;
+      }
+      const targetSet = new Set(list.map((p) => normalizePath(p)));
+      const updated = nodes.map((n) =>
+        n.is_dir ? n : { ...n, selected: targetSet.has(normalizePath(n.path)) },
+      );
+      setNodes(updated);
+      if (currentPath) {
+        generate(updated, currentPath, format, true);
+      }
+      pushToast(
+        'info',
+        `Selected ${list.length} ${kind === 'modified' ? 'Git modified' : 'branch changed'} files`,
+      );
+    },
+    [gitContext, nodes, currentPath, format, generate, pushToast],
+  );
+
+  const selectRelatedFiles = useCallback(
+    async (targetPath: string, relation: 'imports' | 'importers' | 'tests') => {
+      setContextMenu(null);
+      if (!currentPath || !IN_TAURI || browserProjectRef.current) {
+        pushToast('info', 'Dependency graph resolution requires the desktop app');
+        return;
+      }
+      try {
+        const rel = await invoke<RelatedFiles>('resolve_related_files', {
+          path: currentPath,
+          targetFile: normalizePath(targetPath),
+          revision: workspaceRevision.current,
+        });
+        const extra =
+          relation === 'imports'
+            ? rel.imports
+            : relation === 'importers'
+              ? rel.importers
+              : rel.tests;
+        const toSelect = new Set(
+          [targetPath, ...extra].map((p) => normalizePath(p)),
+        );
+        const updated = nodes.map((n) =>
+          !n.is_dir && toSelect.has(normalizePath(n.path))
+            ? { ...n, selected: true }
+            : n,
+        );
+        setNodes(updated);
+        generate(updated, currentPath, format, true);
+        pushToast(
+          'success',
+          extra.length > 0
+            ? `Selected ${targetPath.split('/').pop()} + ${extra.length} ${relation}`
+            : `Selected ${targetPath.split('/').pop()} (no matching ${relation} found)`,
+        );
+      } catch (e) {
+        pushToast('error', `Dependency lookup failed: ${String(e)}`);
+      }
+    },
+    [currentPath, nodes, format, generate, pushToast],
+  );
+
+  const autoFitToBudget = useCallback(() => {
+    if (!currentPath || nodes.length === 0) return;
+    const limit = Math.floor(targetBudgetTokens * 0.9);
+    if (stats.tokens <= limit) {
+      pushToast(
+        'info',
+        `Already within 90% of ${formatTokens(targetBudgetTokens)} budget`,
+      );
+      return;
+    }
+
+    const tokenMap = new Map<string, number>();
+    for (const ft of fileTokens) {
+      tokenMap.set(normalizePath(ft.path), ft.tokens);
+    }
+
+    const selectedFiles = nodes.filter((n) => !n.is_dir && n.selected);
+    const candidates = selectedFiles
+      .map((n) => {
+        const norm = normalizePath(n.path);
+        const tok =
+          tokenMap.get(norm) ?? estimateTokensFromBytes(n.size ?? 0);
+        return {
+          path: norm,
+          lowPriority: isLowPriorityPath(norm),
+          tokens: tok,
+        };
+      })
+      .sort((a, b) => {
+        if (a.lowPriority !== b.lowPriority) return a.lowPriority ? -1 : 1;
+        return b.tokens - a.tokens;
+      });
+
+    let currentTotal = stats.tokens;
+    const nextSkels = new Set(skeletonSet);
+    const toDeselect = new Set<string>();
+
+    // Pass 1: skeletonize heavy files first (~70% reduction)
+    for (const c of candidates) {
+      if (currentTotal <= limit) break;
+      if (!nextSkels.has(c.path) && c.tokens > 25) {
+        nextSkels.add(c.path);
+        currentTotal = Math.max(0, currentTotal - Math.floor(c.tokens * 0.7));
+      }
+    }
+
+    // Pass 2: deselect low-priority or heaviest files if still over budget
+    for (const c of candidates) {
+      if (currentTotal <= limit) break;
+      if (selectedFiles.length - toDeselect.size <= 1) break;
+      toDeselect.add(c.path);
+      const effective = nextSkels.has(c.path)
+        ? Math.ceil(c.tokens * 0.3)
+        : c.tokens;
+      currentTotal = Math.max(0, currentTotal - effective);
+    }
+
+    const updated = nodes.map((n) =>
+      !n.is_dir && toDeselect.has(normalizePath(n.path))
+        ? { ...n, selected: false }
+        : n,
+    );
+    setNodes(updated);
+    setSkeletonSet(nextSkels);
+    generate(updated, currentPath, format, true, { skeletons: nextSkels });
+    pushToast(
+      'success',
+      `Auto-fit complete: ${nextSkels.size} skeletonized · ${toDeselect.size} excluded`,
+    );
+  }, [
+    currentPath,
+    nodes,
+    targetBudgetTokens,
+    stats.tokens,
+    fileTokens,
+    skeletonSet,
+    format,
+    generate,
+    pushToast,
+  ]);
 
   const clearCustomDeselect = useCallback(
     (entry: ProjectPref) => {
@@ -2190,23 +2769,67 @@ function App() {
 
   /* ─── Copy / Save ──────────────────────────────────── */
 
+  const handleToggleFullPreview = useCallback(async () => {
+    if (fullOutputPreview) {
+      setFullOutputPreview(false);
+      return;
+    }
+    if (fullOutputText !== null) {
+      setFullOutputPreview(true);
+      return;
+    }
+    if (IN_TAURI && !browserProjectRef.current && currentPath) {
+      try {
+        const full = await invoke<string | null>('get_full_packed_preview');
+        if (typeof full === 'string' && full.length > 0) {
+          setFullOutputText(full);
+          setFullOutputPreview(true);
+          return;
+        }
+      } catch {
+        /* fallback to regenerate with full_preview: true */
+      }
+      await generateNow(nodes, currentPath, format, { fullPreview: true });
+    } else {
+      setFullOutputPreview(true);
+    }
+  }, [fullOutputPreview, fullOutputText, currentPath, nodes, format, generateNow]);
+
   const handleCopy = useCallback(async () => {
     if (!output) return;
+    if (IN_TAURI && !browserProjectRef.current) {
+      try {
+        await invoke('copy_packed_output');
+        // If running under Playwright mock bridge where copy_packed_output is a no-op,
+        // also call copy_to_clipboard when fullOutputText is available in memory.
+        if (fullOutputText !== null) {
+          await invoke('copy_to_clipboard', { text: fullOutputText }).catch(() => {});
+        }
+        pushToast(
+          'success',
+          `Copied ${stats.files} files · ~${formatTokens(stats.tokens)} tokens`,
+        );
+        return;
+      } catch {
+        /* fallback to clipboard or copy_to_clipboard */
+      }
+    }
+    const textToCopy = fullOutputText ?? output;
     try {
-      await navigator.clipboard.writeText(output);
+      await navigator.clipboard.writeText(textToCopy);
       pushToast(
         'success',
         `Copied ${stats.files} files · ~${formatTokens(stats.tokens)} tokens`,
       );
     } catch {
       try {
-        await invoke('copy_to_clipboard', { text: output });
+        await invoke('copy_to_clipboard', { text: textToCopy });
         pushToast('success', 'Copied to clipboard');
       } catch {
         pushToast('error', 'Could not copy to clipboard');
       }
     }
-  }, [output, stats, pushToast]);
+  }, [output, fullOutputText, stats, pushToast]);
 
   const handleCopyFileList = useCallback(async () => {
     if (!fileListText) return;
@@ -2233,34 +2856,57 @@ function App() {
           : format === 'json'
             ? 'project.json'
             : 'project.txt';
+    const textToSave = fullOutputText ?? output;
     if (browserProjectRef.current || !IN_TAURI) {
-      downloadText(name, output);
+      downloadText(name, textToSave);
       pushToast('success', `Downloaded ${name}`);
       return;
     }
     try {
-      const saved = await invoke<boolean>('save_to_file', {
-        text: output,
+      const saved = await invoke<boolean | null>('save_packed_output', {
         defaultName: name,
       });
-      if (saved) pushToast('success', 'Saved packed output');
+      if (saved === true) {
+        pushToast('success', 'Saved packed output');
+        return;
+      }
+      if (saved === null) {
+        // Fallback for mock bridge that only implements save_to_file
+        const legacySaved = await invoke<boolean>('save_to_file', {
+          text: textToSave,
+          defaultName: name,
+        });
+        if (legacySaved) pushToast('success', 'Saved packed output');
+        return;
+      }
     } catch (e) {
       console.error(e);
-      // Last resort: download in webview
       try {
-        downloadText(name, output);
-        pushToast('success', `Downloaded ${name}`);
+        const legacySaved = await invoke<boolean>('save_to_file', {
+          text: textToSave,
+          defaultName: name,
+        });
+        if (legacySaved) {
+          pushToast('success', 'Saved packed output');
+          return;
+        }
       } catch {
-        pushToast('error', 'Failed to save file');
+        // Last resort: download in webview
+        try {
+          downloadText(name, textToSave);
+          pushToast('success', `Downloaded ${name}`);
+        } catch {
+          pushToast('error', 'Failed to save file');
+        }
       }
     }
-  }, [output, format, pushToast]);
+  }, [output, fullOutputText, format, pushToast]);
 
   /* ─── Keyboard shortcuts ───────────────────────────── */
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const meta = isMac ? e.metaKey : e.ctrlKey;
+      const meta = isModKey(e);
       const target = e.target as HTMLElement | null;
       const inField =
         target &&
@@ -2551,11 +3197,11 @@ function App() {
             type="button"
             onClick={() => void openFolder()}
             className="btn"
-            title={`Open folder (${isMac ? '⌘' : 'Ctrl'}O)`}
+            title={`Open folder (${formatShortcut('O')})`}
             data-testid="btn-open-folder"
           >
             <FolderOpen size={15} /> Open
-            <span className="kbd">{isMac ? '⌘O' : '⌃O'}</span>
+            <span className="kbd">{formatShortcut('O')}</span>
           </button>
 
           <button
@@ -2563,7 +3209,7 @@ function App() {
             onClick={() => currentPath && void scan(currentPath)}
             className="btn"
             disabled={!currentPath || scanning}
-            title={`Refresh (${isMac ? '⌘' : 'Ctrl'}R)`}
+            title={`Refresh (${formatShortcut('R')})`}
           >
             <RefreshCw size={15} className={scanning ? 'spin' : ''} /> Refresh
           </button>
@@ -2601,7 +3247,7 @@ function App() {
               title={
                 generating && !output
                   ? 'Preparing packed output…'
-                  : `Copy packed content (${isMac ? '⌘' : 'Ctrl'}C)`
+                  : `Copy packed content (${formatShortcut('C')})`
               }
             >
               {generating && !output ? (
@@ -2621,7 +3267,7 @@ function App() {
               onClick={() => void handleSave()}
               className="btn btn-icon"
               disabled={!output}
-              title={`Save (${isMac ? '⌘' : 'Ctrl'}S)`}
+              title={`Save (${formatShortcut('S')})`}
               aria-label="Save packed output"
             >
               <Save size={15} />
@@ -2725,9 +3371,109 @@ function App() {
           >
             All clean
           </button>
+          <button
+            type="button"
+            className={`btn btn-ghost ${preset === 'core_skeleton' ? 'is-active' : ''}`}
+            onClick={() => applySelectionPreset('core_skeleton')}
+            disabled={!currentPath}
+            title="Core files full + tests/docs as AST skeletons"
+          >
+            Core Full + Rest Skeleton
+          </button>
+        </div>
+
+        <div className="toolbar-sep" />
+
+        <div className="toolbar-group" role="group" aria-label="Security and Git">
+          <button
+            type="button"
+            className={`btn btn-ghost ${redactSecretsEnabled ? 'is-active' : ''}`}
+            onClick={toggleRedactSecrets}
+            aria-pressed={redactSecretsEnabled}
+            data-testid="btn-toggle-redact"
+            title={
+              redactSecretsEnabled
+                ? 'Secret redaction is ON (click to disable)'
+                : 'Secret redaction is OFF (click to enable)'
+            }
+          >
+            <Shield size={13} />
+            <span>Redact</span>
+          </button>
+          {redactSecretsEnabled && redactionSummary.totalRedactions > 0 && (
+            <span
+              className="redact-badge"
+              data-testid="redaction-badge"
+              title={redactionSummary.kinds
+                .map(([k, c]) => `${k}: ${c}`)
+                .join(', ')}
+            >
+              🛡️ {redactionSummary.totalRedactions} secrets masked
+            </span>
+          )}
+
+          {gitContext?.isGitRepo && (
+            <>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => selectGitFiles('modified')}
+                title="Select Git modified, staged, and untracked files"
+                data-testid="btn-git-modified"
+              >
+                <GitBranch size={13} /> Select Git Modified
+                {gitContext.modifiedFiles.length > 0 && (
+                  <span className="history-count">
+                    {gitContext.modifiedFiles.length}
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => selectGitFiles('branch')}
+                title="Select files changed on current branch vs base branch"
+                data-testid="btn-git-branch"
+              >
+                Select Branch Changes
+              </button>
+              <button
+                type="button"
+                className={`btn btn-ghost ${includeGitDiff ? 'is-active' : ''}`}
+                onClick={toggleIncludeGitDiff}
+                aria-pressed={includeGitDiff}
+                title="Include unified <git_diff> block in packed output"
+                data-testid="btn-include-git-diff"
+              >
+                + &lt;git_diff&gt;
+              </button>
+            </>
+          )}
+
+          <button
+            type="button"
+            className={`btn btn-ghost ${showPromptStudio ? 'is-active' : ''}`}
+            onClick={() => setShowPromptStudio((v) => !v)}
+            aria-expanded={showPromptStudio}
+            data-testid="btn-prompt-studio"
+            title="Prompt Studio — append <task_instructions> at the end of the pack"
+          >
+            <Sparkles size={13} /> Prompt Studio
+          </button>
         </div>
 
         <div className="toolbar-spacer" />
+
+        {workspaceChangedOnDisk && currentPath && (
+          <button
+            type="button"
+            className="disk-changed-pill"
+            onClick={() => void scan(currentPath)}
+            data-testid="disk-changed-pill"
+          >
+            <RefreshCw size={11} /> Files changed on disk — Refresh
+          </button>
+        )}
 
         {currentPath && (
           <span className="meta-inline">
@@ -2740,6 +3486,132 @@ function App() {
           </span>
         )}
       </div>
+
+      {/* Context Budget Bar */}
+      {currentPath && (
+        <div className="budget-bar-row" data-testid="context-budget-bar">
+          <span className="panel-title">Context Budget</span>
+          <select
+            className="select"
+            aria-label="Target token budget"
+            data-testid="budget-select"
+            value={budgetPreset}
+            onChange={(e) => setBudgetPreset(e.target.value as BudgetPreset)}
+          >
+            <option value="32k">32k</option>
+            <option value="64k">64k</option>
+            <option value="128k">128k</option>
+            <option value="200k">200k</option>
+            <option value="1m">1M</option>
+            <option value="custom">Custom</option>
+          </select>
+          {budgetPreset === 'custom' && (
+            <input
+              type="number"
+              className="select"
+              style={{ width: 92, paddingRight: 6 }}
+              min={1000}
+              step={1000}
+              value={customBudget}
+              onChange={(e) => setCustomBudget(Number(e.target.value) || 128_000)}
+              aria-label="Custom token budget"
+            />
+          )}
+          <div className="budget-meter-wrap">
+            <div className="budget-track" role="progressbar" aria-valuenow={stats.tokens} aria-valuemax={targetBudgetTokens}>
+              <div
+                className={[
+                  'budget-fill',
+                  stats.tokens > targetBudgetTokens
+                    ? 'is-over'
+                    : stats.tokens > targetBudgetTokens * 0.85
+                      ? 'is-warn'
+                      : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ')}
+                style={{
+                  width: `${Math.min(100, Math.round((stats.tokens / Math.max(1, targetBudgetTokens)) * 100))}%`,
+                }}
+              />
+            </div>
+            <span className="budget-label" data-testid="budget-progress-label">
+              {formatTokens(stats.tokens)} / {formatTokens(targetBudgetTokens)} tokens (
+              {Math.round((stats.tokens / Math.max(1, targetBudgetTokens)) * 100)}%)
+            </span>
+          </div>
+
+          <button
+            type="button"
+            className="btn btn-ghost"
+            onClick={autoFitToBudget}
+            disabled={selectedCount === 0}
+            data-testid="btn-auto-fit-budget"
+            title="Automatically skeletonize or deselect low-priority files to fit <= 90% of target budget"
+          >
+            Auto-Fit to Budget
+          </button>
+
+          <button
+            type="button"
+            className={`btn btn-ghost ${showTopConsumers ? 'is-active' : ''}`}
+            onClick={() => setShowTopConsumers((v) => !v)}
+            aria-expanded={showTopConsumers}
+            data-testid="btn-top-consumers"
+          >
+            Top Token Consumers
+          </button>
+        </div>
+      )}
+
+      {/* Prompt Studio collapsible bar */}
+      {showPromptStudio && (
+        <div className="prompt-studio-bar" data-testid="prompt-studio-panel">
+          <div className="prompt-studio-controls">
+            <span className="panel-title">Prompt Studio</span>
+            <select
+              className="select"
+              aria-label="Prompt template"
+              data-testid="prompt-template-select"
+              value={promptTemplateId}
+              onChange={(e) => {
+                const id = e.target.value;
+                setPromptTemplateId(id);
+                const tpl = PROMPT_TEMPLATES.find((t) => t.id === id);
+                if (tpl && id !== 'custom') {
+                  setTaskPrompt(tpl.prompt);
+                  if (currentPath && nodes.length > 0) {
+                    generate(nodes, currentPath, format, true, { prompt: tpl.prompt });
+                  }
+                }
+              }}
+            >
+              {PROMPT_TEMPLATES.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+            <span className="meta-inline">
+              Appended at the very end inside <code>&lt;task_instructions&gt;</code> for optimal long-context LLM reasoning.
+            </span>
+          </div>
+          <textarea
+            className="prompt-studio-textarea"
+            placeholder="Describe the engineering task, bug, or review question to append inside <task_instructions>…"
+            value={taskPrompt}
+            data-testid="prompt-studio-input"
+            onChange={(e) => {
+              const val = e.target.value;
+              setTaskPrompt(val);
+              setPromptTemplateId('custom');
+              if (currentPath && nodes.length > 0) {
+                generate(nodes, currentPath, format, false, { prompt: val });
+              }
+            }}
+          />
+        </div>
+      )}
 
       {/* Main */}
       <div className="main-content">
@@ -2770,7 +3642,13 @@ function App() {
             )}
           </div>
 
-          <div className="file-tree" role="tree" aria-label="File tree">
+          <div
+            ref={treeScrollRef}
+            className="file-tree"
+            role="tree"
+            aria-label="File tree"
+            onScroll={(e) => setTreeScrollTop(e.currentTarget.scrollTop)}
+          >
             {scanning && !fileTree.children.length ? (
               <div className="loading-center">
                 <div className="title">
@@ -2778,26 +3656,33 @@ function App() {
                 </div>
                 <div className="sub">Respecting .gitignore</div>
               </div>
-            ) : filteredTree && filteredTree.children.length > 0 ? (
-              filteredTree.children.map((child) => (
-                <TreeItem
-                  key={child.path}
-                  node={child}
-                  depth={0}
-                  expanded={expanded}
-                  selectedSet={selectedSet}
-                  filterText={filterText}
-                  onToggleExpand={toggleExpand}
-                  onToggleSelect={toggleSelect}
-                  onFocusPath={setFocusedPath}
-                  onOpenFile={(p) => void openFilePreview(p)}
-                  onContextMenu={handleTreeContextMenu}
-                  focusedPath={focusedPath}
-                  previewPath={previewRelPath}
-                  subtreeStats={subtreeStats}
-                  tokenSort={tokenSort}
-                />
-              ))
+            ) : visibleTreeRows.length > 0 ? (
+              <div
+                className="tree-virtual-container"
+                style={{
+                  height: `${totalTreeHeight}px`,
+                  paddingTop: `${startRowIdx * ROW_HEIGHT}px`,
+                }}
+              >
+                {virtualSlice.map((row) => (
+                  <TreeRow
+                    key={row.node.path}
+                    row={row}
+                    selectedSet={selectedSet}
+                    skeletonSet={skeletonSet}
+                    filterText={filterText}
+                    onToggleExpand={toggleExpand}
+                    onToggleSelect={toggleSelect}
+                    onToggleSkeleton={toggleSkeleton}
+                    onFocusPath={setFocusedPath}
+                    onOpenFile={(p) => void openFilePreview(p)}
+                    onContextMenu={handleTreeContextMenu}
+                    focusedPath={focusedPath}
+                    previewPath={previewRelPath}
+                    subtreeStats={subtreeStats}
+                  />
+                ))}
+              </div>
             ) : currentPath && filterText ? (
               <div className="empty-state">
                 <div className="empty-title">No matches</div>
@@ -2829,13 +3714,13 @@ function App() {
                 </button>
                 <div className="empty-hints">
                   <span className="hint-chip">
-                    <span className="kbd">{isMac ? '⌘O' : '⌃O'}</span> Open
+                    <span className="kbd">{formatShortcut('O')}</span> Open
                   </span>
                   <span className="hint-chip">
-                    <span className="kbd">{isMac ? '⌘F' : '⌃F'}</span> Filter
+                    <span className="kbd">{formatShortcut('F')}</span> Filter
                   </span>
                   <span className="hint-chip">
-                    <span className="kbd">{isMac ? '⌘C' : '⌃C'}</span> Copy
+                    <span className="kbd">{formatShortcut('C')}</span> Copy
                   </span>
                 </div>
               </div>
@@ -2949,6 +3834,62 @@ function App() {
             </div>
           </div>
 
+          {showTopConsumers && currentPath && (
+            <div className="top-consumers-drawer" data-testid="top-consumers-drawer">
+              <div className="top-consumers-header">
+                <span>Top Token Consumers (Top 10 Selected Files)</span>
+                <button
+                  type="button"
+                  className="panel-link"
+                  onClick={() => setShowTopConsumers(false)}
+                >
+                  Close
+                </button>
+              </div>
+              <div className="top-consumers-list">
+                {nodes
+                  .filter((n) => !n.is_dir && n.selected)
+                  .map((n) => {
+                    const norm = normalizePath(n.path);
+                    const ft = fileTokens.find((f) => normalizePath(f.path) === norm);
+                    return {
+                      path: norm,
+                      tokens: ft ? ft.tokens : estimateTokensFromBytes(n.size ?? 0),
+                      isSkel: skeletonSet.has(norm),
+                    };
+                  })
+                  .sort((a, b) => b.tokens - a.tokens)
+                  .slice(0, 10)
+                  .map((item) => (
+                    <div key={item.path} className="top-consumer-row">
+                      <span className="top-consumer-path" title={item.path}>
+                        {item.path}
+                      </span>
+                      <span className="top-consumer-tokens">
+                        ~{formatTokens(item.tokens)} tok
+                      </span>
+                      <button
+                        type="button"
+                        className={`btn btn-ghost ${item.isSkel ? 'is-active' : ''}`}
+                        style={{ height: 22, padding: '0 6px', fontSize: 11 }}
+                        onClick={() => toggleSkeleton(item.path, false)}
+                      >
+                        {item.isSkel ? 'Full' : 'Skeletonize'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        style={{ height: 22, padding: '0 6px', fontSize: 11 }}
+                        onClick={() => toggleSelect(item.path, false)}
+                      >
+                        Exclude
+                      </button>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
+
           {!generating && output && view === 'packed' && stats.tokens >= TOKEN_SOFT && (
             <div
               className={`token-banner${stats.tokens >= TOKEN_HARD ? ' is-hot' : ''}`}
@@ -3007,15 +3948,32 @@ function App() {
             ) : view === 'packed' ? (
               output ? (
                 <div>
-                  {output.length > 150_000 && (
+                  {(truncatedPreview || output.length > 150_000) && (
                     <div className="preview-inline-actions">
-                      <span>{fullOutputPreview ? 'Full preview' : 'Preview limited to 100,000 characters'}. Copy and Save use the complete output.</span>
-                      <button type="button" className="btn" onClick={() => setFullOutputPreview((shown) => !shown)}>
-                        {fullOutputPreview ? 'Limit preview' : `Show full preview (${formatBytes(outputBytes)})`}
+                      <span>
+                        {fullOutputPreview
+                          ? 'Full preview'
+                          : 'Preview limited to 100,000 characters'}
+                        . Copy and Save use the complete output.
+                      </span>
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => void handleToggleFullPreview()}
+                      >
+                        {fullOutputPreview
+                          ? 'Limit preview'
+                          : `Show full preview (${formatBytes(outputBytes)})`}
                       </button>
                     </div>
                   )}
-                  <pre className="output-text">{output.length > 150_000 && !fullOutputPreview ? output.slice(0, 100_000) : output}</pre>
+                  <pre className="output-text">
+                    {fullOutputPreview && fullOutputText !== null
+                      ? fullOutputText
+                      : output.length > 150_000 && !fullOutputPreview
+                        ? output.slice(0, 100_000)
+                        : output}
+                  </pre>
                 </div>
               ) : (
                 <div className="empty-state">
@@ -3141,6 +4099,42 @@ function App() {
           >
             Toggle pack selection
           </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => {
+              toggleSkeleton(contextMenu.path, false);
+              setContextMenu(null);
+            }}
+          >
+            Pack signatures only (Skeleton mode)
+          </button>
+          <div className="ctx-sep" />
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => void selectRelatedFiles(contextMenu.path, 'imports')}
+          >
+            Select file + direct imports (1-hop)
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => void selectRelatedFiles(contextMenu.path, 'importers')}
+          >
+            Select file + importers (who uses this?)
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="ctx-item"
+            onClick={() => void selectRelatedFiles(contextMenu.path, 'tests')}
+          >
+            Select file + matching tests
+          </button>
         </div>
       )}
 
@@ -3259,31 +4253,31 @@ function App() {
             <dl className="help-list">
               <div>
                 <dt>
-                  <span className="kbd">{isMac ? '⌘O' : 'Ctrl O'}</span>
+                  <span className="kbd">{formatShortcut('O')}</span>
                 </dt>
                 <dd>Open folder</dd>
               </div>
               <div>
                 <dt>
-                  <span className="kbd">{isMac ? '⌘R' : 'Ctrl R'}</span>
+                  <span className="kbd">{formatShortcut('R')}</span>
                 </dt>
                 <dd>Refresh project</dd>
               </div>
               <div>
                 <dt>
-                  <span className="kbd">{isMac ? '⌘F' : 'Ctrl F'}</span>
+                  <span className="kbd">{formatShortcut('F')}</span>
                 </dt>
                 <dd>Focus filter</dd>
               </div>
               <div>
                 <dt>
-                  <span className="kbd">{isMac ? '⌘C' : 'Ctrl C'}</span>
+                  <span className="kbd">{formatShortcut('C')}</span>
                 </dt>
                 <dd>Copy packed output (or file list)</dd>
               </div>
               <div>
                 <dt>
-                  <span className="kbd">{isMac ? '⌘S' : 'Ctrl S'}</span>
+                  <span className="kbd">{formatShortcut('S')}</span>
                 </dt>
                 <dd>Save packed output</dd>
               </div>

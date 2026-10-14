@@ -1,6 +1,6 @@
 //! ptt — ProjectToText
 //! Tauri v2 desktop app: open folder → respect .gitignore exactly like Git → pack into LLM-ready text.
-//! Headless: `ptt pack [DIR] [OPTIONS]` (see `cli` module).
+//! Headless: `ptt pack [DIR] [OPTIONS]` and `ptt mcp [DIR]` (see `cli` and `mcp` modules).
 
 // On Windows, build as a GUI app in release mode so no empty console window
 // appears next to the desktop UI. In dev/debug builds we keep the console
@@ -11,18 +11,43 @@
 )]
 
 mod cli;
+mod mcp;
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tauri::Emitter;
 use tauri_plugin_dialog::DialogExt;
 
-use ptt::core::output::OutputFormat;
-use ptt::core::output::{WriteOptions, DEFAULT_MAX_FILE_SIZE};
+use ptt::core::deps::RelatedFiles;
+use ptt::core::git::{compute_git_diff, GitRepoContext};
+use ptt::core::output::{
+    write_output_with_stats, FileTokenStat, OutputFormat, WriteOptions, DEFAULT_MAX_FILE_SIZE,
+};
 use ptt::core::preview::{load_preview, resolve_under_root, DEFAULT_PREVIEW_MAX};
-use ptt::core::walker::normalize_rel_path;
+use ptt::core::secrets::RedactionSummary;
+use ptt::core::tokenizer::TokenizerModel;
+use ptt::core::walker::{is_junk_dir_name, normalize_rel_path, JUNK_DIRS};
 use ptt::core::workspace::WorkspaceIndex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+
+const PREVIEW_CHAR_LIMIT: usize = 100_000;
+
+#[derive(Clone)]
+struct PackedArtifact {
+    revision: u64,
+    generation: u64,
+    content: Arc<String>,
+    total_bytes: usize,
+    total_chars: usize,
+    total_tokens: usize,
+    files_packed: usize,
+    file_tokens: Vec<FileTokenStat>,
+    redactions: RedactionSummary,
+}
 
 #[derive(Default)]
 struct DesktopState {
@@ -30,13 +55,33 @@ struct DesktopState {
     startup_folder: Option<String>,
     /// Bumped by every `generate_output` call so an older pack stops at its next file.
     generation: Arc<AtomicU64>,
+    /// Zero-copy cache of the latest packed artifact so Copy/Save don't round-trip MBs over IPC.
+    last_artifact: Arc<Mutex<Option<PackedArtifact>>>,
+    /// Optional active filesystem watcher for the currently open workspace.
+    watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ScanResult {
     root: String,
     revision: u64,
     nodes: Vec<FileNode>,
+    junk_dirs: Vec<String>,
+    git_context: GitRepoContext,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateOutputResponse {
+    preview: String,
+    truncated_preview: bool,
+    total_bytes: usize,
+    total_chars: usize,
+    total_tokens: usize,
+    files_packed: usize,
+    file_tokens: Vec<FileTokenStat>,
+    redactions: RedactionSummary,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -55,6 +100,12 @@ pub struct FileNode {
     pub size: Option<u64>,
     pub children: Option<Vec<FileNode>>,
     pub selected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -62,6 +113,18 @@ pub struct PackOptions {
     pub format: String,
     pub include_summary: bool,
     pub max_file_size: Option<u64>,
+    #[serde(default = "default_true")]
+    pub redact_secrets: bool,
+    #[serde(default)]
+    pub full_preview: bool,
+    #[serde(default)]
+    pub skeleton_files: Vec<String>,
+    #[serde(default)]
+    pub include_git_diff: bool,
+    #[serde(default)]
+    pub task_prompt: Option<String>,
+    #[serde(default)]
+    pub tokenizer_model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -77,6 +140,51 @@ pub struct FilePreviewDto {
     pub absolute_path: String,
 }
 
+fn start_workspace_watcher(
+    app: tauri::AppHandle,
+    root: PathBuf,
+    watcher_slot: Arc<Mutex<Option<RecommendedWatcher>>>,
+) {
+    let last_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(5)));
+    let root_for_cb = root.clone();
+    let watcher_res =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            let Ok(event) = res else {
+                return;
+            };
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                return;
+            }
+            // Ignore events inside .git/ or known junk directories
+            let relevant = event.paths.iter().any(|p| {
+                let rel = p.strip_prefix(&root_for_cb).unwrap_or(p);
+                !rel.components().any(|c| {
+                    let s = c.as_os_str().to_string_lossy();
+                    is_junk_dir_name(&s)
+                })
+            });
+            if !relevant {
+                return;
+            }
+            if let Ok(mut guard) = last_emit.lock() {
+                if guard.elapsed() >= Duration::from_millis(600) {
+                    *guard = Instant::now();
+                    let _ = app.emit(
+                        "workspace-changed",
+                        root_for_cb.to_string_lossy().to_string(),
+                    );
+                }
+            }
+        });
+
+    if let Ok(mut watcher) = watcher_res {
+        let _ = watcher.watch(&root, RecursiveMode::Recursive);
+        if let Ok(mut slot) = watcher_slot.lock() {
+            *slot = Some(watcher);
+        }
+    }
+}
+
 #[tauri::command]
 async fn select_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -89,10 +197,12 @@ async fn select_folder(app: tauri::AppHandle) -> Result<Option<String>, String> 
 
 #[tauri::command]
 async fn scan_folder(
+    app: tauri::AppHandle,
     path: String,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<ScanResult, String> {
     let index = state.workspace.clone();
+    let watcher_slot = state.watcher.clone();
     blocking(move || {
         let snapshot = index.scan(Path::new(&path))?;
         let nodes: Vec<FileNode> = snapshot
@@ -105,6 +215,11 @@ async fn scan_folder(
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path_str.clone());
+                let git_status = if !e.is_dir {
+                    snapshot.git_context.file_statuses.get(&path_str).cloned()
+                } else {
+                    None
+                };
                 FileNode {
                     path: path_str,
                     name,
@@ -112,14 +227,19 @@ async fn scan_folder(
                     size: e.size,
                     children: None,
                     selected: false,
+                    git_status,
                 }
             })
             .collect();
+
+        start_workspace_watcher(app, snapshot.root.clone(), watcher_slot);
 
         Ok(ScanResult {
             root: snapshot.root.to_string_lossy().into_owned(),
             revision: snapshot.revision,
             nodes,
+            junk_dirs: JUNK_DIRS.iter().map(|s| (*s).to_string()).collect(),
+            git_context: snapshot.git_context.clone(),
         })
     })
     .await
@@ -130,6 +250,15 @@ fn startup_folder(state: tauri::State<'_, DesktopState>) -> Option<String> {
     state.startup_folder.clone()
 }
 
+fn truncate_preview_chars(s: &str, max_chars: usize) -> (String, bool) {
+    let mut char_indices = s.char_indices();
+    if let Some((byte_idx, _)) = char_indices.nth(max_chars) {
+        (s[..byte_idx].to_string(), true)
+    } else {
+        (s.to_string(), false)
+    }
+}
+
 #[tauri::command]
 async fn generate_output(
     path: String,
@@ -137,10 +266,12 @@ async fn generate_output(
     options: PackOptions,
     revision: u64,
     state: tauri::State<'_, DesktopState>,
-) -> Result<String, String> {
+) -> Result<GenerateOutputResponse, String> {
     let generation = state.generation.clone();
     let request = generation.fetch_add(1, Ordering::SeqCst) + 1;
     let index = state.workspace.clone();
+    let artifact_slot = state.last_artifact.clone();
+
     blocking(move || {
         let snapshot = index.get(Path::new(&path), revision)?;
         let root = &snapshot.root;
@@ -153,18 +284,176 @@ async fn generate_output(
             _ => OutputFormat::Xml,
         };
 
+        let skeleton_files: HashSet<String> = options
+            .skeleton_files
+            .into_iter()
+            .map(|p| normalize_rel_path(Path::new(&p)))
+            .collect();
+
+        let git_diff = if options.include_git_diff {
+            compute_git_diff(root, 256 * 1024)
+        } else {
+            None
+        };
+
+        let tokenizer_model = options
+            .tokenizer_model
+            .as_deref()
+            .map(TokenizerModel::parse)
+            .unwrap_or(TokenizerModel::O200kBase);
+
         let write_opts = WriteOptions {
             format,
             include_file_summary: options.include_summary,
             max_file_size: options.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
+            redact_secrets: options.redact_secrets,
+            skeleton_all: false,
+            skeleton_files,
+            git_diff,
+            task_prompt: options.task_prompt,
+            tokenizer_model,
+            compute_bpe_tokens: true,
         };
 
         let mut buf = Vec::new();
         let is_superseded = || generation.load(Ordering::SeqCst) != request;
-        ptt::write_output_cancellable(&mut buf, &filtered, root, &write_opts, &is_superseded)
-            .map_err(|e| e.to_string())?;
+        let pack_stats =
+            write_output_with_stats(&mut buf, &filtered, root, &write_opts, &is_superseded)
+                .map_err(|e| e.to_string())?;
 
-        String::from_utf8(buf).map_err(|e| format!("Output is not valid UTF-8: {e}"))
+        let full_text =
+            String::from_utf8(buf).map_err(|e| format!("Output is not valid UTF-8: {e}"))?;
+        let total_bytes = full_text.len();
+        let total_chars = full_text.chars().count();
+
+        let (preview, truncated_preview) = if options.full_preview || total_chars <= 150_000 {
+            (full_text.clone(), false)
+        } else {
+            truncate_preview_chars(&full_text, PREVIEW_CHAR_LIMIT)
+        };
+
+        let content_arc = Arc::new(full_text);
+        let artifact = PackedArtifact {
+            revision,
+            generation: request,
+            content: content_arc,
+            total_bytes,
+            total_chars,
+            total_tokens: pack_stats.total_tokens,
+            files_packed: pack_stats.files_packed,
+            file_tokens: pack_stats.file_tokens.clone(),
+            redactions: pack_stats.redactions.clone(),
+        };
+
+        if let Ok(mut guard) = artifact_slot.lock() {
+            // Only store if not superseded by a newer generation
+            if generation.load(Ordering::SeqCst) == request {
+                *guard = Some(artifact);
+            }
+        }
+
+        Ok(GenerateOutputResponse {
+            preview,
+            truncated_preview,
+            total_bytes,
+            total_chars,
+            total_tokens: pack_stats.total_tokens,
+            files_packed: pack_stats.files_packed,
+            file_tokens: pack_stats.file_tokens,
+            redactions: pack_stats.redactions,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn get_full_packed_preview(state: tauri::State<'_, DesktopState>) -> Result<String, String> {
+    let artifact = state
+        .last_artifact
+        .lock()
+        .map_err(|_| "Artifact lock poisoned")?
+        .clone()
+        .ok_or("No packed output available")?;
+    Ok((*artifact.content).clone())
+}
+
+#[tauri::command]
+async fn copy_packed_output(state: tauri::State<'_, DesktopState>) -> Result<(), String> {
+    let artifact = state
+        .last_artifact
+        .lock()
+        .map_err(|_| "Artifact lock poisoned")?
+        .clone()
+        .ok_or("No packed output available to copy")?;
+    let _ = (
+        artifact.revision,
+        artifact.generation,
+        artifact.total_bytes,
+        artifact.total_chars,
+        artifact.total_tokens,
+        artifact.files_packed,
+        &artifact.file_tokens,
+        &artifact.redactions,
+    );
+    blocking(move || {
+        arboard::Clipboard::new()
+            .and_then(|mut c| c.set_text((*artifact.content).clone()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_packed_output(
+    app: tauri::AppHandle,
+    default_name: String,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<bool, String> {
+    let artifact = state
+        .last_artifact
+        .lock()
+        .map_err(|_| "Artifact lock poisoned")?
+        .clone()
+        .ok_or("No packed output available to save")?;
+
+    let name = if default_name.trim().is_empty() {
+        "project.txt".to_string()
+    } else {
+        default_name
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+    app.dialog()
+        .file()
+        .set_file_name(&name)
+        .save_file(move |maybe_path| {
+            let result = maybe_path.map(|p| p.to_string());
+            let _ = tx.send(result);
+        });
+    match rx.await {
+        Ok(Some(path)) => {
+            blocking(move || {
+                std::fs::write(&path, artifact.content.as_bytes()).map_err(|e| e.to_string())?;
+                Ok(true)
+            })
+            .await
+        }
+        Ok(None) => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn resolve_related_files(
+    path: String,
+    target_file: String,
+    revision: u64,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<RelatedFiles, String> {
+    let index = state.workspace.clone();
+    blocking(move || {
+        let snapshot = index.get(Path::new(&path), revision)?;
+        Ok(snapshot.dependency_graph().related_for(&target_file))
     })
     .await
 }
@@ -225,16 +514,17 @@ fn validate_editor_command(app: &str) -> Result<&str, String> {
 #[tauri::command]
 async fn open_in_default_app(root: String, relative_path: String) -> Result<(), String> {
     blocking(move || {
-    let full =
-        resolve_under_root(&PathBuf::from(&root), &relative_path).map_err(|e| e.to_string())?;
-    if is_executable_like(&full) {
-        return Err(
-            "Executables and scripts are not opened with the default app. Use \"Open with\u{2026}\" to choose a program."
-                .into(),
-        );
-    }
-    open::that(dunce::simplified(&full)).map_err(|e| format!("Failed to open file: {e}"))
-    }).await
+        let full =
+            resolve_under_root(&PathBuf::from(&root), &relative_path).map_err(|e| e.to_string())?;
+        if is_executable_like(&full) {
+            return Err(
+                "Executables and scripts are not opened with the default app. Use \"Open with\u{2026}\" to choose a program."
+                    .into(),
+            );
+        }
+        open::that(dunce::simplified(&full)).map_err(|e| format!("Failed to open file: {e}"))
+    })
+    .await
 }
 
 /// Open a project file with one of the known editors (see `KNOWN_EDITORS`).
@@ -377,7 +667,7 @@ fn attach_parent_console() {}
 fn main() {
     attach_parent_console();
 
-    // Headless packing without launching the GUI webview.
+    // Headless packing or MCP server without launching the GUI webview.
     let startup = match cli::maybe_run() {
         cli::Launch::Headless => return,
         cli::Launch::Desktop(folder) => folder,
@@ -396,6 +686,10 @@ fn main() {
             startup_folder,
             scan_folder,
             generate_output,
+            get_full_packed_preview,
+            copy_packed_output,
+            save_packed_output,
+            resolve_related_files,
             read_file_preview,
             open_in_default_app,
             open_with_app,

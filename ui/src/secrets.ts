@@ -6,38 +6,173 @@
  * Best-effort safety net: it masks recognizable credential shapes only.
  */
 
+export interface RedactionSummary {
+  totalRedactions: number;
+  kinds: [string, number][];
+}
+
 interface SecretRule {
+  kind: string;
   pattern: RegExp;
   replacement: string;
+  /** When true, the captured value (group 2) is skipped if it is a documented placeholder. */
+  placeholderAware?: boolean;
 }
 
 // Global flag so `String.prototype.replace` replaces every occurrence.
 const SECRET_RULES: readonly SecretRule[] = [
   {
+    kind: 'PRIVATE_KEY',
     pattern:
       /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=:, \t\r\n-]+?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
     replacement: '[REDACTED: PRIVATE_KEY]',
   },
-  { pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, replacement: '[REDACTED: AWS_ACCESS_KEY]' },
-  { pattern: /\bsk-[A-Za-z0-9_-]{20,}/g, replacement: '[REDACTED: OPENAI_API_KEY]' },
-  { pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/g, replacement: '[REDACTED: GITHUB_TOKEN]' },
-  { pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}\b/g, replacement: '[REDACTED: GITHUB_TOKEN]' },
-  { pattern: /\bxox[abposr]-[A-Za-z0-9-]{10,}/g, replacement: '[REDACTED: SLACK_TOKEN]' },
   {
-    pattern: /((?:^|[\s;{,])(?:password|pwd)=)[^=;\s"'<>`)&}[][^;\s"'<>`)&}]*/gi,
-    replacement: '$1[REDACTED: PASSWORD]',
+    kind: 'AWS_ACCESS_KEY',
+    pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+    replacement: '[REDACTED: AWS_ACCESS_KEY]',
   },
   {
-    pattern: /^((?:export[ \t]+)?[A-Z][A-Z0-9_]*(?:PASSWORD|PWD)=)[^=;\s"'<>`)&}[][^\s"'<>`)&};]*/gm,
+    kind: 'ANTHROPIC_API_KEY',
+    pattern: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g,
+    replacement: '[REDACTED: ANTHROPIC_API_KEY]',
+  },
+  {
+    kind: 'OPENAI_API_KEY',
+    pattern: /\bsk-[A-Za-z0-9_-]{20,}/g,
+    replacement: '[REDACTED: OPENAI_API_KEY]',
+  },
+  {
+    kind: 'GOOGLE_API_KEY',
+    pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g,
+    replacement: '[REDACTED: GOOGLE_API_KEY]',
+  },
+  {
+    kind: 'STRIPE_KEY',
+    pattern: /\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{20,}\b/g,
+    replacement: '[REDACTED: STRIPE_KEY]',
+  },
+  {
+    kind: 'GITHUB_TOKEN',
+    pattern: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/g,
+    replacement: '[REDACTED: GITHUB_TOKEN]',
+  },
+  {
+    kind: 'GITHUB_TOKEN',
+    pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}\b/g,
+    replacement: '[REDACTED: GITHUB_TOKEN]',
+  },
+  {
+    kind: 'SLACK_TOKEN',
+    pattern: /\bxox[abposr]-[A-Za-z0-9-]{10,}/g,
+    replacement: '[REDACTED: SLACK_TOKEN]',
+  },
+  {
+    kind: 'URL_PASSWORD',
+    pattern: /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:@]+:)[^@\s"'`[][^@\s"'`]*(@)/g,
+    replacement: '$1[REDACTED: URL_PASSWORD]$2',
+  },
+  {
+    kind: 'PASSWORD',
+    pattern: /((?:^|[\s;{,])(?:password|pwd)=)([^=;\s"'<>`)&}[][^;\s"'<>`)&}]*)/gi,
     replacement: '$1[REDACTED: PASSWORD]',
+    placeholderAware: true,
+  },
+  {
+    kind: 'PASSWORD',
+    pattern: /^((?:export[ \t]+)?[A-Z][A-Z0-9_]*(?:PASSWORD|PWD)=)([^=;\s"'<>`)&}[][^\s"'<>`)&};]*)/gm,
+    replacement: '$1[REDACTED: PASSWORD]',
+    placeholderAware: true,
+  },
+  {
+    kind: 'ENV_SECRET',
+    pattern: /^((?:export[ \t]+)?[A-Z][A-Z0-9_]*_(?:SECRET|TOKEN|API_KEY|PRIVATE_KEY)=)([^\r\n#;]+)/gm,
+    replacement: '$1[REDACTED: ENV_SECRET]',
+    placeholderAware: true,
   },
 ];
 
+function isEnvPlaceholder(rawVal: string): boolean {
+  const trimmed = rawVal.trim();
+  if (!trimmed) return true;
+  let unquoted = trimmed;
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    unquoted = trimmed.slice(1, -1).trim();
+  }
+  // Documentation placeholders such as `...`, `***` or `---` are never real credentials.
+  if (!unquoted || /^[.*_-]+$/.test(unquoted)) return true;
+  if (
+    unquoted.startsWith('[REDACTED:') ||
+    unquoted.startsWith('$') ||
+    (unquoted.startsWith('<') && unquoted.endsWith('>'))
+  ) {
+    return true;
+  }
+  const lower = unquoted.toLowerCase();
+  if (
+    lower === 'null' ||
+    lower === 'none' ||
+    lower === 'false' ||
+    lower === 'true' ||
+    lower === 'todo' ||
+    lower === 'changeme' ||
+    lower === 'xxx' ||
+    lower === 'example'
+  ) {
+    return true;
+  }
+  return (
+    lower.startsWith('your_') ||
+    lower.startsWith('your-') ||
+    lower.startsWith('replace_')
+  );
+}
+
+export function redactSecretsWithReport(text: string): {
+  text: string;
+  summary: RedactionSummary;
+} {
+  let out = text;
+  let totalRedactions = 0;
+  const kindCounts = new Map<string, number>();
+
+  const record = (kind: string, count: number) => {
+    if (count <= 0) return;
+    totalRedactions += count;
+    kindCounts.set(kind, (kindCounts.get(kind) ?? 0) + count);
+  };
+
+  for (const rule of SECRET_RULES) {
+    if (rule.placeholderAware) {
+      let count = 0;
+      out = out.replace(rule.pattern, (full, prefix: string, val: string) => {
+        if (isEnvPlaceholder(val)) return full;
+        count += 1;
+        return `${prefix}[REDACTED: ${rule.kind}]`;
+      });
+      record(rule.kind, count);
+    } else {
+      const matches = out.match(rule.pattern);
+      if (matches && matches.length > 0) {
+        out = out.replace(rule.pattern, rule.replacement);
+        record(rule.kind, matches.length);
+      }
+    }
+  }
+
+  return {
+    text: out,
+    summary: {
+      totalRedactions,
+      kinds: Array.from(kindCounts.entries()),
+    },
+  };
+}
+
 /** Returns `text` with every recognized credential replaced by `[REDACTED: <KIND>]`. */
 export function redactSecrets(text: string): string {
-  let out = text;
-  for (const rule of SECRET_RULES) {
-    out = out.replace(rule.pattern, rule.replacement);
-  }
-  return out;
+  return redactSecretsWithReport(text).text;
 }

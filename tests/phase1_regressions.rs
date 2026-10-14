@@ -250,7 +250,10 @@ fn packed_output_masks_secrets_in_every_format() {
             !output.contains(concat!("AK", "IAIOSFODNN7EXAMPLE")),
             "{format:?}: {output}"
         );
-        assert!(!output.contains(concat!("Sup", "3r")), "{format:?}: {output}");
+        assert!(
+            !output.contains(concat!("Sup", "3r")),
+            "{format:?}: {output}"
+        );
         assert!(
             output.contains("[REDACTED: AWS_ACCESS_KEY]"),
             "{format:?}: {output}"
@@ -353,4 +356,179 @@ fn malformed_pttignore_still_fails_closed() {
     fs::write(dir.path().join(".pttignore"), "\\\n").unwrap();
     fs::write(dir.path().join("ok.txt"), "ok").unwrap();
     assert!(walk(dir.path()).is_err());
+}
+
+#[test]
+fn parallel_pack_is_byte_for_byte_deterministic_and_respects_no_redact() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut entries = Vec::new();
+    let tok = concat!("sk-ant-", "api03-abcdefghijklmnopqrstuvwx");
+    for i in 0..80 {
+        let sub = dir.path().join(format!("pkg_{}", i / 10));
+        fs::create_dir_all(&sub).unwrap();
+        let rel = format!("pkg_{}/file_{i:02}.rs", i / 10);
+        let content = if i == 42 {
+            format!(
+                "// secret {tok}\npub fn f_{i}() -> usize {{\n    let a = {i};\n    a + 1\n}}\n"
+            )
+        } else {
+            format!("pub fn f_{i}() -> usize {{\n    let a = {i};\n    a + 1\n}}\n")
+        };
+        fs::write(dir.path().join(&rel), &content).unwrap();
+        entries.push(DirEntryMeta {
+            path: PathBuf::from(rel),
+            is_dir: false,
+            size: Some(content.len() as u64),
+        });
+    }
+
+    // Sequential via write_output_cancellable vs parallel via write_output_with_stats
+    let opts = WriteOptions {
+        format: OutputFormat::Xml,
+        compute_bpe_tokens: true,
+        ..Default::default()
+    };
+    let mut seq_buf = Vec::new();
+    write_output_cancellable(&mut seq_buf, &entries, dir.path(), &opts, &|| false).unwrap();
+
+    let mut par_buf = Vec::new();
+    let stats =
+        ptt::write_output_with_stats(&mut par_buf, &entries, dir.path(), &opts, &|| false).unwrap();
+
+    assert_eq!(
+        seq_buf, par_buf,
+        "parallel output must match sequential output"
+    );
+    assert_eq!(stats.files_packed, 80);
+    assert_eq!(stats.redactions.total_redactions, 1);
+    assert!(stats.total_tokens > 80);
+
+    // Verify --no-redact leaves token intact when explicitly requested
+    let mut unredacted_buf = Vec::new();
+    let no_redact_opts = WriteOptions {
+        redact_secrets: false,
+        ..opts
+    };
+    let unredacted_stats = ptt::write_output_with_stats(
+        &mut unredacted_buf,
+        &entries,
+        dir.path(),
+        &no_redact_opts,
+        &|| false,
+    )
+    .unwrap();
+    let unredacted_str = String::from_utf8(unredacted_buf).unwrap();
+    assert!(unredacted_str.contains(tok));
+    assert_eq!(unredacted_stats.redactions.total_redactions, 0);
+}
+
+#[test]
+fn skeleton_mode_and_task_instructions_ordering() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "pub struct Item { pub id: u32 }\npub fn process(item: &Item) -> u32 {\n    let x = item.id + 10;\n    let y = x * 2;\n    y\n}\n";
+    fs::write(dir.path().join("lib.rs"), code).unwrap();
+    let entries = vec![DirEntryMeta {
+        path: PathBuf::from("lib.rs"),
+        is_dir: false,
+        size: Some(code.len() as u64),
+    }];
+
+    let opts = WriteOptions {
+        format: OutputFormat::Xml,
+        skeleton_all: true,
+        git_diff: Some("diff --git a/lib.rs b/lib.rs\n+let y = x * 2;".into()),
+        task_prompt: Some("Audit Item::process for overflow.".into()),
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    write_output(&mut buf, &entries, dir.path(), &opts).unwrap();
+    let xml = String::from_utf8(buf).unwrap();
+
+    assert!(
+        xml.contains("<file path=\"lib.rs\" mode=\"skeleton\">"),
+        "{xml}"
+    );
+    assert!(xml.contains("{ /* ... */ }"), "{xml}");
+    assert!(!xml.contains("let x = item.id + 10;"), "{xml}");
+    assert!(xml.contains("<git_diff>"), "{xml}");
+    assert!(xml.contains("<task_instructions>"), "{xml}");
+
+    // Verify <files> precedes <git_diff> which precedes <task_instructions>
+    let files_pos = xml.find("</files>").unwrap();
+    let diff_pos = xml.find("<git_diff>").unwrap();
+    let task_pos = xml.find("<task_instructions>").unwrap();
+    assert!(files_pos < diff_pos && diff_pos < task_pos, "{xml}");
+}
+
+#[test]
+fn files_section_emits_source_before_docs_and_structure_stays_alphabetical() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (rel, body) in [
+        (".github/workflows/ci.yml", "name: ci\n"),
+        ("README.md", "# readme\n"),
+        ("gen/schemas/acl.json", "{}\n"),
+        ("src/main.rs", "fn main() {}\n"),
+        ("tests/smoke.rs", "#[test] fn t() {}\n"),
+        ("Cargo.toml", "[package]\n"),
+    ] {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+    let mut entries = walk(root).unwrap();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut buf = Vec::new();
+    write_output(&mut buf, &entries, root, &WriteOptions::default()).unwrap();
+    let xml = String::from_utf8(buf).unwrap();
+
+    let structure = &xml[xml.find("<directory_structure>").unwrap()..];
+    let structure = &structure[..structure.find("</directory_structure>").unwrap()];
+    let listed: Vec<&str> = structure
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains('/') || l.contains('.'))
+        .collect();
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    assert_eq!(listed, sorted, "directory_structure must stay alphabetical");
+
+    let pos = |p: &str| {
+        xml.find(&format!("<file path=\"{p}\""))
+            .unwrap_or_else(|| panic!("{p} missing from <files>: {xml}"))
+    };
+    // Tiers: source (0) < manifests (1) < tests (2) < docs and CI metadata (3).
+    assert!(pos("src/main.rs") < pos("Cargo.toml"), "{xml}");
+    assert!(pos("Cargo.toml") < pos("tests/smoke.rs"), "{xml}");
+    assert!(pos("tests/smoke.rs") < pos("README.md"), "{xml}");
+    assert!(
+        pos("tests/smoke.rs") < pos(".github/workflows/ci.yml"),
+        "{xml}"
+    );
+}
+
+#[test]
+fn packing_own_repository_never_triggers_self_redaction_in_source_or_docs() {
+    // Ensure our own source and documentation contain zero raw credentials that would be
+    // mutated by redact_secrets_with_report when ptt packs its own repo.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        "src/core/secrets.rs",
+        "tests/phase1_regressions.rs",
+        "ui/src/secrets.ts",
+        "ui/e2e/secrets.spec.ts",
+        "README.md",
+        "CHANGELOG.md",
+        "SECURITY.md",
+    ] {
+        let content = fs::read_to_string(repo_root.join(rel)).unwrap();
+        let (redacted, summary) = ptt::redact_secrets_with_report(&content);
+        assert_eq!(
+            summary.total_redactions, 0,
+            "{rel} triggered {} self-redactions: {:?}",
+            summary.total_redactions, summary.kinds
+        );
+        assert_eq!(redacted, content, "{rel} was modified by self-redaction");
+    }
 }

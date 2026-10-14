@@ -1,4 +1,6 @@
 use crate::core::{
+    deps::DependencyGraph,
+    git::{inspect_git_context, GitRepoContext},
     preview::resolve_under_canonical_root,
     walker::{walk, DirEntryMeta, SelectionMatcher},
 };
@@ -7,16 +9,43 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
+    time::SystemTime,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExistingIgnoreRule {
+    relative: PathBuf,
+    mtime: Option<SystemTime>,
+    len: u64,
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
+struct IndexedDirectory {
+    relative: PathBuf,
+    mtime: Option<SystemTime>,
+}
+
 pub struct WorkspaceSnapshot {
     pub root: PathBuf,
     pub revision: u64,
     pub entries: Vec<DirEntryMeta>,
-    rules: Vec<(PathBuf, Option<Vec<u8>>)>,
+    pub git_context: GitRepoContext,
+    existing_rules: Vec<ExistingIgnoreRule>,
+    directories: Vec<IndexedDirectory>,
+    dep_graph: OnceLock<DependencyGraph>,
+}
+
+impl std::fmt::Debug for WorkspaceSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceSnapshot")
+            .field("root", &self.root)
+            .field("revision", &self.revision)
+            .field("entries_len", &self.entries.len())
+            .finish()
+    }
 }
 
 #[derive(Default)]
@@ -26,14 +55,30 @@ pub struct WorkspaceIndex {
 }
 
 /// `root` must already be canonical (see `WorkspaceIndex::scan`).
-fn rule_bytes(root: &Path, relative: &Path) -> Result<Option<Vec<u8>>, String> {
+fn inspect_rule(root: &Path, relative: &Path) -> Result<Option<ExistingIgnoreRule>, String> {
     match resolve_under_canonical_root(root, &relative.to_string_lossy()) {
-        Ok(path) => std::fs::read(path)
-            .map(Some)
-            .map_err(|error| error.to_string()),
+        Ok(path) => {
+            let meta = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            Ok(Some(ExistingIgnoreRule {
+                relative: relative.to_path_buf(),
+                mtime: meta.modified().ok(),
+                len: meta.len(),
+                bytes,
+            }))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn dir_mtime(root: &Path, relative: &Path) -> Option<SystemTime> {
+    let path = if relative.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(relative)
+    };
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 impl WorkspaceIndex {
@@ -41,26 +86,41 @@ impl WorkspaceIndex {
         let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
         let root = path.canonicalize().map_err(|error| error.to_string())?;
         let entries = walk(&root).map_err(|error| error.to_string())?;
-        let mut directories: HashSet<PathBuf> = entries
+        let git_context = inspect_git_context(&root);
+
+        let mut dir_set: HashSet<PathBuf> = entries
             .iter()
             .filter(|entry| entry.is_dir)
             .map(|entry| entry.path.clone())
             .collect();
-        directories.insert(PathBuf::new());
-        let mut rules = Vec::new();
-        for directory in directories {
+        dir_set.insert(PathBuf::new());
+
+        let mut existing_rules = Vec::new();
+        let mut directories = Vec::with_capacity(dir_set.len());
+
+        for directory in dir_set {
             for name in [".pttignore", ".gitignore"] {
                 let relative = directory.join(name);
-                rules.push((relative.clone(), rule_bytes(&root, &relative)?));
+                if let Some(rule) = inspect_rule(&root, &relative)? {
+                    existing_rules.push(rule);
+                }
             }
+            directories.push(IndexedDirectory {
+                mtime: dir_mtime(&root, &directory),
+                relative: directory,
+            });
         }
+
         // The root is canonical and returned to the frontend; revisions reject
         // stale generation requests, even when reopening the same path.
         let snapshot = Arc::new(WorkspaceSnapshot {
             root,
             revision,
             entries,
-            rules,
+            git_context,
+            existing_rules,
+            directories,
+            dep_graph: OnceLock::new(),
         });
         let mut current = self.current.lock().map_err(|_| "Workspace lock poisoned")?;
         if self.revision.load(Ordering::SeqCst) != revision {
@@ -84,12 +144,58 @@ impl WorkspaceIndex {
         {
             return Err("Workspace changed; refresh the project".into());
         }
-        for (relative, expected) in &snapshot.rules {
-            if &rule_bytes(&snapshot.root, relative)? != expected {
-                return Err("Ignore rules changed; refresh the project before packing".into());
+
+        // 1. Validate existing ignore files: if (mtime, len) matches, skip reading file content;
+        //    if (mtime, len) differs or mtime is unavailable, compare bytes.
+        let mut existing_paths: HashSet<PathBuf> =
+            HashSet::with_capacity(snapshot.existing_rules.len());
+        for rule in &snapshot.existing_rules {
+            existing_paths.insert(rule.relative.clone());
+            match resolve_under_canonical_root(&snapshot.root, &rule.relative.to_string_lossy()) {
+                Ok(full_path) => {
+                    let meta = std::fs::metadata(&full_path)
+                        .map_err(|_| "Ignore rules changed; refresh the project before packing")?;
+                    let same_stat = rule.mtime.is_some()
+                        && meta.modified().ok() == rule.mtime
+                        && meta.len() == rule.len;
+                    if !same_stat {
+                        let bytes = std::fs::read(&full_path).map_err(|e| e.to_string())?;
+                        if bytes != rule.bytes {
+                            return Err(
+                                "Ignore rules changed; refresh the project before packing".into()
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    return Err("Ignore rules changed; refresh the project before packing".into());
+                }
             }
         }
+
+        // 2. For directories whose mtime changed (or where mtime is unavailable), check if a new
+        //    `.pttignore` or `.gitignore` was created since the scan.
+        for dir in &snapshot.directories {
+            let current_mtime = dir_mtime(&snapshot.root, &dir.relative);
+            if dir.mtime.is_some() && current_mtime == dir.mtime {
+                continue;
+            }
+            for name in [".pttignore", ".gitignore"] {
+                let candidate = dir.relative.join(name);
+                if existing_paths.contains(&candidate) {
+                    continue;
+                }
+                if inspect_rule(&snapshot.root, &candidate)?.is_some() {
+                    return Err("Ignore rules changed; refresh the project before packing".into());
+                }
+            }
+        }
+
         Ok(snapshot)
+    }
+
+    pub fn current_snapshot(&self) -> Option<Arc<WorkspaceSnapshot>> {
+        self.current.lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -101,6 +207,11 @@ impl WorkspaceSnapshot {
             .filter(|entry| !entry.is_dir && matcher.is_selected(&entry.path))
             .cloned()
             .collect()
+    }
+
+    pub fn dependency_graph(&self) -> &DependencyGraph {
+        self.dep_graph
+            .get_or_init(|| DependencyGraph::build(&self.root, &self.entries))
     }
 }
 

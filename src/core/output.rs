@@ -1,20 +1,33 @@
 //! High-quality output generation (XML is the primary recommended format for LLMs).
 //!
-//! Follows repomix / Anthropic best practices for XML-tagged context.
+//! Follows repomix / Anthropic best practices for XML-tagged context, including:
+//! - Parallel file reading, UTF-8/UTF-16 decoding, secret redaction, AST skeletonizing,
+//!   and exact BPE tokenization via `rayon`
+//! - Directory-level canonical root cache so `resolve_under_canonical_root` only checks
+//!   unique parent directories once
+//! - Optional `<git_diff>` block and Anthropic-optimal `<task_instructions>` placement
+//!   at the end of the prompt.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::core::preview::resolve_under_canonical_root;
-use crate::core::secrets::redact_secrets;
-use crate::core::text::{decode_text, markdown_fence, TextError};
-use crate::core::walker::{normalize_rel_path, DirEntryMeta};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::core::preview::{is_link, resolve_under_canonical_root};
+use crate::core::secrets::{redact_secrets_with_report, RedactionSummary};
+use crate::core::skeleton::{extract_skeleton, language_for_path};
+use crate::core::text::{decode_text, markdown_fence, TextError};
+use crate::core::tokenizer::{count_tokens_with_model, TokenizerModel};
+use crate::core::walker::{normalize_rel_path, DirEntryMeta};
 
 /// Default per-file size limit when the caller does not specify one.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     #[default]
     Xml,
@@ -23,12 +36,45 @@ pub enum OutputFormat {
     Plain,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilePackMode {
+    #[default]
+    Full,
+    Skeleton,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTokenStat {
+    pub path: String,
+    pub bytes: usize,
+    pub tokens: usize,
+    pub mode: FilePackMode,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackStats {
+    pub files_packed: usize,
+    pub total_tokens: usize,
+    pub file_tokens: Vec<FileTokenStat>,
+    pub redactions: RedactionSummary,
+}
+
 /// Options for packing files into LLM-ready text.
 #[derive(Clone, Debug)]
 pub struct WriteOptions {
     pub format: OutputFormat,
     pub include_file_summary: bool,
     pub max_file_size: u64,
+    pub redact_secrets: bool,
+    pub skeleton_all: bool,
+    pub skeleton_files: HashSet<String>,
+    pub git_diff: Option<String>,
+    pub task_prompt: Option<String>,
+    pub tokenizer_model: TokenizerModel,
+    pub compute_bpe_tokens: bool,
 }
 
 impl Default for WriteOptions {
@@ -37,8 +83,25 @@ impl Default for WriteOptions {
             format: OutputFormat::Xml,
             include_file_summary: true,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            redact_secrets: true,
+            skeleton_all: false,
+            skeleton_files: HashSet::new(),
+            git_diff: None,
+            task_prompt: None,
+            tokenizer_model: TokenizerModel::O200kBase,
+            compute_bpe_tokens: false,
         }
     }
+}
+
+struct PreparedFile {
+    path: String,
+    ext: String,
+    size: Option<u64>,
+    mode: FilePackMode,
+    content: String,
+    tokens: usize,
+    redactions: RedactionSummary,
 }
 
 /// Main high-quality writer.
@@ -62,14 +125,167 @@ pub fn write_output_cancellable<W: Write>(
 ) -> std::io::Result<()> {
     let canonical_root = std::fs::canonicalize(root)?;
     let root = canonical_root.as_path();
-    let files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+    let files: Vec<&DirEntryMeta> = entries.iter().filter(|e| !e.is_dir).collect();
+    let valid_parents = build_valid_parent_cache(root, &files);
+    let ordered = architectural_order(&files);
 
     match options.format {
-        OutputFormat::Xml => write_xml(writer, &files, root, options, cancelled),
-        OutputFormat::Markdown => write_markdown(writer, &files, root, options, cancelled),
-        OutputFormat::Json => write_json(writer, &files, root, options, cancelled),
-        OutputFormat::Plain => write_plain(writer, &files, root, options, cancelled),
+        OutputFormat::Xml => {
+            write_xml_header(writer, &files, root, options)?;
+            for f in &ordered {
+                ensure_not_cancelled(cancelled)?;
+                let pf = prepare_single_file(f, root, &valid_parents, options);
+                write_xml_file_entry(writer, &pf)?;
+            }
+            write_xml_footer(writer, options)
+        }
+        OutputFormat::Markdown => {
+            write_markdown_header(writer, root, options)?;
+            for f in &ordered {
+                ensure_not_cancelled(cancelled)?;
+                let pf = prepare_single_file(f, root, &valid_parents, options);
+                write_markdown_file_entry(writer, &pf)?;
+            }
+            write_markdown_footer(writer, options)
+        }
+        OutputFormat::Json => {
+            let mut prepared = Vec::with_capacity(files.len());
+            for f in &ordered {
+                ensure_not_cancelled(cancelled)?;
+                prepared.push(prepare_single_file(f, root, &valid_parents, options));
+            }
+            write_json_prepared(writer, &prepared, root, options)
+        }
+        OutputFormat::Plain => {
+            write_plain_header(writer, root, options)?;
+            for f in &ordered {
+                ensure_not_cancelled(cancelled)?;
+                let pf = prepare_single_file(f, root, &valid_parents, options);
+                write_plain_file_entry(writer, &pf)?;
+            }
+            write_plain_footer(writer, options)
+        }
     }
+}
+
+/// Parallelized writer that also returns [`PackStats`] (redaction summary + per-file token stats).
+pub fn write_output_with_stats<W, F>(
+    writer: &mut W,
+    entries: &[DirEntryMeta],
+    root: &Path,
+    options: &WriteOptions,
+    cancelled: &F,
+) -> std::io::Result<PackStats>
+where
+    W: Write,
+    F: Fn() -> bool + Sync,
+{
+    let canonical_root = std::fs::canonicalize(root)?;
+    let root = canonical_root.as_path();
+    let files: Vec<&DirEntryMeta> = entries.iter().filter(|e| !e.is_dir).collect();
+
+    let ordered = architectural_order(&files);
+    let prepared = prepare_files_parallel(&ordered, root, options, cancelled)?;
+
+    match options.format {
+        OutputFormat::Xml => write_xml_prepared(writer, &files, &prepared, root, options)?,
+        OutputFormat::Markdown => write_markdown_prepared(writer, &prepared, root, options)?,
+        OutputFormat::Json => write_json_prepared(writer, &prepared, root, options)?,
+        OutputFormat::Plain => write_plain_prepared(writer, &prepared, root, options)?,
+    }
+
+    let mut stats = PackStats {
+        files_packed: prepared.len(),
+        total_tokens: 0,
+        file_tokens: Vec::with_capacity(prepared.len()),
+        redactions: RedactionSummary::default(),
+    };
+
+    for pf in prepared {
+        stats.total_tokens += pf.tokens;
+        stats.redactions.merge(&pf.redactions);
+        stats.file_tokens.push(FileTokenStat {
+            path: pf.path,
+            bytes: pf.content.len(),
+            tokens: pf.tokens,
+            mode: pf.mode,
+        });
+    }
+
+    if options.compute_bpe_tokens {
+        if let Some(diff) = &options.git_diff {
+            stats.total_tokens += count_tokens_with_model(diff, options.tokenizer_model);
+        }
+        if let Some(prompt) = &options.task_prompt {
+            stats.total_tokens += count_tokens_with_model(prompt, options.tokenizer_model);
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Architectural emission tier for `<files>` content (lower is emitted first). Truncating a pack
+/// from the bottom then drops docs and CI metadata before source code. `<directory_structure>`
+/// stays alphabetical and is unaffected.
+///
+/// 0 = source and entrypoints, 1 = manifests and build configs, 2 = tests and examples,
+/// 3 = documentation, CI metadata and everything else.
+pub fn architectural_tier(rel: &str) -> u8 {
+    let lower = normalize_rel_path(Path::new(rel)).to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+
+    const MANIFESTS: &[&str] = &[
+        "cargo.toml",
+        "package.json",
+        "tauri.conf.json",
+        "pyproject.toml",
+        "go.mod",
+        "makefile",
+        "dockerfile",
+        "build.rs",
+    ];
+    if MANIFESTS.contains(&name) || (name.starts_with("tsconfig") && name.ends_with(".json")) {
+        return 1;
+    }
+
+    fn in_dir(lower: &str, dir: &str) -> bool {
+        lower.starts_with(&format!("{dir}/")) || lower.contains(&format!("/{dir}/"))
+    }
+    let is_test_name = name.contains(".test.")
+        || name.contains(".spec.")
+        || name.contains("_test.")
+        || name.starts_with("test_");
+    if is_test_name
+        || ["tests", "e2e", "examples", "benches"]
+            .iter()
+            .any(|d| in_dir(&lower, d))
+    {
+        return 2;
+    }
+
+    const SOURCE_DIRS: &[&str] = &[
+        "src", "lib", "app", "pkg", "cmd", "internal", "crates", "packages",
+    ];
+    const SOURCE_EXTS: &[&str] = &[
+        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".cs", ".java", ".c", ".cpp", ".h",
+        ".hpp",
+    ];
+    let is_root_source = !lower.contains('/') && SOURCE_EXTS.iter().any(|e| lower.ends_with(e));
+    if is_root_source || SOURCE_DIRS.iter().any(|d| in_dir(&lower, d)) {
+        return 0;
+    }
+
+    3
+}
+
+/// `files` ordered for content emission: by [`architectural_tier`], then by path.
+fn architectural_order<'a>(files: &[&'a DirEntryMeta]) -> Vec<&'a DirEntryMeta> {
+    let mut ordered: Vec<&DirEntryMeta> = files.to_vec();
+    ordered.sort_by_cached_key(|f| {
+        let rel = normalize_rel_path(&f.path);
+        (architectural_tier(&rel), rel)
+    });
+    ordered
 }
 
 fn ensure_not_cancelled(cancelled: &dyn Fn() -> bool) -> std::io::Result<()> {
@@ -81,6 +297,161 @@ fn ensure_not_cancelled(cancelled: &dyn Fn() -> bool) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Validates unique parent directories once against `canonical_root`, caching valid canonical
+/// parent paths in a `HashMap<PathBuf, PathBuf>`.
+fn build_valid_parent_cache(root: &Path, files: &[&DirEntryMeta]) -> HashMap<PathBuf, PathBuf> {
+    let mut unique_parents: HashSet<PathBuf> = HashSet::new();
+    for f in files {
+        let parent = f.path.parent().unwrap_or(Path::new("")).to_path_buf();
+        unique_parents.insert(parent);
+    }
+
+    let mut valid_parents = HashMap::with_capacity(unique_parents.len());
+    for parent in unique_parents {
+        if parent.as_os_str().is_empty() || parent == Path::new(".") {
+            valid_parents.insert(parent, root.to_path_buf());
+        } else if let Ok(canon_dir) = resolve_under_canonical_root(root, &parent.to_string_lossy())
+        {
+            if canon_dir.is_dir() {
+                valid_parents.insert(parent, canon_dir);
+            }
+        }
+    }
+    valid_parents
+}
+
+/// Resolves a file path using the pre-validated parent directory cache, while still checking
+/// the file's own `symlink_metadata` (`!is_link`) and `canonicalize().starts_with(root)`.
+fn resolve_file_with_parent_cache(
+    root: &Path,
+    relative: &Path,
+    valid_parents: &HashMap<PathBuf, PathBuf>,
+) -> std::io::Result<PathBuf> {
+    let rel_str = relative.to_string_lossy();
+    if rel_str.is_empty() || rel_str == "." || Path::new(rel_str.as_ref()).is_absolute() {
+        return resolve_under_canonical_root(root, &rel_str);
+    }
+    // Check that the filename itself is a single normal component
+    let Some(file_name) = relative.file_name() else {
+        return resolve_under_canonical_root(root, &rel_str);
+    };
+    let parent = relative.parent().unwrap_or(Path::new(""));
+    let Some(canon_parent) = valid_parents.get(parent) else {
+        // Fallback to full component-by-component check so error kind is preserved
+        return resolve_under_canonical_root(root, &rel_str);
+    };
+    let joined = canon_parent.join(file_name);
+    let metadata = std::fs::symlink_metadata(&joined)?;
+    if is_link(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "symlinks and reparse points are not allowed",
+        ));
+    }
+    let full = std::fs::canonicalize(&joined)?;
+    if !full.starts_with(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is outside the project root",
+        ));
+    }
+    Ok(full)
+}
+
+fn prepare_single_file(
+    f: &DirEntryMeta,
+    root: &Path,
+    valid_parents: &HashMap<PathBuf, PathBuf>,
+    options: &WriteOptions,
+) -> PreparedFile {
+    let path_str = display_path(&f.path);
+    let ext = f
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mode = if options.skeleton_all || options.skeleton_files.contains(&path_str) {
+        FilePackMode::Skeleton
+    } else {
+        FilePackMode::Full
+    };
+
+    let (raw_content, redactions, is_text_ok) = read_and_redact_file(
+        root,
+        &f.path,
+        valid_parents,
+        options.max_file_size,
+        options.redact_secrets,
+    );
+
+    let content = if is_text_ok && mode == FilePackMode::Skeleton {
+        let lang = language_for_path(&f.path);
+        extract_skeleton(&raw_content, lang)
+    } else {
+        raw_content
+    };
+
+    let tokens = if options.compute_bpe_tokens {
+        count_tokens_with_model(&content, options.tokenizer_model)
+    } else {
+        ((content.len() as f64) / 3.8).round() as usize
+    };
+
+    PreparedFile {
+        path: path_str,
+        ext,
+        size: f.size,
+        mode,
+        content,
+        tokens,
+        redactions,
+    }
+}
+
+fn prepare_files_parallel<F>(
+    files: &[&DirEntryMeta],
+    root: &Path,
+    options: &WriteOptions,
+    cancelled: &F,
+) -> std::io::Result<Vec<PreparedFile>>
+where
+    F: Fn() -> bool + Sync,
+{
+    let valid_parents = build_valid_parent_cache(root, files);
+
+    // For small file counts, process sequentially so deterministic per-file cancellation tests
+    // (like `superseded_pack_stops_before_reading_next_file`) behave identically.
+    if files.len() < 16 {
+        let mut out = Vec::with_capacity(files.len());
+        for f in files {
+            ensure_not_cancelled(cancelled)?;
+            out.push(prepare_single_file(f, root, &valid_parents, options));
+        }
+        return Ok(out);
+    }
+
+    // Process in parallel chunks of 64 to keep memory bounded and check cancellation promptly
+    let mut out = Vec::with_capacity(files.len());
+    for chunk in files.chunks(64) {
+        ensure_not_cancelled(cancelled)?;
+        let chunk_results: Result<Vec<PreparedFile>, std::io::Error> = chunk
+            .par_iter()
+            .map(|f| {
+                if cancelled() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "output superseded by a newer request",
+                    ));
+                }
+                Ok(prepare_single_file(f, root, &valid_parents, options))
+            })
+            .collect();
+        out.extend(chunk_results?);
+    }
+    Ok(out)
 }
 
 fn display_path(path: &Path) -> String {
@@ -119,12 +490,11 @@ fn write_cdata<W: Write>(w: &mut W, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_xml<W: Write>(
+fn write_xml_header<W: Write>(
     w: &mut W,
     files: &[&DirEntryMeta],
     root: &Path,
     options: &WriteOptions,
-    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     let root_disp = escape_xml_attr(&root_label(root));
     writeln!(w, "<project_context>")?;
@@ -162,28 +532,73 @@ fn write_xml<W: Write>(
         writeln!(w, "    {}", display_path(&f.path))?;
     }
     writeln!(w, "  </directory_structure>")?;
-
     writeln!(w, "  <files>")?;
-    for f in files {
-        ensure_not_cancelled(cancelled)?;
-        let content = read_file_content(root, &f.path, options.max_file_size);
-        let path_attr = escape_xml_attr(&display_path(&f.path));
-
-        writeln!(w, "    <file path=\"{path_attr}\">")?;
-        write_cdata(w, &content)?;
-        writeln!(w, "    </file>")?;
-    }
-    writeln!(w, "  </files>")?;
-    writeln!(w, "</project_context>")?;
     Ok(())
 }
 
-fn write_markdown<W: Write>(
+fn write_xml_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io::Result<()> {
+    let path_attr = escape_xml_attr(&pf.path);
+    match pf.mode {
+        FilePackMode::Full => writeln!(w, "    <file path=\"{path_attr}\">")?,
+        FilePackMode::Skeleton => writeln!(w, "    <file path=\"{path_attr}\" mode=\"skeleton\">")?,
+    }
+    write_cdata(w, &pf.content)?;
+    writeln!(w, "    </file>")
+}
+
+fn write_xml_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Result<()> {
+    writeln!(w, "  </files>")?;
+
+    if let Some(diff) = options
+        .git_diff
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let diff_text = if options.redact_secrets {
+            redact_secrets_with_report(diff).0
+        } else {
+            std::borrow::Cow::Borrowed(diff)
+        };
+        writeln!(w, "  <git_diff>")?;
+        write_cdata(w, &diff_text)?;
+        writeln!(w, "  </git_diff>")?;
+    }
+
+    if let Some(prompt) = options
+        .task_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        writeln!(w, "  <task_instructions>")?;
+        for line in prompt.lines() {
+            writeln!(w, "    {line}")?;
+        }
+        writeln!(w, "  </task_instructions>")?;
+    }
+
+    writeln!(w, "</project_context>")
+}
+
+fn write_xml_prepared<W: Write>(
     w: &mut W,
     files: &[&DirEntryMeta],
+    prepared: &[PreparedFile],
     root: &Path,
     options: &WriteOptions,
-    cancelled: &dyn Fn() -> bool,
+) -> std::io::Result<()> {
+    write_xml_header(w, files, root, options)?;
+    for pf in prepared {
+        write_xml_file_entry(w, pf)?;
+    }
+    write_xml_footer(w, options)
+}
+
+fn write_markdown_header<W: Write>(
+    w: &mut W,
+    root: &Path,
+    options: &WriteOptions,
 ) -> std::io::Result<()> {
     writeln!(w, "# Project Context")?;
     writeln!(w, "Generated from: `{}`", root_label(root))?;
@@ -191,53 +606,119 @@ fn write_markdown<W: Write>(
         w,
         "Reading info: Files processed with size/binary limits (max {} bytes) and encoding handling.\n",
         options.max_file_size
-    )?;
+    )
+}
 
-    for f in files {
-        ensure_not_cancelled(cancelled)?;
-        let content = read_file_content(root, &f.path, options.max_file_size);
-        let ext = f.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let path = display_path(&f.path);
-
-        let fence = markdown_fence(&content);
-
-        writeln!(w, "## `{path}`")?;
-        writeln!(w, "{fence}{ext}")?;
-        writeln!(w, "{content}")?;
-        writeln!(w, "{fence}")?;
-        writeln!(w)?;
+fn write_markdown_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io::Result<()> {
+    let fence = markdown_fence(&pf.content);
+    match pf.mode {
+        FilePackMode::Full => writeln!(w, "## `{}`", pf.path)?,
+        FilePackMode::Skeleton => writeln!(w, "## `{}` *(skeleton)*", pf.path)?,
     }
+    writeln!(w, "{fence}{}", pf.ext)?;
+    writeln!(w, "{}", pf.content)?;
+    writeln!(w, "{fence}")?;
+    writeln!(w)
+}
+
+fn write_markdown_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Result<()> {
+    if let Some(diff) = options
+        .git_diff
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let diff_text = if options.redact_secrets {
+            redact_secrets_with_report(diff).0
+        } else {
+            std::borrow::Cow::Borrowed(diff)
+        };
+        let fence = markdown_fence(&diff_text);
+        writeln!(w, "## Git Diff (`<git_diff>`)")?;
+        writeln!(w, "{fence}diff")?;
+        writeln!(w, "{diff_text}")?;
+        writeln!(w, "{fence}\n")?;
+    }
+
+    if let Some(prompt) = options
+        .task_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        writeln!(w, "<task_instructions>")?;
+        writeln!(w, "{prompt}")?;
+        writeln!(w, "</task_instructions>")?;
+    }
+
     Ok(())
 }
 
-fn write_json<W: Write>(
+fn write_markdown_prepared<W: Write>(
     w: &mut W,
-    files: &[&DirEntryMeta],
+    prepared: &[PreparedFile],
     root: &Path,
     options: &WriteOptions,
-    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
-    let mut file_objs: Vec<Value> = Vec::with_capacity(files.len());
-    for f in files {
-        ensure_not_cancelled(cancelled)?;
-        let content = read_file_content(root, &f.path, options.max_file_size);
-        file_objs.push(json!({
-            "path": display_path(&f.path),
-            "size": f.size,
-            "content": content,
-        }));
+    write_markdown_header(w, root, options)?;
+    for pf in prepared {
+        write_markdown_file_entry(w, pf)?;
+    }
+    write_markdown_footer(w, options)
+}
+
+fn write_json_prepared<W: Write>(
+    w: &mut W,
+    prepared: &[PreparedFile],
+    root: &Path,
+    options: &WriteOptions,
+) -> std::io::Result<()> {
+    let mut file_objs: Vec<Value> = Vec::with_capacity(prepared.len());
+    for pf in prepared {
+        let mut obj = json!({
+            "path": pf.path,
+            "size": pf.size,
+            "content": pf.content,
+        });
+        if pf.mode == FilePackMode::Skeleton {
+            obj["mode"] = json!("skeleton");
+        }
+        file_objs.push(obj);
     }
 
-    let doc = json!({
+    let mut doc = json!({
         "generator": "ptt (ProjectToText)",
         "root": root_label(root),
         "reading_info": format!(
             "Files read with {} byte limit, binary detection, UTF-8 / BOM-declared UTF-16 decoding.",
             options.max_file_size
         ),
-        "file_count": files.len(),
+        "file_count": prepared.len(),
         "files": file_objs,
     });
+
+    if let Some(diff) = options
+        .git_diff
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let diff_text = if options.redact_secrets {
+            redact_secrets_with_report(diff).0.into_owned()
+        } else {
+            diff.to_string()
+        };
+        doc["git_diff"] = json!(diff_text);
+    }
+
+    if let Some(prompt) = options
+        .task_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        doc["task_instructions"] = json!(prompt);
+    }
 
     let pretty = serde_json::to_string_pretty(&doc)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -245,12 +726,10 @@ fn write_json<W: Write>(
     Ok(())
 }
 
-fn write_plain<W: Write>(
+fn write_plain_header<W: Write>(
     w: &mut W,
-    files: &[&DirEntryMeta],
     root: &Path,
     options: &WriteOptions,
-    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<()> {
     writeln!(w, "Project: {}", root_label(root))?;
     writeln!(
@@ -258,16 +737,60 @@ fn write_plain<W: Write>(
         "Reading info: Data read with limits ({} bytes), binary skip, UTF-8 / BOM-declared UTF-16.",
         options.max_file_size
     )?;
-    writeln!(w, "================================\n")?;
+    writeln!(w, "================================\n")
+}
 
-    for f in files {
-        ensure_not_cancelled(cancelled)?;
-        let content = read_file_content(root, &f.path, options.max_file_size);
-        writeln!(w, ">>> {}", display_path(&f.path))?;
-        writeln!(w, "{content}")?;
-        writeln!(w, "--------------------------------\n")?;
+fn write_plain_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io::Result<()> {
+    match pf.mode {
+        FilePackMode::Full => writeln!(w, ">>> {}", pf.path)?,
+        FilePackMode::Skeleton => writeln!(w, ">>> {} [skeleton]", pf.path)?,
     }
+    writeln!(w, "{}", pf.content)?;
+    writeln!(w, "--------------------------------\n")
+}
+
+fn write_plain_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Result<()> {
+    if let Some(diff) = options
+        .git_diff
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let diff_text = if options.redact_secrets {
+            redact_secrets_with_report(diff).0
+        } else {
+            std::borrow::Cow::Borrowed(diff)
+        };
+        writeln!(w, "<git_diff>")?;
+        writeln!(w, "{diff_text}")?;
+        writeln!(w, "</git_diff>\n")?;
+    }
+
+    if let Some(prompt) = options
+        .task_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        writeln!(w, "<task_instructions>")?;
+        writeln!(w, "{prompt}")?;
+        writeln!(w, "</task_instructions>")?;
+    }
+
     Ok(())
+}
+
+fn write_plain_prepared<W: Write>(
+    w: &mut W,
+    prepared: &[PreparedFile],
+    root: &Path,
+    options: &WriteOptions,
+) -> std::io::Result<()> {
+    write_plain_header(w, root, options)?;
+    for pf in prepared {
+        write_plain_file_entry(w, pf)?;
+    }
+    write_plain_footer(w, options)
 }
 
 /// Project folder name only, so packed output never exposes the absolute path.
@@ -278,23 +801,50 @@ fn root_label(root: &Path) -> String {
 }
 
 /// `root` must already be canonical (`write_output` canonicalizes it once).
-fn read_file_content(root: &Path, relative: &Path, max_file_size: u64) -> String {
-    let path = match resolve_under_canonical_root(root, &relative.to_string_lossy()) {
+/// Returns `(content, redaction_summary, is_decoded_text)`.
+fn read_and_redact_file(
+    root: &Path,
+    relative: &Path,
+    valid_parents: &HashMap<PathBuf, PathBuf>,
+    max_file_size: u64,
+    redact: bool,
+) -> (String, RedactionSummary, bool) {
+    let path = match resolve_file_with_parent_cache(root, relative, valid_parents) {
         Ok(path) => path,
-        Err(_) => return "[File skipped: inaccessible or unsafe project path]".into(),
+        Err(_) => {
+            return (
+                "[File skipped: inaccessible or unsafe project path]".into(),
+                RedactionSummary::default(),
+                false,
+            )
+        }
     };
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
-        Err(e) => return format!("[Error reading metadata: {e}]"),
+        Err(e) => {
+            return (
+                format!("[Error reading metadata: {e}]"),
+                RedactionSummary::default(),
+                false,
+            )
+        }
     };
 
     let file_size = meta.len();
     if file_size > max_file_size {
-        return format!("[File too large: {file_size} bytes (limit {max_file_size}), skipped]");
+        return (
+            format!("[File too large: {file_size} bytes (limit {max_file_size}), skipped]"),
+            RedactionSummary::default(),
+            false,
+        );
     }
 
     if !meta.is_file() {
-        return "[File skipped: not a regular file]".into();
+        return (
+            "[File skipped: not a regular file]".into(),
+            RedactionSummary::default(),
+            false,
+        );
     }
     // Enforce the limit while reading too, in case a file grows after metadata.
     use std::io::Read;
@@ -305,19 +855,36 @@ fn read_file_content(root: &Path, relative: &Path, max_file_size: u64) -> String
         Ok(bytes)
     });
     match bytes {
-        Ok(bytes) if bytes.len() as u64 > max_file_size => {
-            format!("[File too large: limit {max_file_size} bytes, skipped]")
-        }
+        Ok(bytes) if bytes.len() as u64 > max_file_size => (
+            format!("[File too large: limit {max_file_size} bytes, skipped]"),
+            RedactionSummary::default(),
+            false,
+        ),
         Ok(bytes) => match decode_text(&bytes, false) {
-            Ok(text) => redact_secrets(&text).into_owned(),
-            Err(TextError::Binary) => {
-                format!("[Binary file - {file_size} bytes, content omitted for LLM safety]")
+            Ok(text) => {
+                if redact {
+                    let (redacted, summary) = redact_secrets_with_report(&text);
+                    (redacted.into_owned(), summary, true)
+                } else {
+                    (text, RedactionSummary::default(), true)
+                }
             }
-            Err(TextError::Encoding) => {
-                "[Invalid text encoding: use UTF-8 or UTF-16 with BOM]".into()
-            }
+            Err(TextError::Binary) => (
+                format!("[Binary file - {file_size} bytes, content omitted for LLM safety]"),
+                RedactionSummary::default(),
+                false,
+            ),
+            Err(TextError::Encoding) => (
+                "[Invalid text encoding: use UTF-8 or UTF-16 with BOM]".into(),
+                RedactionSummary::default(),
+                false,
+            ),
         },
-        Err(_) => "[Error reading project file]".into(),
+        Err(_) => (
+            "[Error reading project file]".into(),
+            RedactionSummary::default(),
+            false,
+        ),
     }
 }
 
@@ -348,7 +915,6 @@ mod tests {
                 size: Some(14),
             },
         ]
-        // silence unused if needed
         .into_iter()
         .map(|mut e| {
             if let Ok(m) = fs::metadata(root.join(&e.path)) {
@@ -368,6 +934,7 @@ mod tests {
             format: OutputFormat::Json,
             include_file_summary: true,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            ..Default::default()
         };
         write_output(&mut buf, &entries, &root, &opts).unwrap();
         let v: Value = serde_json::from_slice(&buf).expect("valid JSON");
@@ -386,6 +953,7 @@ mod tests {
             format: OutputFormat::Xml,
             include_file_summary: true,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            ..Default::default()
         };
         write_output(&mut buf, &entries, &root, &opts).unwrap();
         let s = String::from_utf8(buf).unwrap();
@@ -397,9 +965,6 @@ mod tests {
 
     #[test]
     fn xml_escapes_attribute_special_chars() {
-        // Do not create a real file named with `<>` — those characters are illegal
-        // on Windows. Synthetic DirEntryMeta is enough: missing file yields a
-        // placeholder body, while the path attribute still must be escaped.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let entries = vec![DirEntryMeta {
@@ -418,7 +983,6 @@ mod tests {
             s.contains("path=\"a&amp;b&lt;c&gt;.rs\""),
             "expected escaped path attr, got:\n{s}"
         );
-        // Unit-level coverage for remaining attr entities
         assert_eq!(escape_xml_attr(r#"x"y'z"#), "x&quot;y&apos;z");
     }
 
@@ -437,6 +1001,7 @@ mod tests {
             format: OutputFormat::Plain,
             include_file_summary: false,
             max_file_size: 5,
+            ..Default::default()
         };
         write_output(&mut buf, &entries, root, &opts).unwrap();
         let s = String::from_utf8(buf).unwrap();
