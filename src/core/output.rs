@@ -433,25 +433,21 @@ where
         return Ok(out);
     }
 
-    // Process in parallel chunks of 64 to keep memory bounded and check cancellation promptly
-    let mut out = Vec::with_capacity(files.len());
-    for chunk in files.chunks(64) {
-        ensure_not_cancelled(cancelled)?;
-        let chunk_results: Result<Vec<PreparedFile>, std::io::Error> = chunk
-            .par_iter()
-            .map(|f| {
-                if cancelled() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "output superseded by a newer request",
-                    ));
-                }
-                Ok(prepare_single_file(f, root, &valid_parents, options))
-            })
-            .collect();
-        out.extend(chunk_results?);
-    }
-    Ok(out)
+    // One parallel pass over all files. Chunked passes would join the pool after every chunk,
+    // so work-stealing could not balance uneven files. Each worker checks `cancelled` before
+    // reading; `collect` stops at the first error, which keeps cancellation prompt.
+    files
+        .par_iter()
+        .map(|f| {
+            if cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "output superseded by a newer request",
+                ));
+            }
+            Ok(prepare_single_file(f, root, &valid_parents, options))
+        })
+        .collect()
 }
 
 fn display_path(path: &Path) -> String {
@@ -571,10 +567,10 @@ fn write_xml_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Res
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
+        // The prompt is free text (e.g. `Vec<T>`, `a && b`), so it is wrapped in CDATA like file
+        // contents. Escaping it as plain text would produce invalid XML.
         writeln!(w, "  <task_instructions>")?;
-        for line in prompt.lines() {
-            writeln!(w, "    {line}")?;
-        }
+        write_cdata(w, prompt)?;
         writeln!(w, "  </task_instructions>")?;
     }
 

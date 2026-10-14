@@ -1,6 +1,6 @@
-# Engineering review: 0.4.0
+# Engineering review: 0.4.0 and 0.5.0 hardening
 
-**Scope:** local changes on top of v0.3.0, prepared for release 0.4.0 (2026-10-14). Not a published release until tagged.
+**Scope:** local changes on top of v0.3.0. The 0.4.0 section describes the release prepared on 2026-10-14. The 0.5.0 section describes unreleased hardening work on top of it.
 
 **Status:** regression-driven hardening with measured behavior. No independent certification or competitive ranking.
 
@@ -31,52 +31,73 @@ An earlier self-assessment claiming a “10.0 / 10 panel consensus” was withdr
 - **Secret masking** extended (Anthropic, Google, Stripe, URL passwords, `.env` secrets); documentation placeholders such as `Password=...` are no longer masked.
 - **Default exclusions**: presets leave lockfiles and `gen/schemas/` unchecked. The repository's root `.pttignore` covers its own generated files.
 - **Architectural ordering** of `<files>` content (source, manifests, tests, docs/CI). `<directory_structure>` stays alphabetical.
-- **MCP server** (`ptt mcp`) with three tools.
+- **MCP server** (`ptt mcp`).
 - **File watcher**: `notify` events emit `workspace-changed` in the desktop app.
 - **Virtualized tree** with memoized sorting for large repositories.
 
+## 0.5.0 hardening (unreleased)
+
+- **XML validity**: `<task_instructions>` is wrapped in CDATA in the Rust and browser writers, so prompts containing `<`, `>`, or `&` no longer break the document. A regression test covers this.
+- **MCP sandbox**: every tool's `directory` must stay inside the server's project root. Symlinks and reparse points are rejected. `ptt_get_project_map` checks file size before reading and picks skeleton candidates by architectural tier.
+- **New MCP tools**: `ptt_get_related_files` (1-hop imports, importers, and tests) and `ptt_search_symbols` (named functions, methods, types, classes, and interfaces with exact source and line ranges, via tree-sitter).
+- **Dependency graph**: grouped Rust imports (`use crate::core::{deps::X, git::Y}`) resolve every module. TypeScript `./foo.js` imports resolve to `foo.ts` or `foo.tsx`, and `@/` maps to `src/`. The graph is built in parallel.
+- **Packing**: one parallel pass replaces the 64-file chunks, so uneven files no longer wait on chunk barriers. Tree-sitter parsers are cached per worker thread instead of being created per file. Arrow-function bodies in class fields are elided.
+- **CLI `--max-tokens`**: the heuristic pre-pass upgrades files to skeletons above the budget and drops files only above twice the budget. The final fit uses exact per-file BPE counts: skeleton upgrades first, then drops in priority order, verified by a re-pack. Measured: a 20,000-token budget now gives 19,657 tokens (previously 11,337).
+- **Symbol extraction**: `find_symbols` names C/C++ functions through their declarator, TypeScript/JavaScript functions bound to a variable (reporting the whole declaration, including `export`), and Rust `impl`, `const`, `static`, and `macro_rules!` items.
+- **MCP search and pack**: `ptt_search_symbols` orders files by architectural tier so `src/` results come first, and reads and parses in parallel. `ptt_pack_files` accepts `preset`, `max_tokens`, and `git_diff`, using the same selection code as `ptt pack`.
+- **Desktop tree**: token badges for skeleton-marked files count about 30% of their size, matching the packer.
+
 ## Measurements
 
-Command, from the repository root:
+Commands, from the repository root:
 
 ```bash
 cargo run --release --example selection_benchmark
+cargo build --release --bin ptt
+./target/release/ptt pack . -o out.xml
+./target/release/ptt pack . --preset source --skeleton -o skel.xml
+./target/release/ptt pack . --max-tokens 20000 -o budget.xml
 ```
 
-Single run on macOS arm64 (`rustc 1.97.1`). Values vary with machine, filesystem, and load:
+Single benchmark run on macOS arm64 (`rustc 1.97.1`, 14 rayon threads). Values vary with machine, filesystem, and load:
 
 | Measurement | Result |
 | --- | ---: |
-| Legacy selection predicate, 10,000 paths | 4899.5 ms |
+| Legacy selection predicate, 10,000 paths | 4859.8 ms |
 | New selection matcher, including set construction | 1.0 ms |
-| Initial non-Git scan, 1,000 files | 27.1 ms |
+| Initial non-Git scan, 1,000 files | 27.4 ms |
 | Cached lookup + ignore-rule check + selection | 0.13 ms |
-| Pack of 800 files, sequential | 17.1 ms |
-| Pack of 800 files, parallel (`rayon`) | 15.2 ms (about 1.1× faster in this run) |
-| BPE tokenizer, full source (35 files, 448,618 bytes, `o200k_base`) | 107,932 tokens in 15.2 ms median (≈7.1M tokens/s, ≈28 MiB/s) |
-| AST skeleton extraction, same source | 26.4 ms median |
-| Skeleton compression, ptt's own source (exact BPE tokens) | 107,932 → 26,537 tokens (75.4% reduction) |
+| Pack of 800 files, one thread (same code) | 21.0 ms |
+| Pack of 800 files, default rayon pool | 11.8 ms (about 1.8× faster in this run) |
+| BPE tokenizer, full source (35 files, 477,070 bytes, `o200k_base`) | 114,604 tokens in 20.6 ms median (≈5.6M tokens/s, ≈22 MiB/s) |
+| AST skeleton extraction, same source | 26.9 ms median |
+| Skeleton compression, ptt's own source (exact BPE tokens) | 114,604 → 27,879 tokens (75.7% reduction) |
 
-The tokenizer and skeleton timings are measured separately, after an encoder warm-up, with file reads excluded. Each is the median of three repetitions. An earlier run in the same session reported 75.7% for the same measurement; the source changed between runs, so the figure moves slightly.
+The tokenizer and skeleton timings are measured separately, after an encoder warm-up, with file reads excluded. Packing is measured with BPE counting and secret redaction on. Each figure is the median of three repetitions.
 
-The parallel speedup on 800 small files is modest and varies between runs: 1.25× in the first run and about 1.1× in the latest. Earlier documentation claimed about 2.4×; that figure was not reproduced and is withdrawn.
+Parallel speedup varies between runs: 1.1–1.25× in earlier runs, about 1.8× in the latest. The “sequential” baseline is the same code on a one-thread pool. It is not a measurement of the 0.4.0 chunked implementation, so the effect of removing the chunk barriers has not been measured separately. The earlier 2.4× figure is withdrawn.
 
-Self-pack check on this repository (release CLI, 0.4.0):
+Self-pack checks on this repository (release CLI, 0.5.0 working tree):
 
 | Command | Output | Size | Notes |
 | --- | --- | ---: | --- |
-| `ptt pack .` | 80 files, ~155k tokens | 628 KB | `<files>` begin with `src/`; no `gen/schemas/`, lockfiles, or screenshots in `<directory_structure>` |
-| `ptt pack . --preset source` | 64 files, ~144,104 tokens | 591 KB | Full source |
-| `ptt pack . --preset source --skeleton` | 64 files, ~63,374 tokens | 247 KB | Skeleton mode is well under the 700 KB target |
+| `ptt pack .` | 80 files, ~165k tokens | 671 KB | Under the 700 KB target. `<files>` begin with `src/`. |
+| `ptt pack . --preset source --skeleton` | 64 files, ~65k tokens | 254 KB | Skeleton mode for smaller packs. |
+| `ptt pack . --max-tokens 20000` | 49 files, ~19.7k tokens (98% of budget) | — | Exact BPE count stays within the budget. |
+| `ptt pack . --max-tokens 50000` | 62 files, ~48.5k tokens (97% of budget) | — | Exact BPE count stays within the budget. |
 
-The original 350 KB target was not achievable for full source, because `ui/src/App.tsx` alone is about 144 KB. The target was changed to 700 KB by the project owner. The default full pack (628 KB) meets it; skeleton mode is available for smaller packs.
+The 0.4.0 table reported 155k tokens and 628 KB for the default pack. That was measured before the source changed, so those figures are superseded.
+
+The original 350 KB target was not achievable for full source, because `ui/src/App.tsx` alone is about 144 KB. The project owner changed the target to 700 KB.
 
 ## Verification
 
 - `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`: pass.
-- `cargo test --all-targets`: 68 Rust tests pass (42 library, 8 CLI and desktop, 18 integration and regression). The regression suite covers redaction, self-redaction of this repository, parallel determinism, ordering, skeletons, and `<task_instructions>` placement.
+- `cargo test --all-targets`: 77 Rust tests pass (46 library, 12 binary, 19 integration and regression). New tests cover MCP sandboxing, symbol search, related files, grouped Rust imports, `.js` to `.ts` resolution, skeleton element elision, `<task_instructions>` CDATA, and the exact BPE budget.
+- `cargo build --release --bin ptt`: pass.
+- MCP smoke test through the release binary over stdio: `tools/list` returns five tools. `ptt_search_symbols` returns the exact span. `ptt_get_related_files` returns the expected import. A `directory` of `/etc` is rejected.
 - `npm --prefix ui run lint`, `typecheck`, `build`: pass.
-- `npm --prefix ui run test:e2e`: 20 Playwright tests pass in Chromium, including a new browser-mode test for `<files>` ordering and the alphabetical directory listing.
+- `npm --prefix ui run test:e2e`: 20 Playwright tests pass in Chromium.
 - Not run: native desktop tests on macOS, Windows, or Linux; updater and installer flows; the Windows-only junction regression test.
 
 ## Limits
@@ -90,10 +111,11 @@ The original 350 KB target was not achievable for full source, because `ui/src/A
 7. **Native release QA is outstanding.** Installer, signing, notarization, and WebView behavior are not covered by browser tests.
 8. **MSRV is declared, not tested.** `rust-version = "1.90"` comes from the resolved dependency graph. CI builds with `stable`.
 9. **No legacy charset detection.** BOM-less Windows-1252 and similar files must be converted to UTF-8 first.
+10. **MCP symbol search matches name substrings only.** It does not resolve re-exports or aliases.
 
 ## Next milestones
 
 1. Native macOS, Windows, and Linux regression runs, with a path-race threat model.
 2. Automatic tree refresh from the watcher, with incremental index updates.
 3. Secret-scanning evaluation: fixture-based false-positive and false-negative measurements.
-4. Symbol-level MCP retrieval (search and fetch a single function or type) so agents can request exact code without packing whole files.
+4. Before-and-after measurement of the chunk-barrier removal against the 0.4.0 build.

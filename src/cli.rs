@@ -1,6 +1,6 @@
 //! Headless `ptt pack` and `ptt mcp` CLI — same core engine as the desktop app.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufWriter, Write};
@@ -39,7 +39,7 @@ OPTIONS:
       --git-modified      Select only Git modified / staged / untracked files
       --git-branch        Select only files changed on current branch vs base branch
       --git-diff          Include unified <git_diff> in packed output
-      --max-tokens <N>    Auto-fit selection to token budget (<= 90% of N)
+      --max-tokens <N>    Fit the pack within N tokens (exact BPE count)
       --no-redact         Disable automatic secret redaction
       --no-summary        Omit XML file summary (directory listing remains)
       --max-size <N>      Per-file size limit in bytes (default: 2097152)
@@ -320,7 +320,7 @@ fn parse_format(s: &str) -> Result<OutputFormat, String> {
     }
 }
 
-fn parse_preset(s: &str) -> Result<CliPreset, String> {
+pub(crate) fn parse_preset(s: &str) -> Result<CliPreset, String> {
     match s.to_ascii_lowercase().as_str() {
         "source" | "src" => Ok(CliPreset::Source),
         "docs" | "doc" => Ok(CliPreset::Docs),
@@ -436,6 +436,107 @@ fn is_low_priority_path(path: &str) -> bool {
         || lower.ends_with(".txt")
 }
 
+/// Estimated tokens for a file packed as an AST skeleton: about 30% of its full size.
+fn skeleton_cost(tokens: usize) -> usize {
+    tokens * 3 / 10
+}
+
+/// Indices of `files` in the order budget pressure drops them: low-priority paths first, then largest.
+fn drop_priority_order(files: &[DirEntryMeta]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|&a, &b| {
+        let low_a = is_low_priority_path(&normalize_rel_path(&files[a].path));
+        let low_b = is_low_priority_path(&normalize_rel_path(&files[b].path));
+        low_b
+            .cmp(&low_a)
+            .then_with(|| files[b].size.unwrap_or(0).cmp(&files[a].size.unwrap_or(0)))
+    });
+    order
+}
+
+/// Packs `entries` in memory and returns the pack's statistics. Used for exact BPE counts.
+fn pack_stats(
+    entries: &[DirEntryMeta],
+    root: &Path,
+    opts: &WriteOptions,
+) -> Result<ptt::PackStats, String> {
+    let mut sink = Vec::new();
+    write_output_with_stats(&mut sink, entries, root, opts, &|| false).map_err(|e| e.to_string())
+}
+
+/// Fits `entries` within `budget` using exact BPE counts. Returns the kept entries and the skeleton set
+/// to pack them with. Each round packs once and reads the exact per-file counts. An over-budget pack
+/// first upgrades full files to skeletons, lowest priority first, then drops files in the same order,
+/// and packs again. Always keeps at least one file, so a single file over budget is returned as is.
+pub(crate) fn fit_to_bpe_budget(
+    entries: Vec<DirEntryMeta>,
+    root: &Path,
+    opts: &WriteOptions,
+    budget: usize,
+) -> Result<(Vec<DirEntryMeta>, HashSet<String>), String> {
+    let mut opts = opts.clone();
+    opts.compute_bpe_tokens = true;
+    let mut kept = entries;
+    loop {
+        let stats = pack_stats(&kept, root, &opts)?;
+        if stats.total_tokens <= budget || kept.len() <= 1 {
+            return Ok((kept, opts.skeleton_files));
+        }
+        let exact: HashMap<String, usize> = stats
+            .file_tokens
+            .iter()
+            .map(|f| (f.path.clone(), f.tokens))
+            .collect();
+        let tokens_of = |e: &DirEntryMeta| {
+            exact
+                .get(&normalize_rel_path(&e.path))
+                .copied()
+                .unwrap_or(0)
+        };
+        let order = drop_priority_order(&kept);
+        let mut running = stats.total_tokens;
+
+        // Round A: upgrade full files to skeletons, lowest priority first, then pack again.
+        if !opts.skeleton_all {
+            let mut upgraded = false;
+            for &idx in &order {
+                if running <= budget {
+                    break;
+                }
+                let rel = normalize_rel_path(&kept[idx].path);
+                let tok = tokens_of(&kept[idx]);
+                if tok > 30
+                    && !opts.skeleton_files.contains(&rel)
+                    && ptt::core::skeleton::language_for_path(Path::new(&rel)) != "other"
+                {
+                    running = running.saturating_sub(tok * 7 / 10);
+                    opts.skeleton_files.insert(rel);
+                    upgraded = true;
+                }
+            }
+            if upgraded {
+                continue;
+            }
+        }
+
+        // Round B: drop files in priority order until the exact estimate fits, then pack again.
+        // Each round removes at least one file, so the loop always terminates.
+        let mut dropped = HashSet::new();
+        for &idx in &order {
+            if running <= budget || kept.len() - dropped.len() <= 1 {
+                break;
+            }
+            running = running.saturating_sub(tokens_of(&kept[idx]));
+            dropped.insert(idx);
+        }
+        kept = kept
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, e)| (!dropped.contains(&i)).then_some(e))
+            .collect();
+    }
+}
+
 /// Filters and auto-fits `entries` according to `args`. Returns `(filtered_entries, skeleton_files)`.
 pub fn filter_entries_for_cli(
     entries: Vec<DirEntryMeta>,
@@ -513,49 +614,50 @@ pub fn filter_entries_for_cli(
     }
 
     if let Some(budget) = args.max_tokens {
-        let target_limit = ((budget as f64) * 0.90).floor().max(1.0) as usize;
+        // Files already marked for skeleton mode (`--skeleton` or a glob) cost ~30% of their full size.
         let mut total_est: usize = files
             .iter()
-            .map(|f| estimate_tokens_from_bytes(f.size.unwrap_or(0)))
+            .map(|f| {
+                let tok = estimate_tokens_from_bytes(f.size.unwrap_or(0));
+                let rel = normalize_rel_path(&f.path);
+                if args.skeleton || skeleton_files.contains(&rel) {
+                    skeleton_cost(tok)
+                } else {
+                    tok
+                }
+            })
             .sum();
 
-        if total_est > target_limit {
-            // Sort candidate indices: low-priority (tests/docs/locks) first, then largest size first
-            let mut order: Vec<usize> = (0..files.len()).collect();
-            order.sort_by(|&a, &b| {
-                let pa = normalize_rel_path(&files[a].path);
-                let pb = normalize_rel_path(&files[b].path);
-                let low_a = is_low_priority_path(&pa);
-                let low_b = is_low_priority_path(&pb);
-                low_b
-                    .cmp(&low_a)
-                    .then_with(|| files[b].size.unwrap_or(0).cmp(&files[a].size.unwrap_or(0)))
-            });
-
-            // Pass 1: downgrade heavy files to AST Skeleton mode (~70% token reduction)
+        // Pass 1 (heuristic): upgrade heavy files to AST skeleton mode while the estimate exceeds the budget.
+        if total_est > budget {
+            let order = drop_priority_order(&files);
             for &idx in &order {
-                if total_est <= target_limit {
+                if total_est <= budget {
                     break;
                 }
                 let rel = normalize_rel_path(&files[idx].path);
                 let tok = estimate_tokens_from_bytes(files[idx].size.unwrap_or(0));
-                if tok > 20 && !args.skeleton {
+                if tok > 20 && !args.skeleton && !skeleton_files.contains(&rel) {
                     skeleton_files.insert(rel);
-                    let saved = (tok * 7) / 10;
+                    let saved = tok - skeleton_cost(tok);
                     total_est = total_est.saturating_sub(saved);
                 }
             }
+        }
 
-            // Pass 2: if still above target_limit, drop heaviest low-priority/remaining files
+        // Pass 2 (heuristic): pre-drop only when the estimate is far above the budget. The exact counts
+        // in `fit_to_bpe_budget` decide the final fit, so this keeps a 2x margin.
+        if total_est > budget * 2 {
+            let order = drop_priority_order(&files);
             let mut dropped = HashSet::new();
             for &idx in &order {
-                if total_est <= target_limit || files.len() - dropped.len() <= 1 {
+                if total_est <= budget * 2 || files.len() - dropped.len() <= 1 {
                     break;
                 }
                 let rel = normalize_rel_path(&files[idx].path);
                 let tok = estimate_tokens_from_bytes(files[idx].size.unwrap_or(0));
                 let effective = if skeleton_files.contains(&rel) {
-                    tok - (tok * 7) / 10
+                    skeleton_cost(tok)
                 } else {
                     tok
                 };
@@ -587,15 +689,13 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
 
     let entries = walk(&root).map_err(|e| e.to_string())?;
     let (filtered_entries, skeleton_files) = filter_entries_for_cli(entries, &root, args)?;
-    let file_count = filtered_entries.iter().filter(|e| !e.is_dir).count();
-
     let git_diff = if args.git_diff {
         compute_git_diff(&root, 256 * 1024)
     } else {
         None
     };
 
-    let opts = WriteOptions {
+    let mut opts = WriteOptions {
         format: args.format,
         include_file_summary: args.include_summary,
         max_file_size: args.max_file_size,
@@ -607,6 +707,18 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
         tokenizer_model: TokenizerModel::O200kBase,
         compute_bpe_tokens: true,
     };
+
+    // `--max-tokens` is a hard limit on the exact BPE count, not only on the heuristic estimate.
+    let filtered_entries = match args.max_tokens {
+        Some(budget) => {
+            let (entries, skeleton_files) =
+                fit_to_bpe_budget(filtered_entries, &root, &opts, budget)?;
+            opts.skeleton_files = skeleton_files;
+            entries
+        }
+        None => filtered_entries,
+    };
+    let file_count = filtered_entries.iter().filter(|e| !e.is_dir).count();
 
     if args.copy_to_clipboard {
         let mut buf = Vec::new();
@@ -793,6 +905,48 @@ mod tests {
         assert_eq!(desktop_folder(&[]).unwrap(), None);
         assert!(desktop_folder(&["pak".into(), ".".into()]).is_err());
         assert!(desktop_folder(&["--unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn max_tokens_is_enforced_on_the_exact_bpe_count() {
+        let dir = tempdir().unwrap();
+        for i in 0..8 {
+            let body: String = (0..120)
+                .map(|j| format!("pub fn item_{i}_{j}(value: u64) -> u64 {{ value + {j} }}\n"))
+                .collect();
+            fs::write(dir.path().join(format!("module_{i}.rs")), body).unwrap();
+        }
+        let root = dir.path().canonicalize().unwrap();
+        let budget: usize = 4_000;
+        let args = PackArgs {
+            dir: root.clone(),
+            max_tokens: Some(budget),
+            ..Default::default()
+        };
+        let entries = walk(&root).unwrap();
+        let (filtered, skeleton_files) = filter_entries_for_cli(entries, &root, &args).unwrap();
+        let opts = WriteOptions {
+            skeleton_files,
+            compute_bpe_tokens: true,
+            ..Default::default()
+        };
+        let (fitted, fit_skeletons) = fit_to_bpe_budget(filtered, &root, &opts, budget).unwrap();
+
+        let opts = WriteOptions {
+            skeleton_files: fit_skeletons.clone(),
+            ..opts
+        };
+        let stats = pack_stats(&fitted, &root, &opts).unwrap();
+        assert!(
+            stats.total_tokens <= budget,
+            "pack has {} tokens for budget {budget}",
+            stats.total_tokens
+        );
+        assert!(!fitted.is_empty(), "no file kept");
+        assert!(
+            fitted.len() < 8 || !fit_skeletons.is_empty(),
+            "budget {budget} forced neither a drop nor a skeleton"
+        );
     }
 
     #[test]

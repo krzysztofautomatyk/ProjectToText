@@ -254,13 +254,15 @@ ptt --version
 
 ## MCP server
 
-`ptt mcp [DIR]` runs a Model Context Protocol server (JSON-RPC 2.0 over stdio) so AI assistants can request context on demand. It exposes three tools:
+`ptt mcp [DIR]` runs a Model Context Protocol server (JSON-RPC 2.0 over stdio) so AI assistants can request context on demand. It exposes five tools. Every tool accepts an optional `directory`, which must stay inside the server's project root:
 
 | Tool | Returns |
 | :--- | :--- |
 | `ptt_get_project_map` | Directory tree, exact token counts per file, and skeletons of key modules. |
 | `ptt_pack_files` | A pack of the requested files, respecting `.gitignore`, `.pttignore`, and secret masking. |
 | `ptt_get_git_context` | Modified files and the current `git diff`. |
+| `ptt_get_related_files` | One file's 1-hop imports, importers, and matching tests from the dependency graph. |
+| `ptt_search_symbols` | Functions, methods, types, classes, and interfaces whose name contains a query, with exact source and line ranges. |
 
 Example client configuration (Claude Desktop and Cursor accept a similar entry):
 
@@ -459,7 +461,6 @@ ProjectToText/
 │   ├── main.rs             # Desktop commands and app bootstrap
 │   ├── cli.rs              # Headless `ptt pack` entry point
 │   ├── lib.rs              # Reusable Rust core library
-│   └── core/
 │   ├── mcp.rs              # Model Context Protocol server (`ptt mcp`)
 │   └── core/
 │       ├── walker.rs       # Git / ignore-aware file discovery and default exclusions

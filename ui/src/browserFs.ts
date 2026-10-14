@@ -728,11 +728,14 @@ export async function generateBrowserOutputWithStats(
   }
   lines.push('  </files>');
   if (taskPrompt) {
-    lines.push('  <task_instructions>');
-    for (const line of taskPrompt.split('\n')) {
-      lines.push(`    ${line}`);
-    }
-    lines.push('  </task_instructions>');
+    // Wrapped in CDATA like file contents; `]]>` is split so the section stays well-formed.
+    lines.push(
+      '  <task_instructions>',
+      '      <![CDATA[',
+      taskPrompt.split(']]>').join(']]]]><![CDATA[>'),
+      '      ]]>',
+      '  </task_instructions>',
+    );
   }
   lines.push('</project_context>');
   return { text: lines.join('\n'), redactions, fileTokens };

@@ -509,6 +509,40 @@ fn files_section_emits_source_before_docs_and_structure_stays_alphabetical() {
 }
 
 #[test]
+fn task_instructions_are_cdata_wrapped_so_markup_characters_stay_well_formed() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+    let entries = walk(dir.path()).unwrap();
+    let prompt = "Check Vec<String> & Option<u32> where a < b";
+    let opts = WriteOptions {
+        task_prompt: Some(prompt.into()),
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    write_output(&mut buf, &entries, dir.path(), &opts).unwrap();
+    let xml = String::from_utf8(buf).unwrap();
+
+    let start = xml.find("<task_instructions>").unwrap();
+    let end = xml.find("</task_instructions>").unwrap();
+    let block = &xml[start..end];
+    assert!(block.contains("<![CDATA["), "{block}");
+    assert!(block.contains(prompt), "{block}");
+
+    // Outside CDATA the block may only hold its own opening tag: no raw `<` or `&`.
+    let mut outside = String::new();
+    let mut rest = block;
+    while let Some(i) = rest.find("<![CDATA[") {
+        outside.push_str(&rest[..i]);
+        let after = &rest[i + "<![CDATA[".len()..];
+        let j = after.find("]]>").expect("unterminated CDATA");
+        rest = &after[j + 3..];
+    }
+    outside.push_str(rest);
+    assert_eq!(outside.matches('<').count(), 1, "{outside}");
+    assert!(!outside.contains('&'), "{outside}");
+}
+
+#[test]
 fn packing_own_repository_never_triggers_self_redaction_in_source_or_docs() {
     // Ensure our own source and documentation contain zero raw credentials that would be
     // mutated by redact_secrets_with_report when ptt packs its own repo.

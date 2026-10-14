@@ -8,8 +8,10 @@
 //!
 //! For unsupported languages, provides an indentation/brace-aware fallback signature extractor.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::{Language, Node, Parser, Tree};
 
 /// Determine the canonical skeletonizer language identifier from a file path or language name.
 pub fn language_for_path(path: &Path) -> &'static str {
@@ -33,20 +35,48 @@ pub fn language_for_path(path: &Path) -> &'static str {
     }
 }
 
-fn get_tree_sitter_language(lang: &str) -> Option<(Language, bool)> {
+/// Maps a language name to its grammar key, grammar, and whether it uses Python-style bodies.
+fn ts_language(lang: &str) -> Option<(&'static str, Language, bool)> {
     match lang.trim().to_ascii_lowercase().as_str() {
-        "rust" | "rs" => Some((tree_sitter_rust::LANGUAGE.into(), false)),
-        "typescript" | "ts" => Some((tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), false)),
-        "tsx" => Some((tree_sitter_typescript::LANGUAGE_TSX.into(), false)),
-        "javascript" | "js" | "jsx" => Some((tree_sitter_javascript::LANGUAGE.into(), false)),
-        "python" | "py" => Some((tree_sitter_python::LANGUAGE.into(), true)),
-        "go" => Some((tree_sitter_go::LANGUAGE.into(), false)),
-        "csharp" | "c_sharp" | "cs" => Some((tree_sitter_c_sharp::LANGUAGE.into(), false)),
-        "java" => Some((tree_sitter_java::LANGUAGE.into(), false)),
-        "c" => Some((tree_sitter_c::LANGUAGE.into(), false)),
-        "cpp" | "c++" | "cc" | "hpp" => Some((tree_sitter_cpp::LANGUAGE.into(), false)),
+        "rust" | "rs" => Some(("rust", tree_sitter_rust::LANGUAGE.into(), false)),
+        "typescript" | "ts" => Some((
+            "typescript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            false,
+        )),
+        "tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into(), false)),
+        "javascript" | "js" | "jsx" => {
+            Some(("javascript", tree_sitter_javascript::LANGUAGE.into(), false))
+        }
+        "python" | "py" => Some(("python", tree_sitter_python::LANGUAGE.into(), true)),
+        "go" => Some(("go", tree_sitter_go::LANGUAGE.into(), false)),
+        "csharp" | "c_sharp" | "cs" => {
+            Some(("csharp", tree_sitter_c_sharp::LANGUAGE.into(), false))
+        }
+        "java" => Some(("java", tree_sitter_java::LANGUAGE.into(), false)),
+        "c" => Some(("c", tree_sitter_c::LANGUAGE.into(), false)),
+        "cpp" | "c++" | "cc" | "hpp" => Some(("cpp", tree_sitter_cpp::LANGUAGE.into(), false)),
         _ => None,
     }
+}
+
+thread_local! {
+    /// One parser per grammar and worker thread: `Parser::new` is far more costly than reuse.
+    static PARSERS: RefCell<HashMap<&'static str, Parser>> = RefCell::new(HashMap::new());
+}
+
+/// Parses `content` with this thread's cached parser for `key`. Returns `None` when the grammar
+/// cannot be loaded or parsing fails.
+fn parse_with_cached_parser(key: &'static str, language: &Language, content: &str) -> Option<Tree> {
+    PARSERS.with(|cell| {
+        let mut parsers = cell.borrow_mut();
+        let parser = parsers.entry(key).or_insert_with(|| {
+            let mut parser = Parser::new();
+            let _ = parser.set_language(language);
+            parser
+        });
+        parser.parse(content, None)
+    })
 }
 
 /// Returns true if `node` is a function/method/constructor declaration whose body should be elided.
@@ -79,16 +109,10 @@ pub fn extract_skeleton(content: &str, language: &str) -> String {
         return content.to_string();
     }
 
-    let Some((ts_lang, is_python)) = get_tree_sitter_language(language) else {
+    let Some((key, ts_lang, is_python)) = ts_language(language) else {
         return fallback_skeleton(content);
     };
-
-    let mut parser = Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return fallback_skeleton(content);
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = parse_with_cached_parser(key, &ts_lang, content) else {
         return fallback_skeleton(content);
     };
 
@@ -134,6 +158,152 @@ pub fn extract_skeleton(content: &str, language: &str) -> String {
     out
 }
 
+/// Named definitions that [`find_symbols`] can return. Each kind is named by [`extract_symbol_name`];
+/// kinds that it cannot name are skipped.
+fn is_symbol_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        // Rust
+        "function_item" | "struct_item" | "enum_item" | "trait_item" | "type_item"
+        | "impl_item" | "macro_definition" | "const_item" | "static_item"
+        // TypeScript / JavaScript
+        | "function_declaration"
+        | "variable_declarator"
+        | "generator_function_declaration"
+        | "class_declaration"
+        | "interface_declaration"
+        | "type_alias_declaration"
+        | "enum_declaration"
+        | "method_definition"
+        // Python
+        | "function_definition"
+        | "class_definition"
+        // Go
+        | "method_declaration"
+        | "type_spec"
+        // Java / C#
+        | "constructor_declaration"
+        | "record_declaration"
+        | "struct_declaration"
+        // C / C++
+        | "struct_specifier"
+        | "enum_specifier"
+        | "class_specifier"
+    )
+}
+
+/// A named definition returned by [`find_symbols`], with its exact source span.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolMatch {
+    pub name: String,
+    pub kind: String,
+    /// 1-based, inclusive.
+    pub start_line: usize,
+    /// 1-based, inclusive.
+    pub end_line: usize,
+    pub source: String,
+}
+
+/// Finds named definitions (functions, methods, types, classes, interfaces, traits) whose name
+/// contains `query`, compared case-insensitively. Returns each definition's exact source span.
+/// Returns nothing for an empty query or an unsupported language.
+pub fn find_symbols(content: &str, language: &str, query: &str) -> Vec<SymbolMatch> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let Some((key, ts_lang, _)) = ts_language(language) else {
+        return Vec::new();
+    };
+    let Some(tree) = parse_with_cached_parser(key, &ts_lang, content) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_symbols(tree.root_node(), content.as_bytes(), &needle, &mut out);
+    out
+}
+
+/// Name of a symbol node. Most grammars expose a `name` field. C/C++ functions keep their name in the
+/// `declarator` chain, Rust `impl` blocks are named by their `type`, and a TS/JS variable is a symbol
+/// only when its value is a function.
+fn extract_symbol_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let text = |n: Node<'_>| n.utf8_text(source).ok();
+    match node.kind() {
+        "variable_declarator" => {
+            let value = node.child_by_field_name("value")?;
+            if !matches!(value.kind(), "arrow_function" | "function_expression") {
+                return None;
+            }
+            text(node.child_by_field_name("name")?)
+        }
+        "impl_item" => text(node.child_by_field_name("type")?),
+        kind => {
+            if let Some(name) = node.child_by_field_name("name") {
+                return text(name);
+            }
+            if kind == "function_definition" {
+                let mut cur = node.child_by_field_name("declarator")?;
+                loop {
+                    match cur.kind() {
+                        "identifier"
+                        | "field_identifier"
+                        | "qualified_identifier"
+                        | "destructor_name" => {
+                            return text(cur);
+                        }
+                        _ => cur = cur.child_by_field_name("declarator")?,
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+/// The node whose source is reported for a symbol. A variable-bound function is reported with its whole
+/// declaration (and the `export` keyword, when present), so the snippet is a complete statement.
+fn symbol_span_node(node: Node<'_>) -> Node<'_> {
+    if node.kind() != "variable_declarator" {
+        return node;
+    }
+    let mut span = node;
+    while let Some(parent) = span.parent() {
+        if matches!(
+            parent.kind(),
+            "lexical_declaration" | "variable_declaration" | "export_statement"
+        ) {
+            span = parent;
+        } else {
+            break;
+        }
+    }
+    span
+}
+
+fn collect_symbols(node: Node<'_>, source: &[u8], needle: &str, out: &mut Vec<SymbolMatch>) {
+    if is_symbol_kind(node.kind()) {
+        if let Some(name) = extract_symbol_name(node, source) {
+            if name.to_ascii_lowercase().contains(needle) {
+                let span = symbol_span_node(node);
+                if let Ok(text) = span.utf8_text(source) {
+                    out.push(SymbolMatch {
+                        name: name.to_string(),
+                        kind: span.kind().to_string(),
+                        start_line: span.start_position().row + 1,
+                        end_line: span.end_position().row + 1,
+                        source: text.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_symbols(child, source, needle, out);
+    }
+}
+
 fn collect_replacements(
     node: Node<'_>,
     source: &[u8],
@@ -162,6 +332,21 @@ fn collect_replacements(
                 if end.saturating_sub(start) > 18 || source[start..end].contains(&b'\n') {
                     out.push((start, end, "{ /* ... */ }".to_string()));
                     return;
+                }
+            }
+        }
+    } else if !is_python && (kind == "public_field_definition" || kind == "field_definition") {
+        // Class fields holding an arrow function or function expression: `handle = () => { ... }`
+        if let Some(val) = node.child_by_field_name("value") {
+            if val.kind() == "arrow_function" || val.kind() == "function_expression" {
+                if let Some(body) = val.child_by_field_name("body") {
+                    if body.kind() == "statement_block" {
+                        let start = body.start_byte();
+                        let end = body.end_byte();
+                        if end.saturating_sub(start) > 18 || source[start..end].contains(&b'\n') {
+                            out.push((start, end, "{ /* ... */ }".to_string()));
+                        }
+                    }
                 }
             }
         }
@@ -347,6 +532,64 @@ export async function loadUser(id: string): Promise<User> {
             "{skel}"
         );
         assert!(!skel.contains("JSON.parse"), "{skel}");
+    }
+
+    #[test]
+    fn find_symbols_returns_exact_spans_and_is_case_insensitive() {
+        let src = "pub struct Config {\n    pub host: String,\n}\n\npub fn compute(x: usize) -> usize {\n    let y = x * 2;\n    y + 1\n}\n";
+        let hits = find_symbols(src, "rust", "COMPUTE");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "compute");
+        assert_eq!(hits[0].kind, "function_item");
+        assert_eq!((hits[0].start_line, hits[0].end_line), (5, 8));
+        assert!(hits[0].source.contains("let y = x * 2;"), "{:?}", hits[0]);
+
+        assert_eq!(find_symbols(src, "rust", "config").len(), 1);
+        assert!(find_symbols(src, "rust", "  ").is_empty());
+        assert!(find_symbols(src, "other", "compute").is_empty());
+    }
+
+    #[test]
+    fn find_symbols_covers_c_typescript_arrow_and_rust_items() {
+        let c = "int compute_sum(int a, int b) { return a + b; }\n";
+        let hits = find_symbols(c, "c", "compute_sum");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "compute_sum");
+        assert!(hits[0].source.contains("return a + b;"), "{:?}", hits[0]);
+
+        let ts = "export const useAuth = () => {\n  return true;\n};\n";
+        let hits = find_symbols(ts, "typescript", "useauth");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "useAuth");
+        assert_eq!((hits[0].start_line, hits[0].end_line), (1, 3));
+        assert!(
+            hits[0].source.starts_with("export const useAuth"),
+            "{:?}",
+            hits[0]
+        );
+        assert!(find_symbols("const plain = 42;\n", "typescript", "plain").is_empty());
+
+        let rs = "macro_rules! make_it { () => {} }\npub const LIMIT: usize = 4;\npub static NAME: &str = \"x\";\npub struct Widget;\nimpl Widget { pub fn new() -> Self { Widget } }\n";
+        assert_eq!(find_symbols(rs, "rust", "make_it").len(), 1);
+        assert_eq!(find_symbols(rs, "rust", "limit").len(), 1);
+        assert_eq!(find_symbols(rs, "rust", "name").len(), 1);
+        let widget: Vec<String> = find_symbols(rs, "rust", "widget")
+            .into_iter()
+            .map(|s| s.kind)
+            .collect();
+        assert_eq!(widget, vec!["struct_item", "impl_item"]);
+    }
+
+    #[test]
+    fn typescript_class_arrow_field_body_is_elided() {
+        let src = "export class Panel {\n  handleClick = (event: MouseEvent): void => {\n    const target = event.target;\n    console.log(target);\n  };\n}\n";
+        let skel = extract_skeleton(src, "typescript");
+        assert!(
+            skel.contains("handleClick = (event: MouseEvent): void =>"),
+            "{skel}"
+        );
+        assert!(skel.contains("{ /* ... */ }"), "{skel}");
+        assert!(!skel.contains("console.log"), "{skel}");
     }
 
     #[test]

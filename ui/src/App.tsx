@@ -676,7 +676,10 @@ function computeSubtree(
       partial: false,
       allSelected: sel,
       allSkeleton: skel,
-      tokens: estimateTokensFromBytes(node.size ?? 0),
+      // A skeleton keeps about 30% of the file's tokens, matching the Rust packer's estimate.
+      tokens: skel
+        ? Math.max(1, Math.round(estimateTokensFromBytes(node.size ?? 0) * 0.3))
+        : estimateTokensFromBytes(node.size ?? 0),
     };
     stats.set(node.path, result);
     return result;
@@ -805,6 +808,11 @@ const ABOUT_BACKEND_LIBS = [
   'open',
   'dunce',
   'regex',
+  'rayon',
+  'notify',
+  'tiktoken-rs',
+  'globset',
+  'tree-sitter',
 ];
 
 function AboutDialog({

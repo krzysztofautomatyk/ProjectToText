@@ -48,7 +48,7 @@ ProjectToText (`ptt`) is a **Tauri v2** desktop application, a headless CLI, and
 | `core::git` | `git status --porcelain`, branch-changed files versus the base branch, and unified diff. Uses `git_command()`, which suppresses console windows on Windows. |
 | `core::text` | Strict UTF-8 and BOM-declared UTF-16 decoding; Markdown fences longer than any backtick run. |
 | `core::preview` | Canonical-root containment, symlink and reparse-point rejection, bounded text previews. |
-| `mcp` | Three tools: `ptt_get_project_map`, `ptt_pack_files`, `ptt_get_git_context`. |
+| `mcp` | Five tools: `ptt_get_project_map`, `ptt_pack_files`, `ptt_get_git_context`, `ptt_get_related_files`, `ptt_search_symbols`. |
 
 ## Data flow (desktop pack)
 

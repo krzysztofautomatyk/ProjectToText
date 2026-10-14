@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-14
+
+### Added
+
+- **MCP pack options**: `ptt_pack_files` accepts `preset`, `max_tokens`, and `git_diff`, with the same selection rules as `ptt pack`.
+- **MCP symbol and dependency tools**: `ptt_search_symbols` returns named functions, methods, types, classes, and interfaces with their exact source and line range. `ptt_get_related_files` returns a file's 1-hop imports, importers, and tests.
+
+### Fixed
+
+- `<task_instructions>` is wrapped in CDATA in the CLI, desktop, and browser output, so prompts containing `<`, `>`, or `&` produce valid XML.
+- The MCP `directory` argument is confined to the server's project root. Symlinks and reparse points are rejected, and a project-map file is size-checked before it is read.
+- `ptt_get_project_map` picks skeleton candidates by architectural tier instead of alphabetical order.
+- Dependency graph: grouped Rust imports (`use crate::core::{deps::X, git::Y}`) resolve every module, and TypeScript `./foo.js` imports resolve to `foo.ts`/`foo.tsx` with `@/` aliases mapped to `src/`.
+- `--max-tokens` fits the pack with exact per-file BPE counts. Full files are upgraded to skeletons first, then the lowest-priority files are dropped, so a 20,000-token budget now yields about 19.7k tokens instead of 11.3k.
+- `ptt_search_symbols` finds C/C++ functions, TypeScript/JavaScript functions bound to a variable, and Rust `impl`, `const`, `static`, and `macro_rules!` items. Results are ordered by architectural tier, so `src/` is returned first.
+- The desktop tree's token badges count skeleton-marked files at about 30% of their size, matching the packer's estimate.
+
+### Changed
+
+- Parallel packing runs in a single pass instead of 64-file chunks, so uneven files no longer wait on chunk barriers.
+- Tree-sitter parsers are cached per worker thread instead of being created for every file.
+- The benchmark reports BPE throughput and skeleton extraction separately. Packing is measured with one thread against the default pool.
+
 ## [0.4.0] - 2026-10-14
 
 ### Added

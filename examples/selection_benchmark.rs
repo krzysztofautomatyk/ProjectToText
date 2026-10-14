@@ -1,11 +1,17 @@
 use ptt::core::{
-    output::{write_output_cancellable, write_output_with_stats, OutputFormat, WriteOptions},
+    output::{write_output_with_stats, OutputFormat, WriteOptions},
     skeleton::{extract_skeleton, language_for_path},
     tokenizer::count_tokens,
-    walker::{path_is_selected, walk, SelectionMatcher},
+    walker::{path_is_selected, walk, DirEntryMeta, SelectionMatcher},
     workspace::WorkspaceIndex,
 };
 use std::{hint::black_box, path::Path, path::PathBuf, time::Instant};
+
+fn pack_once(entries: &[DirEntryMeta], root: &Path, opts: &WriteOptions) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_output_with_stats(&mut buf, entries, root, opts, &|| false).unwrap();
+    buf
+}
 
 fn main() {
     let candidates: Vec<_> = (0..10_000)
@@ -96,40 +102,37 @@ fn main() {
         median(&mut cached)
     );
 
-    // 3. Sequential vs Parallel packing throughput
+    // 3. Packing throughput with realistic options (BPE counting and secret redaction on).
+    // "Sequential" runs the same code on a one-thread rayon pool; "parallel" uses the default pool.
+    // Each timing is the median of three repetitions, and both outputs must be byte-identical.
     let entries_to_pack = snapshot.selected(&selected_1k);
     let opts = WriteOptions {
         format: OutputFormat::Xml,
-        compute_bpe_tokens: false,
+        redact_secrets: true,
+        compute_bpe_tokens: true,
         ..Default::default()
     };
-    let start_seq = Instant::now();
-    let mut seq_buf = Vec::new();
-    write_output_cancellable(
-        &mut seq_buf,
-        &entries_to_pack,
-        &snapshot.root,
-        &opts,
-        &|| false,
-    )
-    .unwrap();
-    let seq_ms = start_seq.elapsed().as_secs_f64() * 1000.0;
+    let single_thread = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let mut seq_pack_ms = Vec::new();
+    let mut par_pack_ms = Vec::new();
+    for _ in 0..3 {
+        let start = Instant::now();
+        let seq_buf = single_thread.install(|| pack_once(&entries_to_pack, &snapshot.root, &opts));
+        seq_pack_ms.push(start.elapsed().as_secs_f64() * 1000.0);
 
-    let start_par = Instant::now();
-    let mut par_buf = Vec::new();
-    let _ = write_output_with_stats(
-        &mut par_buf,
-        &entries_to_pack,
-        &snapshot.root,
-        &opts,
-        &|| false,
-    )
-    .unwrap();
-    let par_ms = start_par.elapsed().as_secs_f64() * 1000.0;
-    assert_eq!(seq_buf, par_buf);
+        let start = Instant::now();
+        let par_buf = pack_once(&entries_to_pack, &snapshot.root, &opts);
+        par_pack_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(seq_buf, par_buf);
+    }
     println!(
-        "pack_800_files: sequential_ms={:.3}; parallel_rayon_ms={:.3}",
-        seq_ms, par_ms
+        "pack_800_files: threads_parallel={}; sequential_1_thread_median_ms={:.3}; parallel_median_ms={:.3}",
+        rayon::current_num_threads(),
+        median(&mut seq_pack_ms),
+        median(&mut par_pack_ms)
     );
 
     // 4. BPE tokenizer throughput and AST skeleton compression ratio on ptt itself.

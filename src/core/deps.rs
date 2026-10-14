@@ -1,10 +1,13 @@
 //! Intra-repository import & dependency graph resolver.
 //!
-//! Parses `use` / `mod` (Rust), `import ... from` / `export ... from` / `require(...)` (TS/JS),
-//! `import` / `from ... import` (Python), and `using` (C#) to resolve relative and crate-local
-//! file dependencies inside a workspace snapshot.
+//! Parses `use` / `mod` (Rust, including brace-grouped `use crate::a::{b::X, c::Y}`),
+//! `import ... from` / `export ... from` / `require(...)` (TS/JS, including ESM `.js`
+//! specifiers that point at `.ts` sources and `@/` aliases), `import` / `from ... import`
+//! (Python), and `using` (C#) to resolve relative and crate-local file dependencies inside a
+//! workspace snapshot. File reading and import extraction run in parallel.
 
 use crate::core::walker::{normalize_rel_path, DirEntryMeta};
+use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -38,35 +41,40 @@ impl DependencyGraph {
             .map(|e| normalize_rel_path(&e.path))
             .collect();
 
+        // Reading and parsing each file is independent, so it runs on the rayon pool. The
+        // results are merged afterwards, which keeps the graph deterministic (BTreeSet values).
+        let resolved_per_file: Vec<(String, BTreeSet<String>)> = file_set
+            .par_iter()
+            .filter_map(|rel| {
+                let ext = Path::new(rel)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !matches!(
+                    ext.as_str(),
+                    "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "cs" | "go"
+                ) {
+                    return None;
+                }
+                let full = root.join(rel);
+                let meta = std::fs::metadata(&full).ok()?;
+                if !meta.is_file() || meta.len() > 512 * 1024 {
+                    return None;
+                }
+                let content = std::fs::read_to_string(&full).ok()?;
+                Some((
+                    rel.clone(),
+                    resolve_file_imports(rel, &ext, &content, &file_set),
+                ))
+            })
+            .collect();
+
         let mut imports: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut importers: HashMap<String, BTreeSet<String>> = HashMap::new();
-
-        for rel in &file_set {
-            let ext = Path::new(rel)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !matches!(
-                ext.as_str(),
-                "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "cs" | "go"
-            ) {
-                continue;
-            }
-            let full = root.join(rel);
-            let Ok(meta) = std::fs::metadata(&full) else {
-                continue;
-            };
-            if !meta.is_file() || meta.len() > 512 * 1024 {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(&full) else {
-                continue;
-            };
-
-            let resolved = resolve_file_imports(rel, &ext, &content, &file_set);
+        for (rel, resolved) in resolved_per_file {
             for target in &resolved {
-                if target != rel {
+                if *target != rel {
                     imports
                         .entry(rel.clone())
                         .or_default()
@@ -130,12 +138,102 @@ fn rust_use_re() -> &'static Regex {
     })
 }
 
+/// `use crate::a::b::{c::X, d, e::{f, g}};`: captures the module prefix (`a::b::`) and the
+/// brace-group body. The body runs to the statement's `;`, so nested braces are included.
+fn rust_use_group_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?ms)^\s*(?:pub\s+)?use\s+(?:crate|super|self)::((?:[a-zA-Z0-9_]+::)*)\{([^;]*)\}",
+        )
+        .expect("valid rust grouped use regex")
+    })
+}
+
 fn py_import_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?m)^\s*(?:from\s+([.a-zA-Z0-9_]+)\s+import|import\s+([a-zA-Z0-9_.]+))")
             .expect("valid python import regex")
     })
+}
+
+/// The first identifier of each top-level item in a brace group.
+/// `deps::Foo, git::{Bar, Baz}, self` -> `["deps", "git"]` (`self` refers to the prefix itself).
+fn group_items(body: &str) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in body.chars().chain(std::iter::once(',')) {
+        match ch {
+            '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => items.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let ident: String = item
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!ident.is_empty() && ident != "self").then_some(ident)
+        })
+        .collect()
+}
+
+/// Finds `<crate_dir>/<module>.rs` or `<crate_dir>/<module>/mod.rs` for a `::`-free path.
+fn find_rust_module(module: &str, crate_dir: &str, all_files: &HashSet<String>) -> Option<String> {
+    let prefix = if crate_dir.is_empty() {
+        module.to_string()
+    } else {
+        format!("{crate_dir}/{module}")
+    };
+    [format!("{prefix}.rs"), format!("{prefix}/mod.rs")]
+        .into_iter()
+        .find(|candidate| all_files.contains(candidate))
+}
+
+/// The `src` directory that contains `source_path`, used for `@/` aliases and crate roots.
+fn src_root_of(source_path: &str) -> Option<String> {
+    if let Some(idx) = source_path.find("/src/") {
+        return Some(source_path[..idx + 4].to_string());
+    }
+    source_path.starts_with("src/").then(|| "src".to_string())
+}
+
+/// Resolves a TS/JS module path (without extension) to a file in the project.
+/// ESM code often imports `./util.js` when the source is `util.ts` or `util.tsx`, so the `.js`
+/// family is also probed with TypeScript extensions.
+fn probe_ts_module(joined: &str, all_files: &HashSet<String>) -> Option<String> {
+    let mut candidates = vec![joined.to_string()];
+    for js_ext in [".js", ".jsx", ".mjs", ".cjs"] {
+        if let Some(stem) = joined.strip_suffix(js_ext) {
+            candidates.push(format!("{stem}.ts"));
+            candidates.push(format!("{stem}.tsx"));
+        }
+    }
+    candidates.extend([
+        format!("{joined}.ts"),
+        format!("{joined}.tsx"),
+        format!("{joined}.js"),
+        format!("{joined}.jsx"),
+        format!("{joined}/index.ts"),
+        format!("{joined}/index.tsx"),
+        format!("{joined}/index.js"),
+    ]);
+    candidates
+        .into_iter()
+        .find(|candidate| all_files.contains(candidate))
 }
 
 fn resolve_file_imports(
@@ -152,26 +250,31 @@ fn resolve_file_imports(
 
     match ext {
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+            // `@/x` is an alias for the project's `src` directory. Try the file's own `src`
+            // root first, then the two common layouts.
+            let mut alias_bases: Vec<String> = src_root_of(source_path).into_iter().collect();
+            for fallback in ["src", "ui/src"] {
+                if !alias_bases.iter().any(|b| b == fallback) {
+                    alias_bases.push(fallback.to_string());
+                }
+            }
             for caps in ts_import_re().captures_iter(content) {
                 let Some(spec) = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()) else {
                     continue;
                 };
-                if !spec.starts_with('.') {
+                let joins: Vec<String> = if spec.starts_with('.') {
+                    vec![join_relative(&parent_dir, spec)]
+                } else if let Some(rest) = spec.strip_prefix("@/") {
+                    alias_bases
+                        .iter()
+                        .map(|base| join_relative(base, rest))
+                        .collect()
+                } else {
                     continue;
-                }
-                let joined = join_relative(&parent_dir, spec);
-                for candidate in [
-                    joined.clone(),
-                    format!("{joined}.ts"),
-                    format!("{joined}.tsx"),
-                    format!("{joined}.js"),
-                    format!("{joined}.jsx"),
-                    format!("{joined}/index.ts"),
-                    format!("{joined}/index.tsx"),
-                    format!("{joined}/index.js"),
-                ] {
-                    if all_files.contains(&candidate) {
-                        found.insert(candidate);
+                };
+                for joined in joins {
+                    if let Some(hit) = probe_ts_module(&joined, all_files) {
+                        found.insert(hit);
                         break;
                     }
                 }
@@ -193,15 +296,8 @@ fn resolve_file_imports(
                         use_path.split("::").filter(|s| !s.is_empty()).collect();
                     for len in (1..=segments.len().min(3)).rev() {
                         let rel_mod = segments[..len].join("/");
-                        let prefix = if crate_dir.is_empty() {
-                            rel_mod.clone()
-                        } else {
-                            format!("{crate_dir}/{rel_mod}")
-                        };
-                        for candidate in [format!("{prefix}.rs"), format!("{prefix}/mod.rs")] {
-                            if all_files.contains(&candidate) {
-                                found.insert(candidate);
-                            }
+                        if let Some(hit) = find_rust_module(&rel_mod, crate_dir, all_files) {
+                            found.insert(hit);
                         }
                     }
                 } else if let Some(mod_name) = caps.get(2).map(|m| m.as_str()) {
@@ -227,6 +323,31 @@ fn resolve_file_imports(
                                 found.insert(candidate);
                             }
                         }
+                    }
+                }
+            }
+
+            // Grouped imports: `use crate::core::{deps::Foo, git::Bar};` resolves both
+            // `core/deps` and `core/git`. Each item's first segment is one module.
+            for caps in rust_use_group_re().captures_iter(content) {
+                let prefix: Vec<&str> = caps[1].split("::").filter(|s| !s.is_empty()).collect();
+                let prefix_path = prefix.join("/");
+                let mut modules: Vec<String> = group_items(&caps[2])
+                    .into_iter()
+                    .map(|item| {
+                        if prefix_path.is_empty() {
+                            item
+                        } else {
+                            format!("{prefix_path}/{item}")
+                        }
+                    })
+                    .collect();
+                if !prefix_path.is_empty() {
+                    modules.push(prefix_path.clone());
+                }
+                for module in modules {
+                    if let Some(hit) = find_rust_module(&module, crate_dir, all_files) {
+                        found.insert(hit);
                     }
                 }
             }
@@ -410,5 +531,55 @@ mod tests {
         let util_rel = graph.related_for("src/util.rs");
         assert!(util_rel.importers.contains(&"src/main.rs".to_string()));
         assert!(util_rel.tests.contains(&"tests/util_test.rs".to_string()));
+    }
+
+    #[test]
+    fn resolves_grouped_rust_use_and_esm_js_specifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/core")).unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "use crate::core::{deps::Foo, git::{inspect, compute}};\nfn main() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/core/deps.rs"), "pub struct Foo;\n").unwrap();
+        fs::write(root.join("src/core/git.rs"), "pub fn inspect() {}\n").unwrap();
+        fs::write(root.join("src/util.ts"), "export const x = 1;\n").unwrap();
+        fs::write(
+            root.join("src/app.ts"),
+            "import { x } from './util.js';\nimport { y } from '@/util';\n",
+        )
+        .unwrap();
+
+        let entries: Vec<DirEntryMeta> = [
+            "src/main.rs",
+            "src/core/deps.rs",
+            "src/core/git.rs",
+            "src/util.ts",
+            "src/app.ts",
+        ]
+        .iter()
+        .map(|p| DirEntryMeta {
+            path: PathBuf::from(p),
+            is_dir: false,
+            size: Some(20),
+        })
+        .collect();
+
+        let graph = DependencyGraph::build(root, &entries);
+
+        let main = graph.related_for("src/main.rs");
+        assert!(
+            main.imports.contains(&"src/core/deps.rs".to_string()),
+            "{main:?}"
+        );
+        assert!(
+            main.imports.contains(&"src/core/git.rs".to_string()),
+            "{main:?}"
+        );
+
+        let app = graph.related_for("src/app.ts");
+        assert_eq!(app.imports, vec!["src/util.ts"], "{app:?}");
     }
 }
