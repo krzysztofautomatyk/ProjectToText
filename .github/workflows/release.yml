@@ -36,17 +36,17 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v7
+      -        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: lts/*
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
@@ -64,7 +64,7 @@ jobs:
         shell: bash
         run: echo "version=$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
 
-      - uses: tauri-apps/tauri-action@v1
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Updater signing (separate from OS code signing; no OS certificates are configured, so that step is skipped).
@@ -90,12 +90,30 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v7
+      -        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read app version
         id: app_version
         shell: bash
         run: echo "tag=v$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Check every platform installer and its signature are attached
+        shell: bash
+        env:
+          TAG: ${{ steps.app_version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          names=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          for platform in macos-apple-silicon macos-intel linux-x64 windows-x64; do
+            installer=$(echo "$names" | grep "$platform" | grep -v '\.sig$' | head -n 1 || true)
+            if [ -z "$installer" ]; then
+              echo "release $TAG is missing the $platform installer"
+              exit 1
+            fi
+            echo "$names" | grep -qxF "$installer.sig" \
+              || { echo "release $TAG has no updater signature for $installer"; exit 1; }
+            echo "ok: $installer (+ .sig)"
+          done
 
       - name: Rewrite latest.json URLs to public download links
         shell: bash

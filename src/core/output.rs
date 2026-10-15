@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::core::preview::{is_link, resolve_under_canonical_root};
+use crate::core::preview::{is_link, open_verified_regular_file, resolve_under_canonical_root};
 use crate::core::secrets::{redact_secrets_with_report, RedactionSummary};
 use crate::core::skeleton::{extract_skeleton, language_for_path};
 use crate::core::text::{decode_text, markdown_fence, TextError};
@@ -57,7 +57,16 @@ pub struct FileTokenStat {
 #[serde(rename_all = "camelCase")]
 pub struct PackStats {
     pub files_packed: usize,
+    /// Exact (or model-profiled) token count of the complete serialized output artifact,
+    /// including all XML/Markdown/JSON/Plain wrappers, directory tree, paths, diff, and prompt.
     pub total_tokens: usize,
+    /// Sum of tokens across prepared file contents only (excluding wrapper overhead, diff, and prompt).
+    pub content_tokens: usize,
+    /// Tokens attributable to formatting wrappers, directory listing, git diff, and task prompt.
+    pub overhead_tokens: usize,
+    /// Whether `total_tokens` comes from an exact BPE vocabulary (`o200k_base` / `cl100k_base`)
+    /// rather than an approximate multiplier profile (`claude` / `gemini`) or byte heuristic.
+    pub tokenizer_exact: bool,
     pub file_tokens: Vec<FileTokenStat>,
     pub redactions: RedactionSummary,
 }
@@ -129,6 +138,7 @@ pub fn write_output_cancellable<W: Write>(
     let valid_parents = build_valid_parent_cache(root, &files);
     let ordered = architectural_order(&files);
 
+    let mut dummy_redactions = RedactionSummary::default();
     match options.format {
         OutputFormat::Xml => {
             write_xml_header(writer, &files, root, options)?;
@@ -137,7 +147,7 @@ pub fn write_output_cancellable<W: Write>(
                 let pf = prepare_single_file(f, root, &valid_parents, options);
                 write_xml_file_entry(writer, &pf)?;
             }
-            write_xml_footer(writer, options)
+            write_xml_footer(writer, options, &mut dummy_redactions)
         }
         OutputFormat::Markdown => {
             write_markdown_header(writer, root, options)?;
@@ -146,7 +156,7 @@ pub fn write_output_cancellable<W: Write>(
                 let pf = prepare_single_file(f, root, &valid_parents, options);
                 write_markdown_file_entry(writer, &pf)?;
             }
-            write_markdown_footer(writer, options)
+            write_markdown_footer(writer, options, &mut dummy_redactions)
         }
         OutputFormat::Json => {
             let mut prepared = Vec::with_capacity(files.len());
@@ -154,7 +164,7 @@ pub fn write_output_cancellable<W: Write>(
                 ensure_not_cancelled(cancelled)?;
                 prepared.push(prepare_single_file(f, root, &valid_parents, options));
             }
-            write_json_prepared(writer, &prepared, root, options)
+            write_json_prepared(writer, &prepared, root, options, &mut dummy_redactions)
         }
         OutputFormat::Plain => {
             write_plain_header(writer, root, options)?;
@@ -163,7 +173,7 @@ pub fn write_output_cancellable<W: Write>(
                 let pf = prepare_single_file(f, root, &valid_parents, options);
                 write_plain_file_entry(writer, &pf)?;
             }
-            write_plain_footer(writer, options)
+            write_plain_footer(writer, options, &mut dummy_redactions)
         }
     }
 }
@@ -187,22 +197,56 @@ where
     let ordered = architectural_order(&files);
     let prepared = prepare_files_parallel(&ordered, root, options, cancelled)?;
 
+    let mut rendered = Vec::new();
+    let mut extra_redactions = RedactionSummary {
+        redaction_enabled: options.redact_secrets,
+        ..RedactionSummary::default()
+    };
     match options.format {
-        OutputFormat::Xml => write_xml_prepared(writer, &files, &prepared, root, options)?,
-        OutputFormat::Markdown => write_markdown_prepared(writer, &prepared, root, options)?,
-        OutputFormat::Json => write_json_prepared(writer, &prepared, root, options)?,
-        OutputFormat::Plain => write_plain_prepared(writer, &prepared, root, options)?,
+        OutputFormat::Xml => write_xml_prepared(
+            &mut rendered,
+            &files,
+            &prepared,
+            root,
+            options,
+            &mut extra_redactions,
+        )?,
+        OutputFormat::Markdown => write_markdown_prepared(
+            &mut rendered,
+            &prepared,
+            root,
+            options,
+            &mut extra_redactions,
+        )?,
+        OutputFormat::Json => write_json_prepared(
+            &mut rendered,
+            &prepared,
+            root,
+            options,
+            &mut extra_redactions,
+        )?,
+        OutputFormat::Plain => write_plain_prepared(
+            &mut rendered,
+            &prepared,
+            root,
+            options,
+            &mut extra_redactions,
+        )?,
     }
+    writer.write_all(&rendered)?;
 
     let mut stats = PackStats {
         files_packed: prepared.len(),
         total_tokens: 0,
+        content_tokens: 0,
+        overhead_tokens: 0,
+        tokenizer_exact: options.compute_bpe_tokens && options.tokenizer_model.is_exact_bpe(),
         file_tokens: Vec::with_capacity(prepared.len()),
-        redactions: RedactionSummary::default(),
+        redactions: extra_redactions,
     };
 
     for pf in prepared {
-        stats.total_tokens += pf.tokens;
+        stats.content_tokens += pf.tokens;
         stats.redactions.merge(&pf.redactions);
         stats.file_tokens.push(FileTokenStat {
             path: pf.path,
@@ -213,13 +257,14 @@ where
     }
 
     if options.compute_bpe_tokens {
-        if let Some(diff) = &options.git_diff {
-            stats.total_tokens += count_tokens_with_model(diff, options.tokenizer_model);
-        }
-        if let Some(prompt) = &options.task_prompt {
-            stats.total_tokens += count_tokens_with_model(prompt, options.tokenizer_model);
-        }
+        let rendered_str = std::str::from_utf8(&rendered)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        stats.total_tokens = count_tokens_with_model(rendered_str, options.tokenizer_model);
+    } else {
+        let approx_total = ((rendered.len() as f64) / 3.8).round() as usize;
+        stats.total_tokens = approx_total.max(stats.content_tokens);
     }
+    stats.overhead_tokens = stats.total_tokens.saturating_sub(stats.content_tokens);
 
     Ok(stats)
 }
@@ -486,6 +531,26 @@ fn write_cdata<W: Write>(w: &mut W, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Returns the trimmed task prompt, masked with the same rules as file contents and the Git diff
+/// when redaction is on. Masked counts are merged into `extra_redactions` so the report covers them.
+fn task_prompt_text(
+    options: &WriteOptions,
+    extra_redactions: &mut RedactionSummary,
+) -> Option<String> {
+    let prompt = options
+        .task_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    if options.redact_secrets {
+        let (redacted, summary) = redact_secrets_with_report(prompt);
+        extra_redactions.merge(&summary);
+        Some(redacted.into_owned())
+    } else {
+        Some(prompt.to_string())
+    }
+}
+
 fn write_xml_header<W: Write>(
     w: &mut W,
     files: &[&DirEntryMeta],
@@ -542,7 +607,11 @@ fn write_xml_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io::Resu
     writeln!(w, "    </file>")
 }
 
-fn write_xml_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Result<()> {
+fn write_xml_footer<W: Write>(
+    w: &mut W,
+    options: &WriteOptions,
+    extra_redactions: &mut RedactionSummary,
+) -> std::io::Result<()> {
     writeln!(w, "  </files>")?;
 
     if let Some(diff) = options
@@ -552,7 +621,9 @@ fn write_xml_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Res
         .filter(|s| !s.is_empty())
     {
         let diff_text = if options.redact_secrets {
-            redact_secrets_with_report(diff).0
+            let (redacted, summary) = redact_secrets_with_report(diff);
+            extra_redactions.merge(&summary);
+            redacted
         } else {
             std::borrow::Cow::Borrowed(diff)
         };
@@ -561,16 +632,11 @@ fn write_xml_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Res
         writeln!(w, "  </git_diff>")?;
     }
 
-    if let Some(prompt) = options
-        .task_prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(prompt) = task_prompt_text(options, extra_redactions) {
         // The prompt is free text (e.g. `Vec<T>`, `a && b`), so it is wrapped in CDATA like file
         // contents. Escaping it as plain text would produce invalid XML.
         writeln!(w, "  <task_instructions>")?;
-        write_cdata(w, prompt)?;
+        write_cdata(w, &prompt)?;
         writeln!(w, "  </task_instructions>")?;
     }
 
@@ -583,12 +649,13 @@ fn write_xml_prepared<W: Write>(
     prepared: &[PreparedFile],
     root: &Path,
     options: &WriteOptions,
+    extra_redactions: &mut RedactionSummary,
 ) -> std::io::Result<()> {
     write_xml_header(w, files, root, options)?;
     for pf in prepared {
         write_xml_file_entry(w, pf)?;
     }
-    write_xml_footer(w, options)
+    write_xml_footer(w, options, extra_redactions)
 }
 
 fn write_markdown_header<W: Write>(
@@ -617,7 +684,11 @@ fn write_markdown_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io:
     writeln!(w)
 }
 
-fn write_markdown_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Result<()> {
+fn write_markdown_footer<W: Write>(
+    w: &mut W,
+    options: &WriteOptions,
+    extra_redactions: &mut RedactionSummary,
+) -> std::io::Result<()> {
     if let Some(diff) = options
         .git_diff
         .as_deref()
@@ -625,7 +696,9 @@ fn write_markdown_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io
         .filter(|s| !s.is_empty())
     {
         let diff_text = if options.redact_secrets {
-            redact_secrets_with_report(diff).0
+            let (redacted, summary) = redact_secrets_with_report(diff);
+            extra_redactions.merge(&summary);
+            redacted
         } else {
             std::borrow::Cow::Borrowed(diff)
         };
@@ -636,12 +709,7 @@ fn write_markdown_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io
         writeln!(w, "{fence}\n")?;
     }
 
-    if let Some(prompt) = options
-        .task_prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(prompt) = task_prompt_text(options, extra_redactions) {
         writeln!(w, "<task_instructions>")?;
         writeln!(w, "{prompt}")?;
         writeln!(w, "</task_instructions>")?;
@@ -655,12 +723,13 @@ fn write_markdown_prepared<W: Write>(
     prepared: &[PreparedFile],
     root: &Path,
     options: &WriteOptions,
+    extra_redactions: &mut RedactionSummary,
 ) -> std::io::Result<()> {
     write_markdown_header(w, root, options)?;
     for pf in prepared {
         write_markdown_file_entry(w, pf)?;
     }
-    write_markdown_footer(w, options)
+    write_markdown_footer(w, options, extra_redactions)
 }
 
 fn write_json_prepared<W: Write>(
@@ -668,6 +737,7 @@ fn write_json_prepared<W: Write>(
     prepared: &[PreparedFile],
     root: &Path,
     options: &WriteOptions,
+    extra_redactions: &mut RedactionSummary,
 ) -> std::io::Result<()> {
     let mut file_objs: Vec<Value> = Vec::with_capacity(prepared.len());
     for pf in prepared {
@@ -700,19 +770,16 @@ fn write_json_prepared<W: Write>(
         .filter(|s| !s.is_empty())
     {
         let diff_text = if options.redact_secrets {
-            redact_secrets_with_report(diff).0.into_owned()
+            let (redacted, summary) = redact_secrets_with_report(diff);
+            extra_redactions.merge(&summary);
+            redacted.into_owned()
         } else {
             diff.to_string()
         };
         doc["git_diff"] = json!(diff_text);
     }
 
-    if let Some(prompt) = options
-        .task_prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(prompt) = task_prompt_text(options, extra_redactions) {
         doc["task_instructions"] = json!(prompt);
     }
 
@@ -745,7 +812,11 @@ fn write_plain_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io::Re
     writeln!(w, "--------------------------------\n")
 }
 
-fn write_plain_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::Result<()> {
+fn write_plain_footer<W: Write>(
+    w: &mut W,
+    options: &WriteOptions,
+    extra_redactions: &mut RedactionSummary,
+) -> std::io::Result<()> {
     if let Some(diff) = options
         .git_diff
         .as_deref()
@@ -753,7 +824,9 @@ fn write_plain_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::R
         .filter(|s| !s.is_empty())
     {
         let diff_text = if options.redact_secrets {
-            redact_secrets_with_report(diff).0
+            let (redacted, summary) = redact_secrets_with_report(diff);
+            extra_redactions.merge(&summary);
+            redacted
         } else {
             std::borrow::Cow::Borrowed(diff)
         };
@@ -762,12 +835,7 @@ fn write_plain_footer<W: Write>(w: &mut W, options: &WriteOptions) -> std::io::R
         writeln!(w, "</git_diff>\n")?;
     }
 
-    if let Some(prompt) = options
-        .task_prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(prompt) = task_prompt_text(options, extra_redactions) {
         writeln!(w, "<task_instructions>")?;
         writeln!(w, "{prompt}")?;
         writeln!(w, "</task_instructions>")?;
@@ -781,12 +849,13 @@ fn write_plain_prepared<W: Write>(
     prepared: &[PreparedFile],
     root: &Path,
     options: &WriteOptions,
+    extra_redactions: &mut RedactionSummary,
 ) -> std::io::Result<()> {
     write_plain_header(w, root, options)?;
     for pf in prepared {
         write_plain_file_entry(w, pf)?;
     }
-    write_plain_footer(w, options)
+    write_plain_footer(w, options, extra_redactions)
 }
 
 /// Project folder name only, so packed output never exposes the absolute path.
@@ -805,22 +874,34 @@ fn read_and_redact_file(
     max_file_size: u64,
     redact: bool,
 ) -> (String, RedactionSummary, bool) {
+    let skipped_summary = || RedactionSummary {
+        redaction_enabled: redact,
+        files_skipped: 1,
+        ..RedactionSummary::default()
+    };
     let path = match resolve_file_with_parent_cache(root, relative, valid_parents) {
         Ok(path) => path,
         Err(_) => {
             return (
                 "[File skipped: inaccessible or unsafe project path]".into(),
-                RedactionSummary::default(),
+                skipped_summary(),
                 false,
             )
         }
     };
-    let meta = match std::fs::metadata(&path) {
-        Ok(m) => m,
+    let (file, meta) = match open_verified_regular_file(&path) {
+        Ok(pair) => pair,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return (
+                "[File skipped: not a regular file]".into(),
+                skipped_summary(),
+                false,
+            )
+        }
         Err(e) => {
             return (
                 format!("[Error reading metadata: {e}]"),
-                RedactionSummary::default(),
+                skipped_summary(),
                 false,
             )
         }
@@ -830,55 +911,59 @@ fn read_and_redact_file(
     if file_size > max_file_size {
         return (
             format!("[File too large: {file_size} bytes (limit {max_file_size}), skipped]"),
-            RedactionSummary::default(),
+            skipped_summary(),
             false,
         );
     }
 
-    if !meta.is_file() {
-        return (
-            "[File skipped: not a regular file]".into(),
-            RedactionSummary::default(),
-            false,
-        );
-    }
-    // Enforce the limit while reading too, in case a file grows after metadata.
+    // Enforce the limit while reading from the verified handle, in case a file grows after fstat.
     use std::io::Read;
-    let bytes = std::fs::File::open(&path).and_then(|file| {
-        let mut bytes = Vec::new();
+    let bytes = {
+        let mut bytes = Vec::with_capacity(file_size as usize);
         file.take(max_file_size.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
-    });
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    };
     match bytes {
         Ok(bytes) if bytes.len() as u64 > max_file_size => (
             format!("[File too large: limit {max_file_size} bytes, skipped]"),
-            RedactionSummary::default(),
+            skipped_summary(),
             false,
         ),
         Ok(bytes) => match decode_text(&bytes, false) {
             Ok(text) => {
                 if redact {
-                    let (redacted, summary) = redact_secrets_with_report(&text);
+                    let (redacted, mut summary) = redact_secrets_with_report(&text);
+                    summary.redaction_enabled = true;
+                    summary.files_scanned = 1;
                     (redacted.into_owned(), summary, true)
                 } else {
-                    (text, RedactionSummary::default(), true)
+                    (
+                        text,
+                        RedactionSummary {
+                            redaction_enabled: false,
+                            files_scanned: 0,
+                            files_skipped: 0,
+                            ..RedactionSummary::default()
+                        },
+                        true,
+                    )
                 }
             }
             Err(TextError::Binary) => (
                 format!("[Binary file - {file_size} bytes, content omitted for LLM safety]"),
-                RedactionSummary::default(),
+                skipped_summary(),
                 false,
             ),
             Err(TextError::Encoding) => (
                 "[Invalid text encoding: use UTF-8 or UTF-16 with BOM]".into(),
-                RedactionSummary::default(),
+                skipped_summary(),
                 false,
             ),
         },
         Err(_) => (
             "[Error reading project file]".into(),
-            RedactionSummary::default(),
+            skipped_summary(),
             false,
         ),
     }
@@ -938,6 +1023,55 @@ mod tests {
         assert!(v["files"].as_array().unwrap().len() == 2);
         let content = v["files"][0]["content"].as_str().unwrap();
         assert!(content.contains("fn main") || content.contains("hello"));
+    }
+
+    #[test]
+    fn task_prompt_secrets_are_masked_in_every_format_and_counted() {
+        let (_dir, root) = tmp_project();
+        let entries = entries_for(&root);
+        let token = concat!("sk-", "abcdefghijklmnopqrstuvwx");
+        let prompt = format!("Why does this key fail: {token} ?");
+        for format in [
+            OutputFormat::Xml,
+            OutputFormat::Markdown,
+            OutputFormat::Json,
+            OutputFormat::Plain,
+        ] {
+            let opts = WriteOptions {
+                format,
+                task_prompt: Some(prompt.clone()),
+                redact_secrets: true,
+                ..Default::default()
+            };
+            let mut buf = Vec::new();
+            let stats =
+                write_output_with_stats(&mut buf, &entries, &root, &opts, &|| false).unwrap();
+            let text = String::from_utf8(buf).unwrap();
+            assert!(!text.contains(token), "{format:?} leaked the prompt secret");
+            assert!(
+                text.contains("[REDACTED"),
+                "{format:?} did not mask the prompt"
+            );
+            assert!(
+                stats.redactions.total_redactions >= 1,
+                "{format:?} masked prompt not counted in the report"
+            );
+        }
+
+        let opts = WriteOptions {
+            format: OutputFormat::Plain,
+            task_prompt: Some(prompt.clone()),
+            redact_secrets: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let stats = write_output_with_stats(&mut buf, &entries, &root, &opts, &|| false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains(token),
+            "redaction off must keep the prompt verbatim"
+        );
+        assert!(!stats.redactions.redaction_enabled);
     }
 
     #[test]

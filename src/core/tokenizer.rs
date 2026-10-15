@@ -27,6 +27,33 @@ impl TokenizerModel {
             _ => Self::O200kBase,
         }
     }
+
+    pub fn try_parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "o200k" | "o200k_base" | "gpt-4o" | "gpt-5" | "o3" => Ok(Self::O200kBase),
+            "cl100k" | "cl100k_base" | "gpt-4" => Ok(Self::Cl100kBase),
+            "claude" | "anthropic" | "sonnet" | "opus" => Ok(Self::Claude),
+            "gemini" | "google" => Ok(Self::Gemini),
+            other => Err(format!(
+                "unknown tokenizer '{other}' (use o200k_base|cl100k_base|claude|gemini)"
+            )),
+        }
+    }
+
+    /// True only when this profile uses an exact BPE vocabulary (`o200k_base` or `cl100k_base`).
+    /// `Claude` and `Gemini` are scaled approximations of `o200k_base`.
+    pub fn is_exact_bpe(self) -> bool {
+        matches!(self, Self::O200kBase | Self::Cl100kBase)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::O200kBase => "o200k_base",
+            Self::Cl100kBase => "cl100k_base",
+            Self::Claude => "claude (~approx 1.04x o200k_base)",
+            Self::Gemini => "gemini (~approx 0.96x o200k_base)",
+        }
+    }
 }
 
 fn o200k() -> &'static CoreBPE {

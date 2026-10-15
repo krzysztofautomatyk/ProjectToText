@@ -11,15 +11,40 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+fn default_redaction_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RedactionSummary {
     pub total_redactions: usize,
     pub kinds: Vec<(String, usize)>,
+    #[serde(default = "default_redaction_enabled")]
+    pub redaction_enabled: bool,
+    #[serde(default)]
+    pub files_scanned: usize,
+    #[serde(default)]
+    pub files_skipped: usize,
+}
+
+impl Default for RedactionSummary {
+    fn default() -> Self {
+        Self {
+            total_redactions: 0,
+            kinds: Vec::new(),
+            redaction_enabled: true,
+            files_scanned: 0,
+            files_skipped: 0,
+        }
+    }
 }
 
 impl RedactionSummary {
     pub fn merge(&mut self, other: &RedactionSummary) {
+        self.redaction_enabled = self.redaction_enabled && other.redaction_enabled;
+        self.files_scanned += other.files_scanned;
+        self.files_skipped += other.files_skipped;
         if other.total_redactions == 0 {
             return;
         }
@@ -55,7 +80,7 @@ struct Rule {
 fn rules() -> &'static [Rule] {
     static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
     RULES.get_or_init(|| {
-        let raw: [(&str, &str, &str, bool); 13] = [
+        let raw: [(&str, &str, &str, bool); 17] = [
             (
                 "PRIVATE_KEY",
                 r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=:, \t\r\n-]+?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
@@ -109,6 +134,31 @@ fn rules() -> &'static [Rule] {
                 "SLACK_TOKEN",
                 r"\bxox[abposr]-[A-Za-z0-9-]{10,}",
                 "[REDACTED: SLACK_TOKEN]",
+                false,
+            ),
+            (
+                "GITLAB_TOKEN",
+                r"\bglpat-[0-9A-Za-z_-]{20,}\b",
+                "[REDACTED: GITLAB_TOKEN]",
+                false,
+            ),
+            (
+                "HUGGINGFACE_TOKEN",
+                r"\bhf_[A-Za-z0-9]{34,}\b",
+                "[REDACTED: HUGGINGFACE_TOKEN]",
+                false,
+            ),
+            (
+                "NPM_TOKEN",
+                r"\bnpm_[A-Za-z0-9]{36}\b",
+                "[REDACTED: NPM_TOKEN]",
+                false,
+            ),
+            // Three base64url segments, the first two starting with `eyJ` (JSON `{"`).
+            (
+                "JWT_TOKEN",
+                r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+                "[REDACTED: JWT_TOKEN]",
                 false,
             ),
             // URL basic-auth credentials: scheme `://` user `:` password `@` host
@@ -431,5 +481,22 @@ mod tests {
         let redacted = redact_secrets(text);
         assert!(matches!(redacted, Cow::Borrowed(_)));
         assert_eq!(redacted, text);
+    }
+
+    #[test]
+    fn adversarial_large_near_miss_input_completes_quickly_in_linear_time() {
+        // 512 KiB of near-miss prefixes (`sk-short`, `AKIA123`, `eyJabc.def`, `http://a:b`)
+        let chunk = "sk-short AKIA12345 eyJabc.eyJdef.short http://user: in_code_password = 1;\n";
+        let payload = chunk.repeat(7_000);
+        let start = std::time::Instant::now();
+        let (redacted, summary) = redact_secrets_with_report(&payload);
+        let elapsed = start.elapsed();
+        assert_eq!(summary.total_redactions, 0);
+        assert!(matches!(redacted, Cow::Borrowed(_)));
+        assert!(
+            elapsed.as_millis() < 500,
+            "adversarial redaction took {} ms",
+            elapsed.as_millis()
+        );
     }
 }

@@ -43,10 +43,165 @@ const JUNK_DIR_NAMES = new Set(CANONICAL_JUNK_DIRS.map((d) => d.toLowerCase()));
 
 export type BrowserFileMap = Map<string, File>;
 
+export interface BrowserSkippedItem {
+  path: string;
+  reason: 'junk_dir' | 'gitignore' | 'pttignore' | 'unreadable';
+  detail?: string;
+}
+
 export interface BrowserProject {
   rootName: string;
   /** Relative POSIX paths → File blobs */
   files: BrowserFileMap;
+  /** Items excluded or skipped during the browser scan */
+  skipped?: BrowserSkippedItem[];
+}
+
+interface CompiledIgnoreRule {
+  negated: boolean;
+  dirOnly: boolean;
+  baseDir: string;
+  matcher: RegExp;
+}
+
+function globToRegExpSource(pattern: string): string {
+  let out = '';
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      if (i + 1 >= pattern.length) {
+        throw new Error('Trailing backslash in ignore pattern');
+      }
+      const next = pattern[i + 1];
+      out += next.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      i += 2;
+      continue;
+    }
+    if (ch === '*') {
+      if (pattern[i + 1] === '*') {
+        if (pattern[i + 2] === '/') {
+          out += '(?:.*/)?';
+          i += 3;
+        } else {
+          out += '.*';
+          i += 2;
+        }
+      } else {
+        out += '[^/]*';
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '?') {
+      out += '[^/]';
+      i += 1;
+      continue;
+    }
+    if (ch === '[') {
+      const close = pattern.indexOf(']', i + 1);
+      if (close === -1) {
+        throw new Error('Unclosed character class in ignore pattern');
+      }
+      let cls = pattern.slice(i + 1, close);
+      if (cls.startsWith('!')) cls = '^' + cls.slice(1);
+      out += `[${cls}]`;
+      i = close + 1;
+      continue;
+    }
+    out += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Parses `.gitignore` or `.pttignore` text into compiled rules scoped to `baseDir`.
+ * When `strict` is true (`.pttignore`), invalid syntax throws an error (fail-closed),
+ * matching Rust `apply_pttignore_on_git_results` / `walk_with_ignore`.
+ */
+export function parseIgnoreFile(
+  content: string,
+  baseDir: string,
+  strict: boolean,
+): CompiledIgnoreRule[] {
+  const rules: CompiledIgnoreRule[] = [];
+  const lines = content.split(/\r?\n/);
+  for (const rawLine of lines) {
+    let line = rawLine;
+    // Strip unescaped trailing spaces
+    while (line.endsWith(' ') && !line.endsWith('\\ ')) {
+      line = line.slice(0, -1);
+    }
+    if (!line || line.startsWith('#')) continue;
+    if (line.startsWith('\\#') || line.startsWith('\\!')) {
+      line = line.slice(1);
+    } else if (line.startsWith('!')) {
+      const rest = line.slice(1);
+      if (!rest) {
+        if (strict) throw new Error('Invalid empty negation pattern "!" in .pttignore');
+        continue;
+      }
+      try {
+        rules.push(compileSingleRule(rest, baseDir, true, strict));
+      } catch (err) {
+        if (strict) throw err;
+      }
+      continue;
+    }
+    try {
+      rules.push(compileSingleRule(line, baseDir, false, strict));
+    } catch (err) {
+      if (strict) throw err;
+    }
+  }
+  return rules;
+}
+
+function compileSingleRule(
+  rawPattern: string,
+  baseDir: string,
+  negated: boolean,
+  strict: boolean,
+): CompiledIgnoreRule {
+  let pat = rawPattern;
+  const dirOnly = pat.endsWith('/');
+  if (dirOnly) pat = pat.replace(/\/+$/, '');
+  if (!pat) {
+    throw new Error('Empty ignore pattern');
+  }
+  // Reject invalid `**` adjacency in strict mode (e.g. `a/**b`)
+  if (strict && /(?<!^|\/)\*\*|\*\*(?!$|\/)/.test(pat)) {
+    throw new Error(`Invalid globstar placement in .pttignore: ${rawPattern}`);
+  }
+  const leadingSlash = pat.startsWith('/');
+  if (leadingSlash) pat = pat.slice(1);
+  const anchored = leadingSlash || pat.includes('/');
+  const regexBody = globToRegExpSource(pat);
+  const fullRegexStr = anchored ? `^${regexBody}$` : `(?:^|/)${regexBody}$`;
+  const matcher = new RegExp(fullRegexStr);
+  return { negated, dirOnly, baseDir, matcher };
+}
+
+function evaluateIgnoreRules(
+  rules: readonly CompiledIgnoreRule[],
+  relPath: string,
+  isDir: boolean,
+): boolean {
+  let ignored = false;
+  for (const rule of rules) {
+    if (rule.dirOnly && !isDir) continue;
+    let subPath = relPath;
+    if (rule.baseDir) {
+      const prefix = `${rule.baseDir}/`;
+      if (!relPath.startsWith(prefix)) continue;
+      subPath = relPath.slice(prefix.length);
+    }
+    if (rule.matcher.test(subPath)) {
+      ignored = !rule.negated;
+    }
+  }
+  return ignored;
 }
 
 export class UserCancelledError extends Error {
@@ -96,23 +251,154 @@ async function* directoryEntries(
   throw new Error('This browser cannot list folder contents (File System Access incomplete).');
 }
 
-/** Recursively list a FileSystemDirectoryHandle into flat nodes + file map. */
+/**
+ * Applies top-down `.gitignore` and `.pttignore` pruning and filtering to an arbitrary
+ * candidate map of `relPath -> File`. Mirrors Rust `apply_pttignore_on_git_results` /
+ * `walk_with_ignore`:
+ * - Excluded parent directories cannot be resurrected by child negation rules.
+ * - `.pttignore` syntax/read errors fail closed (throw), whereas `.gitignore` syntax errors
+ *   skip only the offending line.
+ */
+export async function applyIgnoreSemanticsToFileMap(
+  rawFiles: BrowserFileMap,
+  initialSkipped: BrowserSkippedItem[] = [],
+): Promise<{
+  files: BrowserFileMap;
+  dirPaths: Set<string>;
+  skipped: BrowserSkippedItem[];
+}> {
+  const skipped: BrowserSkippedItem[] = [...initialSkipped];
+  const allDirs = new Set<string>();
+  for (const rel of rawFiles.keys()) {
+    const segs = rel.split('/');
+    let acc = '';
+    for (let i = 0; i < segs.length - 1; i++) {
+      acc = acc ? `${acc}/${segs[i]}` : segs[i];
+      allDirs.add(acc);
+    }
+  }
+
+  const sortedDirs = ['', ...Array.from(allDirs).sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b))];
+
+  interface DirIgnoreContext {
+    gitRules: CompiledIgnoreRule[];
+    pttRules: CompiledIgnoreRule[];
+    blockedBy: 'gitignore' | 'pttignore' | null;
+  }
+
+  const contexts = new Map<string, DirIgnoreContext>();
+
+  async function loadRulesForDir(
+    dir: string,
+    parentGit: CompiledIgnoreRule[],
+    parentPtt: CompiledIgnoreRule[],
+  ): Promise<{ gitRules: CompiledIgnoreRule[]; pttRules: CompiledIgnoreRule[] }> {
+    let gitRules = parentGit;
+    let pttRules = parentPtt;
+    const gitPath = dir ? `${dir}/.gitignore` : '.gitignore';
+    const pttPath = dir ? `${dir}/.pttignore` : '.pttignore';
+
+    const gitFile = rawFiles.get(gitPath);
+    if (gitFile) {
+      try {
+        const text = await gitFile.text();
+        gitRules = [...parentGit, ...parseIgnoreFile(text, dir, false)];
+      } catch {
+        // Foreign .gitignore read errors do not abort the walk
+      }
+    }
+
+    const pttFile = rawFiles.get(pttPath);
+    if (pttFile) {
+      const text = await pttFile.text();
+      pttRules = [...parentPtt, ...parseIgnoreFile(text, dir, true)];
+    }
+
+    return { gitRules, pttRules };
+  }
+
+  const rootLoaded = await loadRulesForDir('', [], []);
+  contexts.set('', { ...rootLoaded, blockedBy: null });
+
+  for (const dir of sortedDirs) {
+    if (dir === '') continue;
+    const slash = dir.lastIndexOf('/');
+    const parent = slash < 0 ? '' : dir.slice(0, slash);
+    const parentCtx = contexts.get(parent)!;
+
+    if (parentCtx.blockedBy) {
+      contexts.set(dir, {
+        gitRules: parentCtx.gitRules,
+        pttRules: parentCtx.pttRules,
+        blockedBy: parentCtx.blockedBy,
+      });
+      continue;
+    }
+
+    const blockedByGit = evaluateIgnoreRules(parentCtx.gitRules, dir, true);
+    const blockedByPtt = !blockedByGit && evaluateIgnoreRules(parentCtx.pttRules, dir, true);
+    const blockedBy = blockedByGit ? 'gitignore' : blockedByPtt ? 'pttignore' : null;
+    if (blockedBy) {
+      skipped.push({ path: dir, reason: blockedBy });
+      contexts.set(dir, {
+        gitRules: parentCtx.gitRules,
+        pttRules: parentCtx.pttRules,
+        blockedBy,
+      });
+    } else {
+      const loaded = await loadRulesForDir(dir, parentCtx.gitRules, parentCtx.pttRules);
+      contexts.set(dir, { ...loaded, blockedBy: null });
+    }
+  }
+
+  const keptFiles: BrowserFileMap = new Map();
+  const keptDirs = new Set<string>();
+
+  for (const [dir, ctx] of contexts.entries()) {
+    if (dir !== '' && !ctx.blockedBy) {
+      keptDirs.add(dir);
+    }
+  }
+
+  for (const [rel, file] of rawFiles.entries()) {
+    const slash = rel.lastIndexOf('/');
+    const parent = slash < 0 ? '' : rel.slice(0, slash);
+    const ctx = contexts.get(parent);
+    if (!ctx || ctx.blockedBy) continue;
+
+    if (evaluateIgnoreRules(ctx.gitRules, rel, false)) {
+      skipped.push({ path: rel, reason: 'gitignore' });
+      continue;
+    }
+    if (evaluateIgnoreRules(ctx.pttRules, rel, false)) {
+      skipped.push({ path: rel, reason: 'pttignore' });
+      continue;
+    }
+    keptFiles.set(rel, file);
+  }
+
+  return { files: keptFiles, dirPaths: keptDirs, skipped };
+}
+
+/** Recursively list a FileSystemDirectoryHandle into flat nodes + file map, honoring .gitignore and .pttignore. */
 export async function scanDirectoryHandle(
   root: FileSystemDirectoryHandle,
 ): Promise<{ nodes: BrowserFileNode[]; project: BrowserProject }> {
-  const files: BrowserFileMap = new Map();
-  const dirPaths = new Set<string>();
+  const rawFiles: BrowserFileMap = new Map();
+  const skipped: BrowserSkippedItem[] = [];
   let fileCount = 0;
   const MAX_FILES = 25_000;
 
   async function walk(dir: FileSystemDirectoryHandle, prefix: string) {
     for await (const [name, handle] of directoryEntries(dir)) {
       if (!name || name === '.' || name === '..') continue;
-      const rel = prefix ? `${prefix}/${name}` : name;
+      const rel = (prefix ? `${prefix}/${name}` : name).replace(/\\/g, '/');
 
       if (handle.kind === 'directory') {
-        if (isJunkDir(name)) continue;
-        dirPaths.add(rel);
+        if (isJunkDir(name)) {
+          skipped.push({ path: rel, reason: 'junk_dir' });
+          continue;
+        }
         await walk(handle as FileSystemDirectoryHandle, rel);
         continue;
       }
@@ -125,10 +411,14 @@ export async function scanDirectoryHandle(
         }
         try {
           const file = await (handle as FileSystemFileHandle).getFile();
-          files.set(rel.replace(/\\/g, '/'), file);
+          rawFiles.set(rel, file);
           fileCount++;
         } catch (err) {
-          // Skip unreadable files (permissions / locks) instead of failing whole scan
+          skipped.push({
+            path: rel,
+            reason: 'unreadable',
+            detail: err instanceof Error ? err.message : String(err),
+          });
           console.warn('Skip unreadable file', rel, err);
         }
       }
@@ -137,8 +427,9 @@ export async function scanDirectoryHandle(
 
   await walk(root, '');
 
+  const filtered = await applyIgnoreSemanticsToFileMap(rawFiles, skipped);
   const nodes: BrowserFileNode[] = [];
-  for (const d of dirPaths) {
+  for (const d of filtered.dirPaths) {
     nodes.push({
       path: d,
       name: d.split('/').pop() || d,
@@ -146,7 +437,7 @@ export async function scanDirectoryHandle(
       selected: false,
     });
   }
-  for (const [path, file] of files) {
+  for (const [path, file] of filtered.files) {
     nodes.push({
       path,
       name: path.split('/').pop() || path,
@@ -159,19 +450,23 @@ export async function scanDirectoryHandle(
 
   return {
     nodes,
-    project: { rootName: root.name || 'project', files },
+    project: {
+      rootName: root.name || 'project',
+      files: filtered.files,
+      skipped: filtered.skipped,
+    },
   };
 }
 
 /**
- * Scan files from a legacy <input webkitdirectory> FileList.
+ * Scan files from a legacy <input webkitdirectory> FileList, honoring .gitignore and .pttignore.
  */
-export function scanFileList(list: FileList | File[]): {
+export async function scanFileList(list: FileList | File[]): Promise<{
   nodes: BrowserFileNode[];
   project: BrowserProject;
-} {
-  const files: BrowserFileMap = new Map();
-  const dirPaths = new Set<string>();
+}> {
+  const rawFiles: BrowserFileMap = new Map();
+  const skipped: BrowserSkippedItem[] = [];
   let rootName = 'project';
 
   const arr = Array.from(list);
@@ -183,7 +478,7 @@ export function scanFileList(list: FileList | File[]): {
     if (parts.length === 0) continue;
 
     if (parts.length === 1) {
-      files.set(parts[0], file);
+      rawFiles.set(parts[0], file);
       continue;
     }
 
@@ -193,6 +488,7 @@ export function scanFileList(list: FileList | File[]): {
     let skip = false;
     for (let i = 1; i < parts.length - 1; i++) {
       if (isJunkDir(parts[i])) {
+        skipped.push({ path: parts.slice(1, i + 1).join('/'), reason: 'junk_dir' });
         skip = true;
         break;
       }
@@ -200,17 +496,12 @@ export function scanFileList(list: FileList | File[]): {
     if (skip) continue;
 
     const rel = parts.slice(1).join('/');
-    const segs = rel.split('/');
-    let acc = '';
-    for (let i = 0; i < segs.length - 1; i++) {
-      acc = acc ? `${acc}/${segs[i]}` : segs[i];
-      dirPaths.add(acc);
-    }
-    files.set(rel, file);
+    rawFiles.set(rel, file);
   }
 
+  const filtered = await applyIgnoreSemanticsToFileMap(rawFiles, skipped);
   const nodes: BrowserFileNode[] = [];
-  for (const d of dirPaths) {
+  for (const d of filtered.dirPaths) {
     nodes.push({
       path: d,
       name: d.split('/').pop() || d,
@@ -218,7 +509,7 @@ export function scanFileList(list: FileList | File[]): {
       selected: false,
     });
   }
-  for (const [path, file] of files) {
+  for (const [path, file] of filtered.files) {
     nodes.push({
       path,
       name: path.split('/').pop() || path,
@@ -229,7 +520,14 @@ export function scanFileList(list: FileList | File[]): {
   }
   nodes.sort((a, b) => a.path.localeCompare(b.path));
 
-  return { nodes, project: { rootName, files } };
+  return {
+    nodes,
+    project: {
+      rootName,
+      files: filtered.files,
+      skipped: filtered.skipped,
+    },
+  };
 }
 
 /** Pick a directory via File System Access API (Chrome/Edge). */
@@ -484,11 +782,17 @@ async function readPackContentWithReport(
   doRedact = true,
   isSkeleton = false,
 ): Promise<{ content: string; summary: RedactionSummary }> {
-  const emptySummary: RedactionSummary = { totalRedactions: 0, kinds: [] };
+  const skippedSummary: RedactionSummary = {
+    totalRedactions: 0,
+    kinds: [],
+    redactionEnabled: doRedact,
+    filesScanned: 0,
+    filesSkipped: 1,
+  };
   if (file.size > PACK_MAX) {
     return {
       content: `[File too large: ${file.size} bytes (limit ${PACK_MAX}), skipped]`,
-      summary: emptySummary,
+      summary: skippedSummary,
     };
   }
   try {
@@ -496,11 +800,22 @@ async function readPackContentWithReport(
     const decoded = decodeText(buf);
     if (decoded.ok) {
       let text = decoded.text;
-      let summary = emptySummary;
+      let summary: RedactionSummary = {
+        totalRedactions: 0,
+        kinds: [],
+        redactionEnabled: doRedact,
+        filesScanned: doRedact ? 1 : 0,
+        filesSkipped: 0,
+      };
       if (doRedact) {
         const res = redactSecretsWithReport(text);
         text = res.text;
-        summary = res.summary;
+        summary = {
+          ...res.summary,
+          redactionEnabled: true,
+          filesScanned: 1,
+          filesSkipped: 0,
+        };
       } else {
         // silence unused import if needed
         void redactSecrets;
@@ -511,16 +826,16 @@ async function readPackContentWithReport(
       return { content: text, summary };
     }
     if (decoded.reason === 'encoding') {
-      return { content: INVALID_ENCODING_MESSAGE, summary: emptySummary };
+      return { content: INVALID_ENCODING_MESSAGE, summary: skippedSummary };
     }
     return {
       content: `[Binary file - ${file.size} bytes, content omitted for LLM safety]`,
-      summary: emptySummary,
+      summary: skippedSummary,
     };
   } catch (e) {
     return {
       content: `[Error reading file: ${e instanceof Error ? e.message : String(e)}]`,
-      summary: emptySummary,
+      summary: skippedSummary,
     };
   }
 }
@@ -582,7 +897,11 @@ export async function generateBrowserOutputWithStats(
 }> {
   const doRedact = opts.redactSecrets !== false;
   const skelSet = opts.skeletonFiles ?? new Set<string>();
-  const taskPrompt = opts.taskPrompt?.trim() || '';
+  // The prompt is masked with the same rules as file contents when redaction is on (parity with
+  // the native `task_prompt_text` in src/core/output.rs). Its counts are included in the report.
+  const rawTaskPrompt = opts.taskPrompt?.trim() || '';
+  const promptRedaction = doRedact && rawTaskPrompt ? redactSecretsWithReport(rawTaskPrompt) : null;
+  const taskPrompt = promptRedaction ? promptRedaction.text : rawTaskPrompt;
 
   const selected = new Set(selectedPaths.map((p) => p.replace(/\\/g, '/').replace(/\/+$/, '')));
   const isSelected = (path: string): boolean => {
@@ -613,8 +932,10 @@ export async function generateBrowserOutputWithStats(
       ? `\n<!-- packed first ${MAX_PACK_FILES} of ${entries.length} selected files (browser limit) -->\n`
       : '';
 
-  let totalRedactions = 0;
-  const kindMap = new Map<string, number>();
+  let totalRedactions = promptRedaction?.summary.totalRedactions ?? 0;
+  let filesScanned = 0;
+  let filesSkipped = 0;
+  const kindMap = new Map<string, number>(promptRedaction?.summary.kinds ?? []);
   const fileTokens: { path: string; bytes: number; tokens: number; mode: 'full' | 'skeleton' }[] = [];
 
   const prepared: { path: string; size: number; content: string; isSkel: boolean }[] = [];
@@ -622,6 +943,8 @@ export async function generateBrowserOutputWithStats(
     const isSkel = skelSet.has(e.path);
     const { content, summary } = await readPackContentWithReport(e.file, doRedact, isSkel);
     totalRedactions += summary.totalRedactions;
+    filesScanned += summary.filesScanned ?? 0;
+    filesSkipped += summary.filesSkipped ?? 0;
     for (const [k, c] of summary.kinds) {
       kindMap.set(k, (kindMap.get(k) ?? 0) + c);
     }
@@ -638,6 +961,9 @@ export async function generateBrowserOutputWithStats(
   const redactions: RedactionSummary = {
     totalRedactions,
     kinds: Array.from(kindMap.entries()),
+    redactionEnabled: doRedact,
+    filesScanned,
+    filesSkipped,
   };
 
   if (format === 'json') {

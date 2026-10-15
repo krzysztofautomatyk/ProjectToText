@@ -2,6 +2,7 @@
 //! secret redaction, BPE tokenization, AST skeletonization, dependency graph, and Git context.
 //! Used by the Tauri desktop app, headless CLI, and MCP server.
 
+pub mod budget;
 pub mod deps;
 pub mod git;
 pub mod output;

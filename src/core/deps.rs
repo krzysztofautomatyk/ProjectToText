@@ -6,13 +6,27 @@
 //! (Python), and `using` (C#) to resolve relative and crate-local file dependencies inside a
 //! workspace snapshot. File reading and import extraction run in parallel.
 
+use crate::core::preview::{is_link, read_verified_file_string};
 use crate::core::walker::{normalize_rel_path, DirEntryMeta};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
+
+/// One file's cached state: the `(mtime, len)` stamp it was read with, its text, and its resolved imports.
+#[derive(Debug, Clone)]
+struct CachedFileEntry {
+    mtime: Option<SystemTime>,
+    len: u64,
+    content: Arc<str>,
+    resolved: BTreeSet<String>,
+}
+
+/// One file's cache entry, keyed by its relative path.
+type FileResolution = (String, CachedFileEntry);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -31,19 +45,36 @@ pub struct DependencyGraph {
     pub importers: HashMap<String, BTreeSet<String>>,
     /// file -> set of matching test files
     pub matching_tests: HashMap<String, BTreeSet<String>>,
+    /// file -> cached text and imports, reused by `build_incremental` while the stamp matches.
+    file_cache: HashMap<String, CachedFileEntry>,
+    /// The file set the cache was resolved against.
+    cached_files: HashSet<String>,
 }
 
 impl DependencyGraph {
     pub fn build(root: &Path, entries: &[DirEntryMeta]) -> Self {
+        Self::build_incremental(root, entries, None)
+    }
+
+    /// Rebuilds the graph. A file whose `(mtime, len)` is unchanged is never read from disk again: its
+    /// cached text is reused. When the file set changed, its imports are re-resolved from that text,
+    /// because a new file can satisfy an import that previously resolved to nothing.
+    pub fn build_incremental(
+        root: &Path,
+        entries: &[DirEntryMeta],
+        previous: Option<&DependencyGraph>,
+    ) -> Self {
         let file_set: HashSet<String> = entries
             .iter()
             .filter(|e| !e.is_dir)
             .map(|e| normalize_rel_path(&e.path))
             .collect();
 
+        let same_file_set = previous.is_some_and(|p| p.cached_files == file_set);
+
         // Reading and parsing each file is independent, so it runs on the rayon pool. The
         // results are merged afterwards, which keeps the graph deterministic (BTreeSet values).
-        let resolved_per_file: Vec<(String, BTreeSet<String>)> = file_set
+        let resolved_per_file: Vec<FileResolution> = file_set
             .par_iter()
             .filter_map(|rel| {
                 let ext = Path::new(rel)
@@ -58,22 +89,55 @@ impl DependencyGraph {
                     return None;
                 }
                 let full = root.join(rel);
-                let meta = std::fs::metadata(&full).ok()?;
-                if !meta.is_file() || meta.len() > 512 * 1024 {
+                let meta = std::fs::symlink_metadata(&full).ok()?;
+                if is_link(&meta) || !meta.is_file() || meta.len() > 512 * 1024 {
                     return None;
                 }
-                let content = std::fs::read_to_string(&full).ok()?;
-                Some((
-                    rel.clone(),
-                    resolve_file_imports(rel, &ext, &content, &file_set),
-                ))
+                let stamp = (meta.modified().ok(), meta.len());
+                // A stamp without an mtime cannot prove the file is unchanged, so it is never reused.
+                let cached = if stamp.0.is_some() {
+                    previous
+                        .and_then(|p| p.file_cache.get(rel))
+                        .filter(|entry| (entry.mtime, entry.len) == stamp)
+                } else {
+                    None
+                };
+                let entry = match cached {
+                    Some(entry) => {
+                        // Unchanged file: its text is already in memory, so it is not read again.
+                        let resolved = if same_file_set {
+                            entry.resolved.clone()
+                        } else {
+                            resolve_file_imports(rel, &ext, &entry.content, &file_set)
+                        };
+                        CachedFileEntry {
+                            mtime: stamp.0,
+                            len: stamp.1,
+                            content: Arc::clone(&entry.content),
+                            resolved,
+                        }
+                    }
+                    None => {
+                        let content: Arc<str> =
+                            read_verified_file_string(&full, 512 * 1024).ok()?.into();
+                        let resolved = resolve_file_imports(rel, &ext, &content, &file_set);
+                        CachedFileEntry {
+                            mtime: stamp.0,
+                            len: stamp.1,
+                            content,
+                            resolved,
+                        }
+                    }
+                };
+                Some((rel.clone(), entry))
             })
             .collect();
 
         let mut imports: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut importers: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for (rel, resolved) in resolved_per_file {
-            for target in &resolved {
+        let mut file_cache = HashMap::with_capacity(resolved_per_file.len());
+        for (rel, entry) in resolved_per_file {
+            for target in &entry.resolved {
                 if *target != rel {
                     imports
                         .entry(rel.clone())
@@ -85,6 +149,7 @@ impl DependencyGraph {
                         .insert(rel.clone());
                 }
             }
+            file_cache.insert(rel, entry);
         }
 
         let matching_tests = match_test_files(&file_set, &importers);
@@ -93,6 +158,8 @@ impl DependencyGraph {
             imports,
             importers,
             matching_tests,
+            file_cache,
+            cached_files: file_set,
         }
     }
 
@@ -531,6 +598,56 @@ mod tests {
         let util_rel = graph.related_for("src/util.rs");
         assert!(util_rel.importers.contains(&"src/main.rs".to_string()));
         assert!(util_rel.tests.contains(&"tests/util_test.rs".to_string()));
+    }
+
+    #[test]
+    fn incremental_graph_skips_disk_read_when_file_set_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let a = root.join("src/a.ts");
+        fs::write(&a, "import './b';\nimport './c';\n").unwrap();
+        fs::write(root.join("src/b.ts"), "export const b = 1;\n").unwrap();
+        let entry = |p: &str| DirEntryMeta {
+            path: PathBuf::from(p),
+            is_dir: false,
+            size: Some(20),
+        };
+
+        let first = DependencyGraph::build(root, &[entry("src/a.ts"), entry("src/b.ts")]);
+        let first_a = first.imports.get("src/a.ts").cloned().unwrap_or_default();
+        assert!(first_a.contains("src/b.ts"), "{first_a:?}");
+        // `src/c.ts` does not exist yet, so `./c` resolves to nothing.
+        assert!(!first_a.contains("src/c.ts"), "{first_a:?}");
+
+        // Add `c.ts`. Then rewrite `a.ts` with same-length text that no longer imports `./c`, and restore
+        // its original mtime. The stamp still matches, so the cached text must be used. Reading the file
+        // again would drop the `./c` import.
+        let original_mtime = fs::metadata(&a).unwrap().modified().unwrap();
+        fs::write(root.join("src/c.ts"), "export const c = 2;\n").unwrap();
+        fs::write(&a, "import './b';\nimport './x';\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+
+        let second = DependencyGraph::build_incremental(
+            root,
+            &[entry("src/a.ts"), entry("src/b.ts"), entry("src/c.ts")],
+            Some(&first),
+        );
+        let second_a = second.imports.get("src/a.ts").cloned().unwrap_or_default();
+        assert!(second_a.contains("src/b.ts"), "{second_a:?}");
+        assert!(second_a.contains("src/c.ts"), "{second_a:?}");
+        assert!(
+            second
+                .importers
+                .get("src/c.ts")
+                .is_some_and(|s| s.contains("src/a.ts")),
+            "{second:?}"
+        );
     }
 
     #[test]

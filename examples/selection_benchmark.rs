@@ -13,6 +13,15 @@ fn pack_once(entries: &[DirEntryMeta], root: &Path, opts: &WriteOptions) -> Vec<
     buf
 }
 
+/// Packs each 64-file chunk on its own, as the 0.4.0 build did. Chunks wait for one another.
+fn pack_chunked_64(entries: &[DirEntryMeta], root: &Path, opts: &WriteOptions) {
+    for chunk in entries.chunks(64) {
+        let mut sink = Vec::new();
+        write_output_with_stats(&mut sink, chunk, root, opts, &|| false).unwrap();
+        black_box(sink);
+    }
+}
+
 fn main() {
     let candidates: Vec<_> = (0..10_000)
         .map(|i| PathBuf::from(format!("package{}/src/file{i}.rs", i / 100)))
@@ -199,5 +208,48 @@ fn main() {
     println!("ast_skeleton_extraction: median_ms={ast:.3}");
     println!(
         "ptt_source_skeleton_compression: full_bpe_tokens={full_tokens}; skeleton_bpe_tokens={skel_tokens}; token_reduction={reduction_pct:.1}%; skeleton_bpe_median_ms={bpe_skel:.3}"
+    );
+
+    // 5. Chunked vs single-pass packing on an uneven workload. `chunked_64` reproduces the 0.4.0
+    // structure: each 64-file chunk is packed on its own, so chunks wait for one another. It is a
+    // simulation of that structure, not the 0.4.0 code. Every 32nd file is about 32 KB, the rest
+    // about 1 KB. Each timing is the median of three repetitions.
+    let uneven_dir = tempfile::tempdir().unwrap();
+    let uneven_root = uneven_dir.path();
+    let big = "pub fn heavy(x: usize) -> usize {\n    x * 2\n}\n".repeat(700);
+    let small = "pub fn light(x: usize) -> usize {\n    x + 1\n}\n".repeat(20);
+    let mut uneven = Vec::new();
+    for i in 0..800usize {
+        let rel = PathBuf::from(format!("pkg{}/mod{i}.rs", i / 50));
+        let full = uneven_root.join(&rel);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, if i % 32 == 0 { &big } else { &small }).unwrap();
+        uneven.push(DirEntryMeta {
+            path: rel,
+            is_dir: false,
+            size: None,
+        });
+    }
+    let mut single_thread_ms = Vec::new();
+    let mut chunked_ms = Vec::new();
+    let mut single_pass_ms = Vec::new();
+    for _ in 0..3 {
+        let start = Instant::now();
+        black_box(single_thread.install(|| pack_once(&uneven, uneven_root, &opts)));
+        single_thread_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        pack_chunked_64(&uneven, uneven_root, &opts);
+        chunked_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        black_box(pack_once(&uneven, uneven_root, &opts));
+        single_pass_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    println!(
+        "pack_800_files_uneven: single_thread_ms={:.3}; chunked_64_ms={:.3}; single_pass_rayon_ms={:.3}",
+        median(&mut single_thread_ms),
+        median(&mut chunked_ms),
+        median(&mut single_pass_ms)
     );
 }

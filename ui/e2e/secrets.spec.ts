@@ -114,7 +114,81 @@ test('leaves ordinary password code unchanged', () => {
   expect(redactSecrets(text)).toBe(text);
 });
 
+// Same corpus as `secret_scanner_fp_fn_corpus_evaluation` in tests/phase1_regressions.rs.
+test('fixture corpus: 17/17 true positives and 0/20 false positives', () => {
+  const truePositives: [string, string][] = [
+    [['-----BEGIN ', 'PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END ', 'PRIVATE KEY-----'].join(''), 'PRIVATE_KEY'],
+    [['AK', 'IAIOSFODNN7EXAMPLE'].join(''), 'AWS_ACCESS_KEY'],
+    [['sk-ant-', 'api03-abcdefghijklmnopqrstuvwx'].join(''), 'ANTHROPIC_API_KEY'],
+    [['sk-', 'abcdefghijklmnopqrstuvwx'].join(''), 'OPENAI_API_KEY'],
+    [['AIza', 'SyDaGmWKa4JsXZ-HjGw7xAAAAAAAAA12345'].join(''), 'GOOGLE_API_KEY'],
+    [['sk_live_', '51Habcdefghijklmnopqrstuvwx'].join(''), 'STRIPE_KEY'],
+    [['ghp_', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'].join(''), 'GITHUB_TOKEN'],
+    [['xoxb-', '1234567890-abcdefghij'].join(''), 'SLACK_TOKEN'],
+    [['postgres://admin:', 's3cr3tPass', '@db.internal:5432/app'].join(''), 'URL_PASSWORD'],
+    [['Server=db;Password=', 'Sup3r'].join(''), 'PASSWORD'],
+    [['JWT_SECRET=', 'super-secret-jwt-signing-key-999'].join(''), 'ENV_SECRET'],
+    [['glpat-', 'abcdefghijklmnopqrst0123'].join(''), 'GITLAB_TOKEN'],
+    [['hf_', 'abcdefghijklmnopqrstuvwxyz0123456789'].join(''), 'HUGGINGFACE_TOKEN'],
+    [['npm_', 'abcdefghijklmnopqrstuvwxyz0123456789'].join(''), 'NPM_TOKEN'],
+    [
+      ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiIxMjM0NTY3ODkwIn0', 'dozjgNryP4J3jVmNHl0w5N'].join('.'),
+      'JWT_TOKEN',
+    ],
+    [['github_pat_', '11AAABBBCCC0123456789_abcdefghijklmnopqrstuvwx'].join(''), 'GITHUB_TOKEN'],
+    [['DB_PASSWORD=', 'Sup3rSecretEnvPass'].join(''), 'PASSWORD'],
+  ];
+  let caught = 0;
+  for (const [sample, kind] of truePositives) {
+    const { text: redacted } = redactSecretsWithReport(sample);
+    expect(redacted, kind).toContain(`[REDACTED: ${kind}]`);
+    caught += 1;
+  }
+  expect(caught).toBe(17);
+
+  const trueNegatives: string[] = [
+    'id = 123e4567-e89b-12d3-a456-426614174000;',
+    'sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    '<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==">',
+    '<div class="btn btn-primary text-center mt-4">',
+    'const map: Map<string, Array<number>> = new Map();',
+    'SELECT id, name FROM users WHERE active = 1 ORDER BY name;',
+    'if (a == b && c != d) { return a >= 0; }',
+    'Replace <your-token> with a real value from the dashboard.',
+    'fn verify(password: &str) -> bool { hash(password) == stored }',
+    'git commit -m "fix: sk-learn import order"',
+    'See [the docs](https://example.com/docs/getting-started) for details.',
+    'Dev server: http://localhost:3000/api/users',
+    'color: #1a2b3c; background: rgba(0, 0, 0, 0.5);',
+    'createdAt: 2026-10-14T12:00:00Z',
+    'commit 9fceb02d0ae598e95dc970b74767f19372d61af8',
+    '"@scope/package-name": "^1.2.3"',
+    'const token = process.env.API_TOKEN;',
+    'export const TOKEN_LIMIT = 4096;',
+    'MAX_SECRET_LENGTH=32',
+    'headers["X-CSRF-Token"] = csrfToken;',
+  ];
+  expect(trueNegatives.length).toBe(20);
+  let falsePositives = 0;
+  for (const sample of trueNegatives) {
+    const { text: redacted, summary } = redactSecretsWithReport(sample);
+    if (summary.totalRedactions > 0 || redacted !== sample) falsePositives += 1;
+  }
+  expect(falsePositives).toBe(0);
+});
+
 test('leaves ordinary code unchanged', () => {
   const text = 'let task = skip_list;\npassword_hint = "use a manager";\nlet key = sk;\n';
   expect(redactSecrets(text)).toBe(text);
+});
+
+test('adversarial near-miss input completes within bounded time', () => {
+  const chunk = 'sk-short AKIA12345 eyJabc.eyJdef.short http://user: in_code_password = 1;\n';
+  const payload = chunk.repeat(5000);
+  const t0 = Date.now();
+  const { text, summary } = redactSecretsWithReport(payload);
+  const elapsed = Date.now() - t0;
+  expect(summary.totalRedactions).toBe(0);
+  expect(text.length).toBe(payload.length);
+  expect(elapsed).toBeLessThan(500);
 });

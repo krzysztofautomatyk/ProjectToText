@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, master]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -14,21 +17,23 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install Linux Tauri system deps
         if: runner.os == 'Linux'
@@ -51,18 +56,80 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Build release binary and run cross-platform CLI & MCP smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --bin ptt
+          BIN="./target/release/ptt"
+          "$BIN" --version
+          "$BIN" pack . --preset source --max-tokens 20000 -o /tmp/ptt-ci-smoke.xml
+          test -s /tmp/ptt-ci-smoke.xml
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}' | "$BIN" mcp . | grep -q '"2025-11-25"'
+
+  msrv:
+    name: Rust MSRV (1.90)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master branch
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install Linux Tauri system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+
+      - name: Verify MSRV 1.90 compilation
+        run: cargo check --all-targets
+
+  supply-chain:
+    name: Rust dependency audit (RustSec)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-audit
+
+      # Fails on any vulnerability. Two informational warnings (glib, proc-macro-error) come from the
+      # Linux GTK stack pulled in by Tauri and are triaged in SECURITY.md.
+      - name: Audit Cargo.lock
+        run: cargo audit
+
   frontend:
     name: Frontend
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: ui
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4.3.0
         with:
           node-version: "22"
           cache: npm
@@ -70,6 +137,9 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
 
       - name: Lint
         run: npm run lint
@@ -80,15 +150,17 @@ jobs:
   e2e:
     name: E2E (browser smoke)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: ui
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4.3.0
         with:
           node-version: "22"
           cache: npm

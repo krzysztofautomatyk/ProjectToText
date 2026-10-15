@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::Emitter;
 use tauri_plugin_dialog::DialogExt;
 
@@ -31,15 +31,26 @@ use ptt::core::output::{
 use ptt::core::preview::{load_preview, resolve_under_root, DEFAULT_PREVIEW_MAX};
 use ptt::core::secrets::RedactionSummary;
 use ptt::core::tokenizer::TokenizerModel;
-use ptt::core::walker::{is_junk_dir_name, normalize_rel_path, JUNK_DIRS};
+use ptt::core::walker::{is_junk_dir_name, normalize_rel_path, DirEntryMeta, JUNK_DIRS};
 use ptt::core::workspace::WorkspaceIndex;
 
 const PREVIEW_CHAR_LIMIT: usize = 100_000;
+/// Above this many queued watcher paths, the next scan walks the whole tree instead.
+const MAX_PENDING_WATCHER_PATHS: usize = 4096;
+
+/// `(modification time, length)` of a file on disk. `None` means the file does not exist.
+type FileStamp = Option<(Option<SystemTime>, u64)>;
 
 #[derive(Clone)]
 struct PackedArtifact {
     revision: u64,
     generation: u64,
+    /// Project root and the exact entries packed, so the pack can be rebuilt without the index.
+    root: PathBuf,
+    entries: Vec<DirEntryMeta>,
+    options: PackOptions,
+    /// One stamp per entry, read before packing. A changed stamp means the cached pack is stale.
+    file_stamps: Vec<FileStamp>,
     content: Arc<String>,
     total_bytes: usize,
     total_chars: usize,
@@ -49,7 +60,7 @@ struct PackedArtifact {
     redactions: RedactionSummary,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DesktopState {
     workspace: Arc<WorkspaceIndex>,
     startup_folder: Option<String>,
@@ -59,6 +70,8 @@ struct DesktopState {
     last_artifact: Arc<Mutex<Option<PackedArtifact>>>,
     /// Optional active filesystem watcher for the currently open workspace.
     watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
+    /// Changed paths reported by the watcher since the last scan, drained by `scan_folder`.
+    pending_watcher_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 #[derive(Serialize)]
@@ -79,6 +92,9 @@ struct GenerateOutputResponse {
     total_bytes: usize,
     total_chars: usize,
     total_tokens: usize,
+    content_tokens: usize,
+    overhead_tokens: usize,
+    tokenizer_exact: bool,
     files_packed: usize,
     file_tokens: Vec<FileTokenStat>,
     redactions: RedactionSummary,
@@ -144,6 +160,7 @@ fn start_workspace_watcher(
     app: tauri::AppHandle,
     root: PathBuf,
     watcher_slot: Arc<Mutex<Option<RecommendedWatcher>>>,
+    pending_watcher_paths: Arc<Mutex<Vec<PathBuf>>>,
 ) {
     let last_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(5)));
     let root_for_cb = root.clone();
@@ -156,15 +173,30 @@ fn start_workspace_watcher(
                 return;
             }
             // Ignore events inside .git/ or known junk directories
-            let relevant = event.paths.iter().any(|p| {
-                let rel = p.strip_prefix(&root_for_cb).unwrap_or(p);
-                !rel.components().any(|c| {
-                    let s = c.as_os_str().to_string_lossy();
-                    is_junk_dir_name(&s)
+            let relevant: Vec<PathBuf> = event
+                .paths
+                .iter()
+                .filter(|p| {
+                    let rel = p.strip_prefix(&root_for_cb).unwrap_or(p);
+                    !rel.components().any(|c| {
+                        let s = c.as_os_str().to_string_lossy();
+                        is_junk_dir_name(&s)
+                    })
                 })
-            });
-            if !relevant {
+                .cloned()
+                .collect();
+            if relevant.is_empty() {
                 return;
+            }
+            // Queue the paths even when the emit below is throttled, so the next scan sees them.
+            if let Ok(mut pending) = pending_watcher_paths.lock() {
+                if pending.len() + relevant.len() > MAX_PENDING_WATCHER_PATHS {
+                    // Too many changes to track one by one: the next scan walks the whole tree.
+                    pending.clear();
+                    pending.push(root_for_cb.clone());
+                } else {
+                    pending.extend(relevant);
+                }
             }
             if let Ok(mut guard) = last_emit.lock() {
                 if guard.elapsed() >= Duration::from_millis(600) {
@@ -203,8 +235,18 @@ async fn scan_folder(
 ) -> Result<ScanResult, String> {
     let index = state.workspace.clone();
     let watcher_slot = state.watcher.clone();
+    let pending = state.pending_watcher_paths.clone();
     blocking(move || {
-        let snapshot = index.scan(Path::new(&path))?;
+        // In-place edits reported since the last scan are applied incrementally.
+        let changed: Vec<PathBuf> = pending
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default();
+        let snapshot = if changed.is_empty() {
+            index.scan(Path::new(&path))?
+        } else {
+            index.refresh_paths(Path::new(&path), &changed)?
+        };
         let nodes: Vec<FileNode> = snapshot
             .entries
             .iter()
@@ -232,7 +274,7 @@ async fn scan_folder(
             })
             .collect();
 
-        start_workspace_watcher(app, snapshot.root.clone(), watcher_slot);
+        start_workspace_watcher(app, snapshot.root.clone(), watcher_slot, pending);
 
         Ok(ScanResult {
             root: snapshot.root.to_string_lossy().into_owned(),
@@ -259,6 +301,152 @@ fn truncate_preview_chars(s: &str, max_chars: usize) -> (String, bool) {
     }
 }
 
+fn stamp_of(path: &Path) -> FileStamp {
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.modified().ok(), meta.len()))
+}
+
+/// Packs `entries` into the cacheable artifact and the UI response. Stamps are read before packing, so a
+/// file edited while the pack runs reads as stale afterwards.
+fn build_pack<F: Fn() -> bool + Sync>(
+    root: PathBuf,
+    entries: Vec<DirEntryMeta>,
+    options: PackOptions,
+    revision: u64,
+    generation: u64,
+    is_superseded: &F,
+) -> Result<(PackedArtifact, GenerateOutputResponse), String> {
+    let file_stamps = entries
+        .iter()
+        .map(|entry| stamp_of(&root.join(&entry.path)))
+        .collect();
+
+    let format = match options.format.as_str() {
+        "markdown" => OutputFormat::Markdown,
+        "json" => OutputFormat::Json,
+        "plain" => OutputFormat::Plain,
+        _ => OutputFormat::Xml,
+    };
+
+    let skeleton_files: HashSet<String> = options
+        .skeleton_files
+        .iter()
+        .map(|p| normalize_rel_path(Path::new(p)))
+        .collect();
+
+    let git_diff = if options.include_git_diff {
+        compute_git_diff(&root, 256 * 1024)
+    } else {
+        None
+    };
+
+    let tokenizer_model = options
+        .tokenizer_model
+        .as_deref()
+        .map(TokenizerModel::parse)
+        .unwrap_or(TokenizerModel::O200kBase);
+
+    let write_opts = WriteOptions {
+        format,
+        include_file_summary: options.include_summary,
+        max_file_size: options.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
+        redact_secrets: options.redact_secrets,
+        skeleton_all: false,
+        skeleton_files,
+        git_diff,
+        task_prompt: options.task_prompt.clone(),
+        tokenizer_model,
+        compute_bpe_tokens: true,
+    };
+
+    let mut buf = Vec::new();
+    let pack_stats = write_output_with_stats(&mut buf, &entries, &root, &write_opts, is_superseded)
+        .map_err(|e| e.to_string())?;
+
+    let full_text =
+        String::from_utf8(buf).map_err(|e| format!("Output is not valid UTF-8: {e}"))?;
+    let total_bytes = full_text.len();
+    let total_chars = full_text.chars().count();
+
+    let (preview, truncated_preview) = if options.full_preview || total_chars <= 150_000 {
+        (full_text.clone(), false)
+    } else {
+        truncate_preview_chars(&full_text, PREVIEW_CHAR_LIMIT)
+    };
+
+    let response = GenerateOutputResponse {
+        preview,
+        truncated_preview,
+        total_bytes,
+        total_chars,
+        total_tokens: pack_stats.total_tokens,
+        content_tokens: pack_stats.content_tokens,
+        overhead_tokens: pack_stats.overhead_tokens,
+        tokenizer_exact: pack_stats.tokenizer_exact,
+        files_packed: pack_stats.files_packed,
+        file_tokens: pack_stats.file_tokens.clone(),
+        redactions: pack_stats.redactions.clone(),
+    };
+    let artifact = PackedArtifact {
+        revision,
+        generation,
+        root,
+        entries,
+        options,
+        file_stamps,
+        content: Arc::new(full_text),
+        total_bytes,
+        total_chars,
+        total_tokens: pack_stats.total_tokens,
+        files_packed: pack_stats.files_packed,
+        file_tokens: pack_stats.file_tokens,
+        redactions: pack_stats.redactions,
+    };
+    Ok((artifact, response))
+}
+
+/// Returns the cached pack when every packed file still has the stamp it had when packed. Otherwise the
+/// same selection is packed again from disk, and the cache is replaced.
+fn ensure_fresh_artifact(state: &DesktopState) -> Result<PackedArtifact, String> {
+    let cached = state
+        .last_artifact
+        .lock()
+        .map_err(|_| "Artifact lock poisoned")?
+        .clone()
+        .ok_or("No packed output available")?;
+
+    // Fail closed: when the workspace index holds a snapshot, a changed `.pttignore` or `.gitignore`
+    // (or a stale revision) is an error, not a silent repack with the old selection rules.
+    if state.workspace.current_snapshot().is_some() {
+        state.workspace.get(&cached.root, cached.revision)?;
+    }
+
+    // Git diff content is not covered by file stamps, so a pack that includes it is rebuilt.
+    let fresh = !cached.options.include_git_diff
+        && cached
+            .file_stamps
+            .iter()
+            .zip(&cached.entries)
+            .all(|(stamp, entry)| *stamp == stamp_of(&cached.root.join(&entry.path)));
+    if fresh {
+        return Ok(cached);
+    }
+
+    let (artifact, _) = build_pack(
+        cached.root.clone(),
+        cached.entries.clone(),
+        cached.options.clone(),
+        cached.revision,
+        cached.generation,
+        &|| false,
+    )?;
+    if let Ok(mut guard) = state.last_artifact.lock() {
+        *guard = Some(artifact.clone());
+    }
+    Ok(artifact)
+}
+
 #[tauri::command]
 async fn generate_output(
     path: String,
@@ -274,76 +462,16 @@ async fn generate_output(
 
     blocking(move || {
         let snapshot = index.get(Path::new(&path), revision)?;
-        let root = &snapshot.root;
         let filtered = snapshot.selected(&selected_paths);
-
-        let format = match options.format.as_str() {
-            "markdown" => OutputFormat::Markdown,
-            "json" => OutputFormat::Json,
-            "plain" => OutputFormat::Plain,
-            _ => OutputFormat::Xml,
-        };
-
-        let skeleton_files: HashSet<String> = options
-            .skeleton_files
-            .into_iter()
-            .map(|p| normalize_rel_path(Path::new(&p)))
-            .collect();
-
-        let git_diff = if options.include_git_diff {
-            compute_git_diff(root, 256 * 1024)
-        } else {
-            None
-        };
-
-        let tokenizer_model = options
-            .tokenizer_model
-            .as_deref()
-            .map(TokenizerModel::parse)
-            .unwrap_or(TokenizerModel::O200kBase);
-
-        let write_opts = WriteOptions {
-            format,
-            include_file_summary: options.include_summary,
-            max_file_size: options.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
-            redact_secrets: options.redact_secrets,
-            skeleton_all: false,
-            skeleton_files,
-            git_diff,
-            task_prompt: options.task_prompt,
-            tokenizer_model,
-            compute_bpe_tokens: true,
-        };
-
-        let mut buf = Vec::new();
         let is_superseded = || generation.load(Ordering::SeqCst) != request;
-        let pack_stats =
-            write_output_with_stats(&mut buf, &filtered, root, &write_opts, &is_superseded)
-                .map_err(|e| e.to_string())?;
-
-        let full_text =
-            String::from_utf8(buf).map_err(|e| format!("Output is not valid UTF-8: {e}"))?;
-        let total_bytes = full_text.len();
-        let total_chars = full_text.chars().count();
-
-        let (preview, truncated_preview) = if options.full_preview || total_chars <= 150_000 {
-            (full_text.clone(), false)
-        } else {
-            truncate_preview_chars(&full_text, PREVIEW_CHAR_LIMIT)
-        };
-
-        let content_arc = Arc::new(full_text);
-        let artifact = PackedArtifact {
+        let (artifact, response) = build_pack(
+            snapshot.root.clone(),
+            filtered,
+            options,
             revision,
-            generation: request,
-            content: content_arc,
-            total_bytes,
-            total_chars,
-            total_tokens: pack_stats.total_tokens,
-            files_packed: pack_stats.files_packed,
-            file_tokens: pack_stats.file_tokens.clone(),
-            redactions: pack_stats.redactions.clone(),
-        };
+            request,
+            &is_superseded,
+        )?;
 
         if let Ok(mut guard) = artifact_slot.lock() {
             // Only store if not superseded by a newer generation
@@ -351,51 +479,33 @@ async fn generate_output(
                 *guard = Some(artifact);
             }
         }
-
-        Ok(GenerateOutputResponse {
-            preview,
-            truncated_preview,
-            total_bytes,
-            total_chars,
-            total_tokens: pack_stats.total_tokens,
-            files_packed: pack_stats.files_packed,
-            file_tokens: pack_stats.file_tokens,
-            redactions: pack_stats.redactions,
-        })
+        Ok(response)
     })
     .await
 }
 
 #[tauri::command]
 async fn get_full_packed_preview(state: tauri::State<'_, DesktopState>) -> Result<String, String> {
-    let artifact = state
-        .last_artifact
-        .lock()
-        .map_err(|_| "Artifact lock poisoned")?
-        .clone()
-        .ok_or("No packed output available")?;
+    let state = state.inner().clone();
+    let artifact = blocking(move || ensure_fresh_artifact(&state)).await?;
     Ok((*artifact.content).clone())
 }
 
 #[tauri::command]
 async fn copy_packed_output(state: tauri::State<'_, DesktopState>) -> Result<(), String> {
-    let artifact = state
-        .last_artifact
-        .lock()
-        .map_err(|_| "Artifact lock poisoned")?
-        .clone()
-        .ok_or("No packed output available to copy")?;
-    let _ = (
-        artifact.revision,
-        artifact.generation,
-        artifact.total_bytes,
-        artifact.total_chars,
-        artifact.total_tokens,
-        artifact.files_packed,
-        &artifact.file_tokens,
-        &artifact.redactions,
-    );
+    let state = state.inner().clone();
     blocking(move || {
+        let artifact = ensure_fresh_artifact(&state)?;
+        let _ = (
+            artifact.revision,
+            artifact.generation,
+            artifact.total_bytes,
+            artifact.total_chars,
+            artifact.total_tokens,
+            artifact.files_packed,
+            &artifact.file_tokens,
+            &artifact.redactions,
+        );
         arboard::Clipboard::new()
             .and_then(|mut c| c.set_text((*artifact.content).clone()))
             .map_err(|e| e.to_string())
@@ -409,12 +519,8 @@ async fn save_packed_output(
     default_name: String,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<bool, String> {
-    let artifact = state
-        .last_artifact
-        .lock()
-        .map_err(|_| "Artifact lock poisoned")?
-        .clone()
-        .ok_or("No packed output available to save")?;
+    let state = state.inner().clone();
+    let artifact = blocking(move || ensure_fresh_artifact(&state)).await?;
 
     let name = if default_name.trim().is_empty() {
         "project.txt".to_string()
@@ -704,6 +810,95 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_artifact_is_repacked_from_disk_after_a_selected_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("note.txt"), "old").unwrap();
+        let entries: Vec<DirEntryMeta> = ptt::core::walker::walk(&root)
+            .unwrap()
+            .into_iter()
+            .filter(|e| !e.is_dir)
+            .collect();
+        let options = PackOptions {
+            format: "plain".into(),
+            include_summary: false,
+            max_file_size: None,
+            redact_secrets: true,
+            full_preview: true,
+            skeleton_files: Vec::new(),
+            include_git_diff: false,
+            task_prompt: None,
+            tokenizer_model: None,
+        };
+        let (artifact, _) = build_pack(root.clone(), entries, options, 1, 1, &|| false).unwrap();
+        let state = DesktopState {
+            last_artifact: Arc::new(Mutex::new(Some(artifact.clone()))),
+            ..Default::default()
+        };
+
+        // Unchanged files: the cached pack is returned as is.
+        let reused = ensure_fresh_artifact(&state).unwrap();
+        assert!(Arc::ptr_eq(&reused.content, &artifact.content));
+
+        // A selected file changed on disk: the pack is rebuilt from the new content.
+        std::fs::write(root.join("note.txt"), "brand new content").unwrap();
+        let fresh = ensure_fresh_artifact(&state).unwrap();
+        assert!(
+            fresh.content.contains("brand new content"),
+            "{}",
+            fresh.content
+        );
+        assert!(!Arc::ptr_eq(&fresh.content, &artifact.content));
+    }
+
+    #[test]
+    fn stale_artifact_fails_closed_when_ignore_rules_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("note.txt"), "old").unwrap();
+        let state = DesktopState::default();
+        let snapshot = state.workspace.scan(&root).unwrap();
+        let options = PackOptions {
+            format: "plain".into(),
+            include_summary: false,
+            max_file_size: None,
+            redact_secrets: true,
+            full_preview: true,
+            skeleton_files: Vec::new(),
+            include_git_diff: false,
+            task_prompt: None,
+            tokenizer_model: None,
+        };
+        let entries = snapshot
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .cloned()
+            .collect();
+        let (artifact, _) = build_pack(
+            root.clone(),
+            entries,
+            options,
+            snapshot.revision,
+            1,
+            &|| false,
+        )
+        .unwrap();
+        *state.last_artifact.lock().unwrap() = Some(artifact);
+        assert!(ensure_fresh_artifact(&state).is_ok());
+
+        // A new ignore file changes which files a pack may contain: the cache must not be reused.
+        std::fs::write(root.join(".pttignore"), "note.txt\n").unwrap();
+        let error = ensure_fresh_artifact(&state).err().unwrap();
+        assert_eq!(
+            error,
+            "Ignore rules changed; refresh the project before packing"
+        );
+    }
+
     use super::{is_executable_like, validate_editor_command, validate_https_url};
     use std::path::Path;
 

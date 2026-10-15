@@ -9,6 +9,9 @@
 export interface RedactionSummary {
   totalRedactions: number;
   kinds: [string, number][];
+  redactionEnabled?: boolean;
+  filesScanned?: number;
+  filesSkipped?: number;
 }
 
 interface SecretRule {
@@ -66,6 +69,27 @@ const SECRET_RULES: readonly SecretRule[] = [
     kind: 'SLACK_TOKEN',
     pattern: /\bxox[abposr]-[A-Za-z0-9-]{10,}/g,
     replacement: '[REDACTED: SLACK_TOKEN]',
+  },
+  {
+    kind: 'GITLAB_TOKEN',
+    pattern: /\bglpat-[0-9A-Za-z_-]{20,}\b/g,
+    replacement: '[REDACTED: GITLAB_TOKEN]',
+  },
+  {
+    kind: 'HUGGINGFACE_TOKEN',
+    pattern: /\bhf_[A-Za-z0-9]{34,}\b/g,
+    replacement: '[REDACTED: HUGGINGFACE_TOKEN]',
+  },
+  {
+    kind: 'NPM_TOKEN',
+    pattern: /\bnpm_[A-Za-z0-9]{36}\b/g,
+    replacement: '[REDACTED: NPM_TOKEN]',
+  },
+  {
+    // Three base64url segments, the first two starting with `eyJ` (JSON `{"`).
+    kind: 'JWT_TOKEN',
+    pattern: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+    replacement: '[REDACTED: JWT_TOKEN]',
   },
   {
     kind: 'URL_PASSWORD',

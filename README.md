@@ -254,6 +254,8 @@ ptt --version
 
 ## MCP server
 
+**Protocol compatibility:** the server negotiates MCP revisions `2025-11-25`, `2025-06-18`, and `2024-11-05` using the `initialize` handshake. It does not yet implement the stateless `2026-07-28` revision, so it does not advertise it.
+
 `ptt mcp [DIR]` runs a Model Context Protocol server (JSON-RPC 2.0 over stdio) so AI assistants can request context on demand. It exposes five tools. Every tool accepts an optional `directory`, which must stay inside the server's project root:
 
 | Tool | Returns |

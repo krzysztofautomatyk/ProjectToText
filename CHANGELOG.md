@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `--max-tokens` (CLI and MCP `ptt_pack_files`) is enforced on the exact token count of the complete serialized artifact, including wrappers, directory structure, paths, escaping, Git diff, and task prompt. The fit re-renders and recounts the whole document each round.
+- When no file can be dropped and the artifact still exceeds the budget, the pack fails with an explicit error instead of returning an over-budget artifact.
+- Approximate tokenizer profiles (`claude`, `gemini`) are scaled estimates; the CLI prints them with a `~` prefix.
+- The task prompt (`<task_instructions>`) is masked with the same rules as file contents and the Git diff when redaction is on, in all formats, in both the CLI and the browser. Before, the prompt was written unmasked.
+- `ptt pack` writes a one-line redaction report to stderr on every output path. It gives the masked count by kind, files scanned and skipped, and says that pattern matching is not a guarantee. With `--no-redact` it states that credentials are included unmasked. Stdout is unchanged.
+
+### Changed
+
+- The MCP server no longer advertises protocol revision `2026-07-28`. That revision removes the `initialize` handshake and requires `server/discover`, per-request `_meta`, and `resultType`, none of which this server implements. Supported revisions are now `2025-11-25`, `2025-06-18`, and `2024-11-05`; unknown or unimplemented versions get `2025-11-25`. The CI MCP smoke test and the integration test were updated to match.
+
+### Security
+
+- MCP `notifications/cancelled` no longer grows an unbounded set. An untrusted client could send unlimited cancellations for ids that never arrive. The set is now capped at 1024 pending ids; further cancellations are dropped, which only means that request runs to completion. Found by the new fuzz test.
+- Added deterministic fuzz tests for malformed JSON-RPC messages (4,000 mutated messages, each must get a well-formed reply) and hostile `directory` arguments (traversal, absolute, symlink, NUL, very long) that must be refused without leaking outside content.
+- `rustls` 0.23.45 → 0.23.46 (lockfile only) fixes RUSTSEC-2026-0346, 0347, 0348, and 0349.
+
+### Added
+
+- Regression tests for file-path attacks on Unix: symlinked directory components, `..` and absolute paths are rejected before any open. A concurrency test swaps a file between real content and a symlink to outside content while the verified open runs, and checks that outside content is never returned (10/10 repeated runs passed). Windows reparse-point tests have not been run.
+- Each MCP tool call has a 30-second time limit. A call that runs longer returns a tool error (`isError: true`) instead of holding the session. The timed-out work is not cancelled and keeps running in the background. A later call that needs the shared workspace index waits for it to finish. At most four tool workers run at once, timed-out ones included. A call that arrives while all four are busy returns a tool error right away, and a worker's slot is freed when its work ends. A worker that cannot be started returns a tool error instead of crashing the server. Cooperative cancellation is not implemented.
+- Integration test `tests/mcp_stdio_client.rs` drives the built `ptt mcp` binary over stdio: handshake, `tools/list`, then one call to each of the five tools. It checks that stdout carries only protocol JSON and stderr stays empty. It passes in debug and release builds. CI runs it on Linux, macOS, and Windows.
+- CI runs `cargo audit` (RustSec) and fails on any vulnerability. Two informational warnings are triaged in `SECURITY.md`.
+- The release workflow fails if any of the four platform installers, or its `.sig`, is missing from the release.
+- `ptt pack --pin <PATH>` marks a project file that budget fitting never drops. If the pinned files alone exceed `--max-tokens`, the pack fails with an error that names them.
+- Regression tests: pinned files survive a fit that drops others; a pinned file that alone exceeds the budget fails closed; repeated fits are deterministic.
+- Regression tests: a secret in the task prompt is masked in XML, Markdown, JSON, and plain output and counted in the report (Rust); the same holds in the browser (Playwright).
+
+## [0.8.0] - 2026-10-15
+
+### Added
+
+- Symbol search reads grouped Rust re-exports (`pub use core::output::{ a, b as c };`), each name under its exported alias. It also reads TypeScript `import { a as b }` aliases and `export * as ns from './m'` namespace re-exports. `ptt`'s own `src/lib.rs` now lists its re-exports.
+- `WorkspaceIndex::refresh_paths` updates the current snapshot in place when watcher events only modify indexed files. It falls back to a full scan when files are created or removed, or when ignore files change.
+- The MCP server keeps one process-local workspace index, so repeated `ptt_get_related_files` calls reuse the dependency graph.
+
+### Changed
+
+- The dependency graph keeps each file's source in memory. A file-set change (a file added or removed) re-resolves unchanged files from that cache instead of reading them from disk again.
+- The desktop watcher queues changed paths. A refresh after in-place edits uses `refresh_paths`, not a full directory walk.
+- `ui/src/useWorkspace.tsx` is split into `useThemeAndLayout.ts` (theme, sidebar resize, tree viewport) and `useFilePreviewAndMenu.ts` (file preview, editor launchers, context menu, dependency selection). Each UI source file is under 38 KB.
+- `SECURITY.md` lists 0.8.x as supported.
+
+## [0.7.0] - 2026-10-15
+
+### Added
+
+- Secret corpus covers all 17 masking rules: 17/17 synthetic credentials masked and 0/20 benign snippets changed, in Rust and Playwright. The GitHub fine-grained token and `DB_PASSWORD=` rules now have cases.
+- Symbol search finds Rust `pub use` re-exports (under their alias when present), `pub mod name;` declarations, TypeScript and JavaScript `export { ... }` specifiers (under their exported name), and Go `const` and `var` specs.
+- `examples/selection_benchmark.rs` compares chunked (64-file) and single-pass packing on 800 uneven files.
+
+### Changed
+
+- `ui/src/App.tsx` is a 1.2 KB shell. The state, effects and handlers moved to `ui/src/useWorkspace.tsx`. The header, toolbar and status bar are in `ui/src/AppChrome.tsx`, the budget and prompt studio in `ui/src/BudgetAndPromptBar.tsx`, and the main panel in `ui/src/MainPanel.tsx`.
+- Copy, Save and the full preview validate the workspace ignore rules before reusing a pack. A changed `.pttignore` or `.gitignore` fails closed with "Ignore rules changed; refresh the project before packing". A pack that includes git diff is rebuilt, because file stamps do not cover diff content.
+- A rescan reuses the import resolutions of files whose modification time and length are unchanged. The cache is ignored when the file set changes, because a new file can satisfy an old import.
+- `pub mod name { ... }` inline modules are not reported as symbols, so their bodies are not returned.
+- `SECURITY.md` supports 0.5 and later.
+
+## [0.6.0] - 2026-10-14
+
+### Added
+
+- Secret masking for GitLab personal access tokens, Hugging Face tokens, npm tokens, and JWTs, in the Rust and browser implementations.
+- Fixture corpus for secret scanning: 15 positive cases (15/15 masked) and 20 benign snippets (0/20 changed), in Rust and Playwright.
+- Desktop auto-refresh: a `workspace-changed` event re-scans the open folder after 800 ms and keeps the current selection and skeleton marks.
+
+### Changed
+
+- `ui/src/App.tsx` is split: tree model and helpers in `ui/src/treeModel.ts`, and panels, dialogs, and tree rows in `ui/src/Panels.tsx`.
+- Copy, Save, and the full preview check the packed files on disk. If a selected file changed since packing, the output is rebuilt from the current contents.
+
 ## [0.5.0] - 2026-10-14
 
 ### Added

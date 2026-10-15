@@ -1,6 +1,6 @@
 //! Headless `ptt pack` and `ptt mcp` CLI — same core engine as the desktop app.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufWriter, Write};
@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use ptt::core::budget::{fit_to_bpe_budget_with_pins, prefit_by_estimate};
 use ptt::core::git::{compute_git_diff, inspect_git_context};
 use ptt::core::output::{
     write_output_with_stats, OutputFormat, WriteOptions, DEFAULT_MAX_FILE_SIZE,
 };
-use ptt::core::tokenizer::{estimate_tokens_from_bytes, TokenizerModel};
+use ptt::core::tokenizer::TokenizerModel;
 use ptt::core::walker::{
     is_default_excluded_path, is_junk_dir_name, normalize_rel_path, walk, DirEntryMeta,
 };
@@ -33,13 +34,15 @@ OPTIONS:
   -o, --output <FILE>     Write to file instead of stdout
   -c, --copy              Copy packed output directly to system clipboard
       --preset <PRESET>   source | docs | all
+      --pin <PATH>        Pin a project file so --max-tokens fitting never drops it (repeatable)
       --include <GLOB>    Include only files matching glob (repeatable)
       --exclude <GLOB>    Exclude files matching glob (repeatable)
       --skeleton [GLOB]   Pack all files (or files matching GLOB) as AST skeletons
       --git-modified      Select only Git modified / staged / untracked files
       --git-branch        Select only files changed on current branch vs base branch
       --git-diff          Include unified <git_diff> in packed output
-      --max-tokens <N>    Fit the pack within N tokens (exact BPE count)
+      --max-tokens <N>    Fit the pack within N tokens (strict final-artifact limit)
+      --tokenizer <MODEL> o200k_base | cl100k_base | claude | gemini (default: o200k_base)
       --no-redact         Disable automatic secret redaction
       --no-summary        Omit XML file summary (directory listing remains)
       --max-size <N>      Per-file size limit in bytes (default: 2097152)
@@ -70,6 +73,7 @@ pub struct PackArgs {
     pub include_summary: bool,
     pub max_file_size: u64,
     pub preset: Option<CliPreset>,
+    pub pinned_paths: Vec<String>,
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
     pub skeleton: bool,
@@ -78,6 +82,7 @@ pub struct PackArgs {
     pub git_branch: bool,
     pub git_diff: bool,
     pub max_tokens: Option<usize>,
+    pub tokenizer_model: TokenizerModel,
     pub redact_secrets: bool,
     pub task_prompt: Option<String>,
 }
@@ -92,6 +97,7 @@ impl Default for PackArgs {
             include_summary: true,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             preset: None,
+            pinned_paths: Vec::new(),
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
             skeleton: false,
@@ -100,6 +106,7 @@ impl Default for PackArgs {
             git_branch: false,
             git_diff: false,
             max_tokens: None,
+            tokenizer_model: TokenizerModel::O200kBase,
             redact_secrets: true,
             task_prompt: None,
         }
@@ -228,6 +235,11 @@ pub fn parse_args(argv: &[String]) -> Result<PackArgs, String> {
                 let v = argv.get(i).ok_or("missing value for --preset")?;
                 args.preset = Some(parse_preset(v)?);
             }
+            "--pin" => {
+                i += 1;
+                let v = argv.get(i).ok_or("missing value for --pin")?;
+                args.pinned_paths.push(v.clone());
+            }
             "--include" => {
                 i += 1;
                 let v = argv.get(i).ok_or("missing value for --include")?;
@@ -276,6 +288,11 @@ pub fn parse_args(argv: &[String]) -> Result<PackArgs, String> {
                     return Err("--max-tokens must be greater than 0".into());
                 }
                 args.max_tokens = Some(parsed);
+            }
+            "--tokenizer" | "--model" => {
+                i += 1;
+                let v = argv.get(i).ok_or("missing value for --tokenizer")?;
+                args.tokenizer_model = TokenizerModel::try_parse(v)?;
             }
             "--no-redact" => {
                 args.redact_secrets = false;
@@ -423,117 +440,13 @@ fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>, String> {
         .map_err(|e| format!("failed to build globset: {e}"))
 }
 
-fn is_low_priority_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("test")
-        || lower.contains("spec")
-        || lower.contains("fixture")
-        || lower.contains("bench")
-        || lower.contains("example")
-        || lower.ends_with(".lock")
-        || lower.ends_with("-lock.json")
-        || lower.ends_with(".md")
-        || lower.ends_with(".txt")
-}
-
-/// Estimated tokens for a file packed as an AST skeleton: about 30% of its full size.
-fn skeleton_cost(tokens: usize) -> usize {
-    tokens * 3 / 10
-}
-
-/// Indices of `files` in the order budget pressure drops them: low-priority paths first, then largest.
-fn drop_priority_order(files: &[DirEntryMeta]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_by(|&a, &b| {
-        let low_a = is_low_priority_path(&normalize_rel_path(&files[a].path));
-        let low_b = is_low_priority_path(&normalize_rel_path(&files[b].path));
-        low_b
-            .cmp(&low_a)
-            .then_with(|| files[b].size.unwrap_or(0).cmp(&files[a].size.unwrap_or(0)))
-    });
-    order
-}
-
-/// Packs `entries` in memory and returns the pack's statistics. Used for exact BPE counts.
-fn pack_stats(
-    entries: &[DirEntryMeta],
-    root: &Path,
-    opts: &WriteOptions,
-) -> Result<ptt::PackStats, String> {
-    let mut sink = Vec::new();
-    write_output_with_stats(&mut sink, entries, root, opts, &|| false).map_err(|e| e.to_string())
-}
-
-/// Fits `entries` within `budget` using exact BPE counts. Returns the kept entries and the skeleton set
-/// to pack them with. Each round packs once and reads the exact per-file counts. An over-budget pack
-/// first upgrades full files to skeletons, lowest priority first, then drops files in the same order,
-/// and packs again. Always keeps at least one file, so a single file over budget is returned as is.
-pub(crate) fn fit_to_bpe_budget(
-    entries: Vec<DirEntryMeta>,
-    root: &Path,
-    opts: &WriteOptions,
-    budget: usize,
-) -> Result<(Vec<DirEntryMeta>, HashSet<String>), String> {
-    let mut opts = opts.clone();
-    opts.compute_bpe_tokens = true;
-    let mut kept = entries;
-    loop {
-        let stats = pack_stats(&kept, root, &opts)?;
-        if stats.total_tokens <= budget || kept.len() <= 1 {
-            return Ok((kept, opts.skeleton_files));
-        }
-        let exact: HashMap<String, usize> = stats
-            .file_tokens
+impl PackArgs {
+    /// The `--pin` paths in the normalized form the budget fitter compares against.
+    pub(crate) fn pinned_rel_paths(&self) -> HashSet<String> {
+        self.pinned_paths
             .iter()
-            .map(|f| (f.path.clone(), f.tokens))
-            .collect();
-        let tokens_of = |e: &DirEntryMeta| {
-            exact
-                .get(&normalize_rel_path(&e.path))
-                .copied()
-                .unwrap_or(0)
-        };
-        let order = drop_priority_order(&kept);
-        let mut running = stats.total_tokens;
-
-        // Round A: upgrade full files to skeletons, lowest priority first, then pack again.
-        if !opts.skeleton_all {
-            let mut upgraded = false;
-            for &idx in &order {
-                if running <= budget {
-                    break;
-                }
-                let rel = normalize_rel_path(&kept[idx].path);
-                let tok = tokens_of(&kept[idx]);
-                if tok > 30
-                    && !opts.skeleton_files.contains(&rel)
-                    && ptt::core::skeleton::language_for_path(Path::new(&rel)) != "other"
-                {
-                    running = running.saturating_sub(tok * 7 / 10);
-                    opts.skeleton_files.insert(rel);
-                    upgraded = true;
-                }
-            }
-            if upgraded {
-                continue;
-            }
-        }
-
-        // Round B: drop files in priority order until the exact estimate fits, then pack again.
-        // Each round removes at least one file, so the loop always terminates.
-        let mut dropped = HashSet::new();
-        for &idx in &order {
-            if running <= budget || kept.len() - dropped.len() <= 1 {
-                break;
-            }
-            running = running.saturating_sub(tokens_of(&kept[idx]));
-            dropped.insert(idx);
-        }
-        kept = kept
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, e)| (!dropped.contains(&i)).then_some(e))
-            .collect();
+            .map(|p| normalize_rel_path(Path::new(p)))
+            .collect()
     }
 }
 
@@ -614,68 +527,38 @@ pub fn filter_entries_for_cli(
     }
 
     if let Some(budget) = args.max_tokens {
-        // Files already marked for skeleton mode (`--skeleton` or a glob) cost ~30% of their full size.
-        let mut total_est: usize = files
-            .iter()
-            .map(|f| {
-                let tok = estimate_tokens_from_bytes(f.size.unwrap_or(0));
-                let rel = normalize_rel_path(&f.path);
-                if args.skeleton || skeleton_files.contains(&rel) {
-                    skeleton_cost(tok)
-                } else {
-                    tok
-                }
-            })
-            .sum();
-
-        // Pass 1 (heuristic): upgrade heavy files to AST skeleton mode while the estimate exceeds the budget.
-        if total_est > budget {
-            let order = drop_priority_order(&files);
-            for &idx in &order {
-                if total_est <= budget {
-                    break;
-                }
-                let rel = normalize_rel_path(&files[idx].path);
-                let tok = estimate_tokens_from_bytes(files[idx].size.unwrap_or(0));
-                if tok > 20 && !args.skeleton && !skeleton_files.contains(&rel) {
-                    skeleton_files.insert(rel);
-                    let saved = tok - skeleton_cost(tok);
-                    total_est = total_est.saturating_sub(saved);
-                }
-            }
-        }
-
-        // Pass 2 (heuristic): pre-drop only when the estimate is far above the budget. The exact counts
-        // in `fit_to_bpe_budget` decide the final fit, so this keeps a 2x margin.
-        if total_est > budget * 2 {
-            let order = drop_priority_order(&files);
-            let mut dropped = HashSet::new();
-            for &idx in &order {
-                if total_est <= budget * 2 || files.len() - dropped.len() <= 1 {
-                    break;
-                }
-                let rel = normalize_rel_path(&files[idx].path);
-                let tok = estimate_tokens_from_bytes(files[idx].size.unwrap_or(0));
-                let effective = if skeleton_files.contains(&rel) {
-                    skeleton_cost(tok)
-                } else {
-                    tok
-                };
-                dropped.insert(idx);
-                total_est = total_est.saturating_sub(effective);
-            }
-
-            if !dropped.is_empty() {
-                files = files
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, f)| (!dropped.contains(&i)).then_some(f))
-                    .collect();
-            }
-        }
+        files = prefit_by_estimate(
+            files,
+            &mut skeleton_files,
+            args.skeleton,
+            budget,
+            &args.pinned_rel_paths(),
+        );
     }
 
     Ok((files, skeleton_files))
+}
+
+/// One-line pre-export redaction report for stderr. Says what was masked, what was skipped, and
+/// that pattern matching is not a guarantee. Redaction off is stated explicitly.
+fn redaction_report(stats: &ptt::PackStats) -> String {
+    let r = &stats.redactions;
+    if !r.redaction_enabled {
+        return "ptt pack: redaction OFF (--no-redact): credentials in selected files and the diff are included unmasked".to_string();
+    }
+    let kinds = if r.kinds.is_empty() {
+        "no pattern matched".to_string()
+    } else {
+        r.kinds
+            .iter()
+            .map(|(kind, count)| format!("{kind}×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "ptt pack: redaction ON: {} masked ({kinds}); {} files scanned, {} skipped. Pattern-based only: no match does not prove there are no secrets",
+        r.total_redactions, r.files_scanned, r.files_skipped
+    )
 }
 
 pub fn run_pack(args: &PackArgs) -> Result<(), String> {
@@ -695,6 +578,8 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
         None
     };
 
+    let pinned_rel_paths = args.pinned_rel_paths();
+
     let mut opts = WriteOptions {
         format: args.format,
         include_file_summary: args.include_summary,
@@ -704,15 +589,20 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
         skeleton_files,
         git_diff,
         task_prompt: args.task_prompt.clone(),
-        tokenizer_model: TokenizerModel::O200kBase,
+        tokenizer_model: args.tokenizer_model,
         compute_bpe_tokens: true,
     };
 
     // `--max-tokens` is a hard limit on the exact BPE count, not only on the heuristic estimate.
     let filtered_entries = match args.max_tokens {
         Some(budget) => {
-            let (entries, skeleton_files) =
-                fit_to_bpe_budget(filtered_entries, &root, &opts, budget)?;
+            let (entries, skeleton_files) = fit_to_bpe_budget_with_pins(
+                filtered_entries,
+                &root,
+                &opts,
+                budget,
+                &pinned_rel_paths,
+            )?;
             opts.skeleton_files = skeleton_files;
             entries
         }
@@ -733,10 +623,15 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
         arboard::Clipboard::new()
             .and_then(|mut c| c.set_text(text))
             .map_err(|e| format!("clipboard error: {e}"))?;
+        let tok_prefix = if stats.tokenizer_exact { "" } else { "~" };
         eprintln!(
-            "ptt pack: copied {} files (~{} tokens) to clipboard",
-            file_count, stats.total_tokens
+            "ptt pack: copied {} files ({}{} tokens, {}) to clipboard",
+            file_count,
+            tok_prefix,
+            stats.total_tokens,
+            opts.tokenizer_model.label()
         );
+        eprintln!("{}", redaction_report(&stats));
         return Ok(());
     }
 
@@ -774,21 +669,29 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
             }
             let file = fs::File::create(path).map_err(|error| error.to_string())?;
             let stats = stream(file, &filtered_entries, &root, &opts)?;
+            let tok_prefix = if stats.tokenizer_exact { "" } else { "~" };
             eprintln!(
-                "ptt pack: wrote {} files (~{} tokens) → {}",
+                "ptt pack: wrote {} files ({}{} tokens, {}) → {}",
                 file_count,
+                tok_prefix,
                 stats.total_tokens,
+                opts.tokenizer_model.label(),
                 path.display()
             );
+            eprintln!("{}", redaction_report(&stats));
         }
         None => {
             let stats = stream(io::stdout().lock(), &filtered_entries, &root, &opts)?;
+            let tok_prefix = if stats.tokenizer_exact { "" } else { "~" };
             eprintln!(
-                "ptt pack: {} files · ~{} tokens · {}",
+                "ptt pack: {} files · {}{} tokens ({}) · {}",
                 file_count,
+                tok_prefix,
                 stats.total_tokens,
+                opts.tokenizer_model.label(),
                 format_label(args.format)
             );
+            eprintln!("{}", redaction_report(&stats));
         }
     }
 
@@ -832,6 +735,7 @@ fn format_label(f: OutputFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ptt::core::budget::{fit_to_bpe_budget, pack_stats};
     use std::io::Write;
     use tempfile::tempdir;
 

@@ -48,7 +48,12 @@ ProjectToText (`ptt`) is a **Tauri v2** desktop application, a headless CLI, and
 | `core::git` | `git status --porcelain`, branch-changed files versus the base branch, and unified diff. Uses `git_command()`, which suppresses console windows on Windows. |
 | `core::text` | Strict UTF-8 and BOM-declared UTF-16 decoding; Markdown fences longer than any backtick run. |
 | `core::preview` | Canonical-root containment, symlink and reparse-point rejection, bounded text previews. |
-| `mcp` | Five tools: `ptt_get_project_map`, `ptt_pack_files`, `ptt_get_git_context`, `ptt_get_related_files`, `ptt_search_symbols`. |
+| `core::budget` | `--max-tokens` fitting in two stages: `prefit_by_estimate` (heuristic skeleton upgrades and pre-drops), then `fit_to_bpe_budget_with_pins` (exact BPE fit on the full artifact). Pinned paths are never dropped. |
+| `cli` | Argument parsing (`PackArgs`) and filters. `PackArgs::pinned_rel_paths()` is the only place `--pin` paths are normalized. `ptt pack` and `ptt_pack_files` both call into `core::budget`. |
+| `mcp` | JSON-RPC 2.0 envelope only: protocol negotiation, the stdio loop, `tools/call` routing, cancellations, and the output cap. |
+| `mcp::tools` | Tool schemas and argument validation (`tool_definitions`, `validate_tool_arguments`), the project-root sandbox (`resolve_root`), and dispatch for the five tools: `ptt_get_project_map`, `ptt_pack_files`, `ptt_get_git_context`, `ptt_get_related_files`, `ptt_search_symbols`. |
+| `mcp::tests`, `mcp::fuzz_tests` | Protocol and tool unit tests. Seeded fuzzing and hostile-directory tests live apart in `fuzz_tests`. |
+| `mcp::workers` | Runs each `tools/call` on a worker thread with a 30 s limit. At most four workers run at once, and timed-out workers keep their slot until they finish. |
 
 ## Data flow (desktop pack)
 
@@ -63,6 +68,17 @@ ProjectToText (`ptt`) is a **Tauri v2** desktop application, a headless CLI, and
 
 - **CLI** (`ptt pack`) uses the same `walk`, filters (`--preset`, `--include`, `--exclude`, `--skeleton`, Git flags), auto-fit (`--max-tokens`), and `write_output` path. It writes through a buffered writer and refuses to overwrite an input file.
 - **MCP** (`ptt mcp [DIR]`) answers JSON-RPC 2.0 requests on stdio. A tool call may name a directory; results go through the same ignore and redaction rules as `ptt pack`.
+
+## Desktop UI hooks
+
+`ui/src/App.tsx` is a thin shell around `useWorkspace()` in `ui/src/useWorkspace.tsx`. That hook composes two focused hooks by area:
+
+- `ui/src/useThemeAndLayout.ts`: theme preference and persistence, sidebar resize, and virtualized tree scroll and viewport state.
+- `ui/src/useFilePreviewAndMenu.ts`: in-app file preview, native editor launchers, the tree context menu, and 1-hop dependency selection.
+
+`useWorkspace.tsx` keeps folder scanning, selection, budget auto-fit, packing, and project history and preferences. The views are `AppChrome.tsx` (header, toolbar, status bar), `BudgetAndPromptBar.tsx`, `MainPanel.tsx`, and `Panels.tsx` (tree rows, dialogs, toasts). `treeModel.ts` holds the pure tree and preset helpers.
+
+On the Rust side, `WorkspaceIndex::refresh_paths` updates the current snapshot in place when watcher events only modify indexed files. It falls back to a full `scan` when files are created or removed, or when ignore files change.
 
 ## Browser mode
 
@@ -79,7 +95,7 @@ ProjectToText (`ptt`) is a **Tauri v2** desktop application, a headless CLI, and
 
 - **`.pttignore`** adds exclusions on top of Git ignore rules.
 - **Output formats**: add a variant to `OutputFormat` and a writer in `output.rs`, then mirror it in `browserFs.ts`.
-- **Presets and default exclusions**: `applyPreset` in `ui/src/App.tsx` and `matches_preset` in `src/cli.rs` share the same rules.
+- **Presets and default exclusions**: `applyPreset` in `ui/src/treeModel.ts` and `matches_preset` in `src/cli.rs` share the same rules.
 - **Secret rules**: change `src/core/secrets.rs` and `ui/src/secrets.ts` together and add matching cases to both test suites.
 - **Skeleton languages**: add a grammar and a case in `core::skeleton::language_for_path`.
 

@@ -566,3 +566,204 @@ fn packing_own_repository_never_triggers_self_redaction_in_source_or_docs() {
         assert_eq!(redacted, content, "{rel} was modified by self-redaction");
     }
 }
+
+#[test]
+fn secret_scanner_fp_fn_corpus_evaluation() {
+    // True positives: one synthetic credential per rule (17 rules, 15 kinds). Split with concat! so
+    // packing this file with ptt never masks the fixtures themselves. Every case must be masked
+    // under its kind: 15/15 recall means FN = 0.
+    let true_positives: [(&str, &str); 17] = [
+        (
+            concat!(
+                "-----BEGIN ",
+                "PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END ",
+                "PRIVATE KEY-----"
+            ),
+            "PRIVATE_KEY",
+        ),
+        (concat!("AK", "IAIOSFODNN7EXAMPLE"), "AWS_ACCESS_KEY"),
+        (
+            concat!("sk-ant-", "api03-abcdefghijklmnopqrstuvwx"),
+            "ANTHROPIC_API_KEY",
+        ),
+        (concat!("sk-", "abcdefghijklmnopqrstuvwx"), "OPENAI_API_KEY"),
+        (
+            concat!("AIza", "SyDaGmWKa4JsXZ-HjGw7xAAAAAAAAA12345"),
+            "GOOGLE_API_KEY",
+        ),
+        (
+            concat!("sk_live_", "51Habcdefghijklmnopqrstuvwx"),
+            "STRIPE_KEY",
+        ),
+        (
+            concat!("ghp_", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "GITHUB_TOKEN",
+        ),
+        (concat!("xoxb-", "1234567890-abcdefghij"), "SLACK_TOKEN"),
+        (
+            concat!("postgres://admin:", "s3cr3tPass", "@db.internal:5432/app"),
+            "URL_PASSWORD",
+        ),
+        (concat!("Server=db;Password=", "Sup3r"), "PASSWORD"),
+        (
+            concat!("JWT_SECRET=", "super-secret-jwt-signing-key-999"),
+            "ENV_SECRET",
+        ),
+        (
+            concat!("glpat-", "abcdefghijklmnopqrst0123"),
+            "GITLAB_TOKEN",
+        ),
+        (
+            concat!("hf_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            "HUGGINGFACE_TOKEN",
+        ),
+        (
+            concat!("npm_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            "NPM_TOKEN",
+        ),
+        (
+            concat!(
+                "eyJhbGciOiJIUzI1NiJ9",
+                ".",
+                "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                ".",
+                "dozjgNryP4J3jVmNHl0w5N"
+            ),
+            "JWT_TOKEN",
+        ),
+        (
+            concat!(
+                "github_pat_",
+                "11AAABBBCCC0123456789_abcdefghijklmnopqrstuvwx"
+            ),
+            "GITHUB_TOKEN",
+        ),
+        (concat!("DB_PASSWORD=", "Sup3rSecretEnvPass"), "PASSWORD"),
+    ];
+    let mut caught = 0usize;
+    for (sample, kind) in true_positives {
+        let (redacted, summary) = ptt::redact_secrets_with_report(sample);
+        let marker = format!("[REDACTED: {kind}]");
+        assert!(
+            redacted.contains(&marker) && summary.kinds.iter().any(|(k, _)| k == kind),
+            "false negative for {kind}: {redacted}"
+        );
+        caught += 1;
+    }
+    assert_eq!(caught, 17, "recall must be 17/17");
+    let tp_text = true_positives
+        .iter()
+        .map(|(sample, _)| *sample)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        ptt::redact_secrets_with_report(&tp_text).1.total_redactions,
+        17,
+        "combined corpus must mask exactly one secret per case"
+    );
+
+    // True negatives: 20 realistic benign snippets. Each must pass through untouched (FP = 0).
+    let true_negatives: [&str; 20] = [
+        r#"id = 123e4567-e89b-12d3-a456-426614174000;"#,
+        r#"sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"#,
+        r#"<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==">"#,
+        r#"<div class="btn btn-primary text-center mt-4">"#,
+        r#"const map: Map<string, Array<number>> = new Map();"#,
+        r#"SELECT id, name FROM users WHERE active = 1 ORDER BY name;"#,
+        r#"if (a == b && c != d) { return a >= 0; }"#,
+        r#"Replace <your-token> with a real value from the dashboard."#,
+        r#"fn verify(password: &str) -> bool { hash(password) == stored }"#,
+        r#"git commit -m "fix: sk-learn import order""#,
+        r#"See [the docs](https://example.com/docs/getting-started) for details."#,
+        r#"Dev server: http://localhost:3000/api/users"#,
+        r#"color: #1a2b3c; background: rgba(0, 0, 0, 0.5);"#,
+        r#"createdAt: 2026-10-14T12:00:00Z"#,
+        r#"commit 9fceb02d0ae598e95dc970b74767f19372d61af8"#,
+        r#""@scope/package-name": "^1.2.3""#,
+        r#"const token = process.env.API_TOKEN;"#,
+        r#"export const TOKEN_LIMIT = 4096;"#,
+        r#"MAX_SECRET_LENGTH=32"#,
+        r#"headers["X-CSRF-Token"] = csrfToken;"#,
+    ];
+    let mut false_positives = 0usize;
+    for sample in true_negatives {
+        let (redacted, summary) = ptt::redact_secrets_with_report(sample);
+        if summary.total_redactions > 0 || redacted != sample {
+            false_positives += 1;
+            eprintln!("false positive: {sample} -> {redacted}");
+        }
+    }
+    assert_eq!(false_positives, 0, "false positive rate must be 0/20");
+    let tn_text = true_negatives.join("\n");
+    assert_eq!(
+        ptt::redact_secrets_with_report(&tn_text).1.total_redactions,
+        0,
+        "combined benign corpus must produce no redactions"
+    );
+}
+
+#[test]
+fn mcp_stdio_binary_negotiates_versions_enforces_sandbox_and_stays_protocol_clean() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("outside.rs"), "pub fn leaked() {}\n").unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn entry_point(x: u32) -> u32 {\n    x + 1\n}\n",
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ptt");
+    let mut child = Command::new(bin)
+        .args(["mcp", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ptt mcp");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        let lines = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ptt_search_symbols","arguments":{"query":"entry_point"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ptt_get_project_map","arguments":{"directory":"../.."}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ptt_pack_files","arguments":{"bogus_arg":123}}}"#,
+            r#"not valid json at all"#,
+        ];
+        for l in lines {
+            writeln!(stdin, "{l}").unwrap();
+        }
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("every stdout line must be valid JSON-RPC"))
+        .collect();
+
+    // 6 requests (notification produces no response)
+    assert_eq!(responses.len(), 6, "stdout:\n{stdout}");
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 5);
+    assert!(responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("entry_point"));
+    assert_eq!(responses[3]["result"]["isError"], true);
+    assert_eq!(responses[4]["error"]["code"], -32602);
+    assert_eq!(responses[5]["error"]["code"], -32700);
+}
