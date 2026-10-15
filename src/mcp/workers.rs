@@ -40,12 +40,21 @@ impl ToolWorkers {
     }
 
     fn try_acquire(&self) -> Option<WorkerSlot> {
-        self.in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < self.limit).then_some(n + 1)
-            })
-            .ok()?;
-        Some(WorkerSlot(Arc::clone(&self.in_flight)))
+        let mut in_flight = self.in_flight.load(Ordering::SeqCst);
+        loop {
+            if in_flight >= self.limit {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                in_flight,
+                in_flight + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(WorkerSlot(Arc::clone(&self.in_flight))),
+                Err(current) => in_flight = current,
+            }
+        }
     }
 
     #[cfg(test)]

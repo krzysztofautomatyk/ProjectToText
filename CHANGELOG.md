@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-15
+
+### Fixed
+
+- The MCP concurrency limiter uses `compare_exchange_weak` instead of the `fetch_update` helper, which newer stable toolchains flag as deprecated. CI runs with `-D warnings`, so v0.8.0 failed to build there. Behavior is unchanged: a tool slot is taken only while fewer than four are in use.
+
 ### Changed
 
 - `--max-tokens` (CLI and MCP `ptt_pack_files`) is enforced on the exact token count of the complete serialized artifact, including wrappers, directory structure, paths, escaping, Git diff, and task prompt. The fit re-renders and recounts the whole document each round.
