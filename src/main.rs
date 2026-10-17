@@ -51,6 +51,7 @@ struct PackedArtifact {
     options: PackOptions,
     /// One stamp per entry, read before packing. A changed stamp means the cached pack is stale.
     file_stamps: Vec<FileStamp>,
+    modified_files: HashSet<String>,
     content: Arc<String>,
     total_bytes: usize,
     total_chars: usize,
@@ -313,6 +314,7 @@ fn build_pack<F: Fn() -> bool + Sync>(
     root: PathBuf,
     entries: Vec<DirEntryMeta>,
     options: PackOptions,
+    modified_files: HashSet<String>,
     revision: u64,
     generation: u64,
     is_superseded: &F,
@@ -358,6 +360,7 @@ fn build_pack<F: Fn() -> bool + Sync>(
         task_prompt: options.task_prompt.clone(),
         tokenizer_model,
         compute_bpe_tokens: true,
+        modified_files: modified_files.clone(),
     };
 
     let mut buf = Vec::new();
@@ -395,6 +398,7 @@ fn build_pack<F: Fn() -> bool + Sync>(
         entries,
         options,
         file_stamps,
+        modified_files,
         content: Arc::new(full_text),
         total_bytes,
         total_chars,
@@ -437,6 +441,7 @@ fn ensure_fresh_artifact(state: &DesktopState) -> Result<PackedArtifact, String>
         cached.root.clone(),
         cached.entries.clone(),
         cached.options.clone(),
+        cached.modified_files.clone(),
         cached.revision,
         cached.generation,
         &|| false,
@@ -463,11 +468,18 @@ async fn generate_output(
     blocking(move || {
         let snapshot = index.get(Path::new(&path), revision)?;
         let filtered = snapshot.selected(&selected_paths);
+        let modified_files: HashSet<String> = snapshot
+            .git_context
+            .modified_files
+            .iter()
+            .cloned()
+            .collect();
         let is_superseded = || generation.load(Ordering::SeqCst) != request;
         let (artifact, response) = build_pack(
             snapshot.root.clone(),
             filtered,
             options,
+            modified_files,
             revision,
             request,
             &is_superseded,
@@ -833,7 +845,16 @@ mod tests {
             task_prompt: None,
             tokenizer_model: None,
         };
-        let (artifact, _) = build_pack(root.clone(), entries, options, 1, 1, &|| false).unwrap();
+        let (artifact, _) = build_pack(
+            root.clone(),
+            entries,
+            options,
+            HashSet::new(),
+            1,
+            1,
+            &|| false,
+        )
+        .unwrap();
         let state = DesktopState {
             last_artifact: Arc::new(Mutex::new(Some(artifact.clone()))),
             ..Default::default()
@@ -882,6 +903,7 @@ mod tests {
             root.clone(),
             entries,
             options,
+            HashSet::new(),
             snapshot.revision,
             1,
             &|| false,

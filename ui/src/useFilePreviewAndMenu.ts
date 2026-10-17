@@ -176,7 +176,10 @@ export function useFilePreviewAndMenu({ currentPath, nodes, format, browserProje
   }, [contextMenu]);
 
   const selectRelatedFiles = useCallback(
-    async (targetPath: string, relation: 'imports' | 'importers' | 'tests') => {
+    async (
+      targetPath: string,
+      relation: 'imports' | 'importers' | 'tests' | 'all',
+    ) => {
       setContextMenu(null);
       if (!currentPath || !IN_TAURI || browserProjectRef.current) {
         pushToast('info', 'Dependency graph resolution requires the desktop app');
@@ -193,7 +196,9 @@ export function useFilePreviewAndMenu({ currentPath, nodes, format, browserProje
             ? rel.imports
             : relation === 'importers'
               ? rel.importers
-              : rel.tests;
+              : relation === 'tests'
+                ? rel.tests
+                : Array.from(new Set([...rel.imports, ...rel.importers, ...rel.tests]));
         const toSelect = new Set(
           [targetPath, ...extra].map((p) => normalizePath(p)),
         );
@@ -204,17 +209,22 @@ export function useFilePreviewAndMenu({ currentPath, nodes, format, browserProje
         );
         setNodes(updated);
         generate(updated, currentPath, format, true);
+        const fileName = targetPath.split('/').pop() ?? targetPath;
         pushToast(
           'success',
-          extra.length > 0
-            ? `Selected ${targetPath.split('/').pop()} + ${extra.length} ${relation}`
-            : `Selected ${targetPath.split('/').pop()} (no matching ${relation} found)`,
+          relation === 'all'
+            ? extra.length > 0
+              ? `Selected ${fileName} + ${extra.length} related files (${rel.imports.length} imports, ${rel.importers.length} importers, ${rel.tests.length} tests)`
+              : `Selected ${fileName} (no related files found)`
+            : extra.length > 0
+              ? `Selected ${fileName} + ${extra.length} ${relation}`
+              : `Selected ${fileName} (no matching ${relation} found)`,
         );
       } catch (e) {
         pushToast('error', `Dependency lookup failed: ${String(e)}`);
       }
     },
-    [currentPath, nodes, format, generate, pushToast],
+    [currentPath, nodes, format, generate, pushToast, workspaceRevision],
   );
 
   return {

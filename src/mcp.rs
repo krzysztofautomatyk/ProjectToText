@@ -4,10 +4,11 @@
 //! Cursor, Zed, etc.) can dynamically inspect and pack the repository while honoring
 //! `.gitignore`, `.pttignore`, path sandboxing, AST skeletonization, and secret redaction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
@@ -15,7 +16,7 @@ mod workers;
 use workers::tool_workers;
 
 mod tools;
-use tools::{dispatch_tool, tool_definitions, validate_tool_arguments};
+use tools::{dispatch_tool_cancellable, tool_definitions, validate_tool_arguments};
 
 #[cfg(test)]
 mod fuzz_tests;
@@ -42,6 +43,12 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 fn cancelled_requests() -> &'static Mutex<HashSet<String>> {
     static CANCELLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     CANCELLED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Tracks currently active workers so `notifications/cancelled` can immediately signal them.
+fn active_workers() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Upper bound on cancellations recorded for requests that have not arrived yet. Untrusted clients
@@ -211,6 +218,11 @@ pub fn handle_jsonrpc_message(raw: &str, default_root: &Path) -> Option<Value> {
     if method == "notifications/cancelled" {
         if let Some(req_id) = params.get("requestId") {
             let key = req_id.to_string();
+            if let Ok(running) = active_workers().lock() {
+                if let Some(flag) = running.get(&key) {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
             if let Ok(mut set) = cancelled_requests().lock() {
                 record_cancellation(&mut set, key);
             }
@@ -250,6 +262,13 @@ pub fn handle_jsonrpc_message(raw: &str, default_root: &Path) -> Option<Value> {
                     "protocolVersion": negotiated,
                     "capabilities": {
                         "tools": {
+                            "listChanged": false
+                        },
+                        "resources": {
+                            "subscribe": false,
+                            "listChanged": false
+                        },
+                        "prompts": {
                             "listChanged": false
                         }
                     },
@@ -321,13 +340,23 @@ pub fn handle_jsonrpc_message(raw: &str, default_root: &Path) -> Option<Value> {
                     }
                 }));
             }
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            if let Ok(mut active) = active_workers().lock() {
+                active.insert(id_key.clone(), Arc::clone(&cancel_flag));
+            }
             let work = {
                 let name = tool_name.to_string();
                 let args = args.clone();
                 let root = default_root.to_path_buf();
-                move || dispatch_tool(&name, &args, &root)
+                let cancel_worker = Arc::clone(&cancel_flag);
+                move || dispatch_tool_cancellable(&name, &args, &root, cancel_worker)
             };
-            match tool_workers().run(MCP_TOOL_TIME_LIMIT, work) {
+            let run_res =
+                tool_workers().run_cancellable(MCP_TOOL_TIME_LIMIT, Arc::clone(&cancel_flag), work);
+            if let Ok(mut active) = active_workers().lock() {
+                active.remove(&id_key);
+            }
+            match run_res {
                 Ok(mut text) => {
                     if text.len() > MAX_TOOL_OUTPUT_BYTES {
                         let mut cut = MAX_TOOL_OUTPUT_BYTES;
@@ -366,6 +395,257 @@ pub fn handle_jsonrpc_message(raw: &str, default_root: &Path) -> Option<Value> {
                 })),
             }
         }
+        "resources/list" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "resources": [
+                    {
+                        "uri": "ptt://project/map",
+                        "name": "Project Map",
+                        "description": "Ignore-aware directory tree with token estimates and AST skeleton of key files",
+                        "mimeType": "text/markdown"
+                    },
+                    {
+                        "uri": "ptt://project/git-diff",
+                        "name": "Git Diff Context",
+                        "description": "Working tree git status badges and unified git diff",
+                        "mimeType": "application/json"
+                    }
+                ]
+            }
+        })),
+        "resources/read" => {
+            let Some(params_obj) = params.as_object() else {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: expected object for resources/read"
+                    }
+                }));
+            };
+            let Some(uri) = params_obj.get("uri").and_then(Value::as_str) else {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: missing string \"uri\" for resources/read"
+                    }
+                }));
+            };
+
+            let mime = if uri == "ptt://project/map" {
+                "text/markdown"
+            } else if uri == "ptt://project/git-diff" {
+                "application/json"
+            } else {
+                "text/plain"
+            };
+
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            if let Ok(mut active) = active_workers().lock() {
+                active.insert(id_key.clone(), Arc::clone(&cancel_flag));
+            }
+
+            let work = {
+                let uri = uri.to_string();
+                let root = default_root.to_path_buf();
+                let cancel_worker = Arc::clone(&cancel_flag);
+                move || match uri.as_str() {
+                    "ptt://project/map" => dispatch_tool_cancellable(
+                        "ptt_get_project_map",
+                        &json!({}),
+                        &root,
+                        cancel_worker,
+                    ),
+                    "ptt://project/git-diff" => dispatch_tool_cancellable(
+                        "ptt_get_git_context",
+                        &json!({}),
+                        &root,
+                        cancel_worker,
+                    ),
+                    _ => Err(format!("Resource not found: {uri}")),
+                }
+            };
+
+            let run_res =
+                tool_workers().run_cancellable(MCP_TOOL_TIME_LIMIT, Arc::clone(&cancel_flag), work);
+
+            if let Ok(mut active) = active_workers().lock() {
+                active.remove(&id_key);
+            }
+
+            match run_res {
+                Ok(text) => Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": uri,
+                                "mimeType": mime,
+                                "text": text
+                            }
+                        ]
+                    }
+                })),
+                Err(err) => Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": err
+                    }
+                })),
+            }
+        }
+        "prompts/list" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "prompts": [
+                    {
+                        "name": "architecture_review",
+                        "description": "Deep architectural, modularity, and dependency-graph review of the repository",
+                        "arguments": [
+                            {
+                                "name": "focus_path",
+                                "description": "Optional file or module path to focus the architecture review on.",
+                                "required": false
+                            }
+                        ]
+                    },
+                    {
+                        "name": "security_audit",
+                        "description": "Security, path-sandbox, and secret-exposure audit of the codebase",
+                        "arguments": [
+                            {
+                                "name": "directory",
+                                "description": "Optional subdirectory or module to audit.",
+                                "required": false
+                            }
+                        ]
+                    },
+                    {
+                        "name": "git_diff_review",
+                        "description": "Pre-merge code review of current working tree changes and git diff",
+                        "arguments": []
+                    }
+                ]
+            }
+        })),
+        "prompts/get" => {
+            let Some(params_obj) = params.as_object() else {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: expected object for prompts/get"
+                    }
+                }));
+            };
+            let Some(prompt_name) = params_obj
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: missing string \"name\" for prompts/get"
+                    }
+                }));
+            };
+            let prompt_args = match params_obj.get("arguments") {
+                None | Some(Value::Null) => json!({}),
+                Some(v @ Value::Object(_)) => v.clone(),
+                Some(_) => {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid params: \"arguments\" must be a JSON object"
+                        }
+                    }));
+                }
+            };
+
+            let description = match prompt_name {
+                "architecture_review" => {
+                    "Deep architectural, modularity, and dependency-graph review of the repository"
+                }
+                "security_audit" => {
+                    "Security, path-sandbox, and secret-exposure audit of the codebase"
+                }
+                "git_diff_review" => {
+                    "Pre-merge code review of current working tree changes and git diff"
+                }
+                other => {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": format!("Prompt not found: {other}")
+                        }
+                    }));
+                }
+            };
+
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            if let Ok(mut active) = active_workers().lock() {
+                active.insert(id_key.clone(), Arc::clone(&cancel_flag));
+            }
+
+            let work = {
+                let name = prompt_name.to_string();
+                let args = prompt_args.clone();
+                let root = default_root.to_path_buf();
+                let cancel_worker = Arc::clone(&cancel_flag);
+                move || generate_prompt_text(&name, &args, &root, cancel_worker)
+            };
+
+            let run_res =
+                tool_workers().run_cancellable(MCP_TOOL_TIME_LIMIT, Arc::clone(&cancel_flag), work);
+
+            if let Ok(mut active) = active_workers().lock() {
+                active.remove(&id_key);
+            }
+
+            match run_res {
+                Ok(text) => Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "description": description,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": text
+                                }
+                            }
+                        ]
+                    }
+                })),
+                Err(err) => Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": err
+                    }
+                })),
+            }
+        }
         other => Some(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -374,6 +654,103 @@ pub fn handle_jsonrpc_message(raw: &str, default_root: &Path) -> Option<Value> {
                 "message": format!("Method not found: {other}")
             }
         })),
+    }
+}
+
+fn generate_prompt_text(
+    name: &str,
+    args: &Value,
+    root: &Path,
+    cancelled: Arc<AtomicBool>,
+) -> Result<String, String> {
+    match name {
+        "architecture_review" => {
+            let focus_path = args
+                .get("focus_path")
+                .and_then(Value::as_str)
+                .map(str::trim);
+            let map = dispatch_tool_cancellable(
+                "ptt_get_project_map",
+                &json!({ "include_skeletons": true }),
+                root,
+                Arc::clone(&cancelled),
+            )?;
+            let mut text = String::from(
+                "# Architecture & Dependency-Graph Review Request\n\n\
+                 You are a Principal Systems Architect performing a deep architectural review of this repository.\n\n\
+                 ## Review Goals\n\
+                 1. Analyze architectural tiers and modular decoupling across packages and modules.\n\
+                 2. Identify potential circular dependencies, tight coupling, and boundary leaks.\n\
+                 3. Review error propagation and system invariants for fail-closed behavior.\n\
+                 4. Suggest structural refactorings to improve cohesion and testability.\n\n",
+            );
+            if let Some(focus) = focus_path.filter(|s| !s.is_empty()) {
+                text.push_str(&format!(
+                    "## Review Focus\nFocused file/module: `{focus}`\n\n"
+                ));
+                if let Ok(rel) = dispatch_tool_cancellable(
+                    "ptt_get_related_files",
+                    &json!({ "path": focus }),
+                    root,
+                    Arc::clone(&cancelled),
+                ) {
+                    text.push_str(&format!("### Related Dependencies (1-hop imports, importers, tests)\n```json\n{rel}\n```\n\n"));
+                }
+            }
+            text.push_str("## Repository Structure & Module Skeletons\n\n");
+            text.push_str(&map);
+            Ok(text)
+        }
+        "security_audit" => {
+            let directory = args.get("directory").and_then(Value::as_str).map(str::trim);
+            let tool_args = if let Some(dir) = directory.filter(|s| !s.is_empty()) {
+                json!({ "directory": dir, "include_skeletons": true })
+            } else {
+                json!({ "include_skeletons": true })
+            };
+            let map = dispatch_tool_cancellable(
+                "ptt_get_project_map",
+                &tool_args,
+                root,
+                Arc::clone(&cancelled),
+            )?;
+            let mut text = String::from(
+                "# Security & Secret-Exposure Audit Request\n\n\
+                 You are a Principal Security Architect performing a security audit of this codebase.\n\n\
+                 ## Audit Scope\n\
+                 1. Path traversal & sandboxing: verify canonical root enforcement, symlink handling, and path normalization.\n\
+                 2. Secret detection & credential hygiene: review secret redaction rules, API key exposure, and sanitization in logs/artifacts.\n\
+                 3. Denial of Service (DoS) protections: review input size caps, regex backtracking safety, and token budget limits.\n\
+                 4. Supply-chain & memory safety: review unsafe boundaries, dependency trust, and untrusted archive/input processing.\n\n",
+            );
+            if let Some(dir) = directory.filter(|s| !s.is_empty()) {
+                text.push_str(&format!("Audit scope restricted to directory: `{dir}`\n\n"));
+            }
+            text.push_str("## Codebase Skeletons & Map\n\n");
+            text.push_str(&map);
+            Ok(text)
+        }
+        "git_diff_review" => {
+            let git_ctx = dispatch_tool_cancellable(
+                "ptt_get_git_context",
+                &json!({}),
+                root,
+                Arc::clone(&cancelled),
+            )?;
+            let text = format!(
+                "# Pre-Merge Git Diff Review Request\n\n\
+                 You are a Principal Software Engineer performing a rigorous pre-merge code review of the current working tree changes.\n\n\
+                 ## Review Checklist\n\
+                 1. Logic correctness, edge cases, and off-by-one errors.\n\
+                 2. Adherence to architectural invariants and backward compatibility.\n\
+                 3. Performance implications: zero-waste I/O, allocation pressure, and concurrency safety.\n\
+                 4. Test coverage for new features, regression guards, and error cases.\n\n\
+                 ## Working Tree Git Context & Diff\n\n\
+                 {git_ctx}"
+            );
+            Ok(text)
+        }
+        other => Err(format!("Prompt not found: {other}")),
     }
 }
 

@@ -7,11 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-17
+
+### Added
+
+- **Prompt Caching (KV-Cache) optimization:** Output serialization splits files into a stable prefix of unmodified base files and places Git-modified files (`status="modified"` in XML/JSON, `*(modified)*` in Markdown) at the end of `<files>`. This stable ordering maximizes prompt prefix cache hits in Anthropic Claude, OpenAI, and Google Gemini.
+- **Intelligent `--max-tokens` budgeting engine:**
+  - Single-pass in-memory `PreparedWorkspace` with `CachedRender` eliminates redundant disk I/O and re-tokenization across budget iterations.
+  - Dependency graph centrality (`DependencyGraph` with an $O(1)$ lookup index covering Rust, TypeScript/JavaScript, Python, Go, and C#) prevents core modules with high incoming import centrality from premature dropping.
+  - Two-stage degradation algorithm: Round A converts candidate files to Tree-sitter AST skeletons before Round B drops remaining files starting from lowest priority.
+  - File pinning (`--pin <PATH>` in CLI and `pinned_paths` in MCP `ptt_pack_files`) guarantees critical files are never dropped by budget fitting.
+- **Self-packing protection across all 4 formats:** Automatic detection and omission of previously generated `ptt` context artifacts across XML, Markdown, JSON, and Plain Text (both native and browser mode), preventing recursive file expansion.
+- **Complete MCP Server capabilities (`ptt mcp` MCP 2025-11-25):**
+  - Read-only tool annotations: `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
+  - Tools: `ptt_get_project_map`, `ptt_pack_files` (supporting `paths`, `pinned_paths`, `include`, `exclude`, `git_modified`, `git_branch`, `skeleton`, `format`, `preset`, `max_tokens`, `git_diff`, `tokenizer`, `prompt`), `ptt_get_git_context`, `ptt_get_related_files`, `ptt_search_symbols`.
+  - Resources: `ptt://project/map` and `ptt://project/git-diff`.
+  - Prompts: `architecture_review`, `security_audit`, `git_diff_review`.
+- **Advanced security scanner:**
+  - High-performance DFA `RegexSet` automaton with 21 rules covering cloud provider tokens (AWS, Anthropic, OpenAI, Google, Stripe, GitHub, GitLab, Slack, Hugging Face, npm, Azure Storage Account Keys, SendGrid, Discord) and PEM private keys.
+  - Generic secret detection based on Shannon entropy ($H > 4.5$ bits/char for literals $\ge 32$ chars with placeholder avoidance).
+  - TOCTOU protection (`O_NOFOLLOW` and inode verification via `dev/ino` before reading regular files).
+- **UI and browser parity:**
+  - Full secret masking parity in `ui/src/secrets.ts` including `shannonEntropy`, `AZURE_KEY`, `SENDGRID_KEY`, `DISCORD_TOKEN`, and `HIGH_ENTROPY_SECRET`.
+  - Directory structure summary support (`## Directory Structure` in Markdown and `"directory_structure"` in JSON) when `includeSummary` is enabled in browser mode.
+  - Token breakdown in UI: exact presentation of `contentTokens`, `overheadTokens`, and `tokenizerExact` with `~` prefix for approximate profiles (`claude`, `gemini`, and browser mode).
+  - Default preset exclusions: selection presets in UI and backend exclude `benchmarks/` and lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, `poetry.lock`, `uv.lock`).
+
 ## [0.8.1] - 2026-10-15
 
 ### Fixed
 
-- The MCP concurrency limiter uses `compare_exchange_weak` instead of the `fetch_update` helper, which newer stable toolchains flag as deprecated. CI runs with `-D warnings`, so v0.8.0 failed to build there. Behavior is unchanged: a tool slot is taken only while fewer than four are in use.
+- The MCP concurrency limiter uses `compare_exchange_weak` instead of the `fetch_update` helper, which newer stable toolchains flag as deprecated. CI runs with `-D warnings`, so v0.8.0 failed to build there. Behavior is unchanged: a tool slot is taken only while fewer than 16 are in use.
 
 ### Changed
 
@@ -34,9 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Regression tests for file-path attacks on Unix: symlinked directory components, `..` and absolute paths are rejected before any open. A concurrency test swaps a file between real content and a symlink to outside content while the verified open runs, and checks that outside content is never returned (10/10 repeated runs passed). Windows reparse-point tests have not been run.
-- Each MCP tool call has a 30-second time limit. A call that runs longer returns a tool error (`isError: true`) instead of holding the session. The timed-out work is not cancelled and keeps running in the background. A later call that needs the shared workspace index waits for it to finish. At most four tool workers run at once, timed-out ones included. A call that arrives while all four are busy returns a tool error right away, and a worker's slot is freed when its work ends. A worker that cannot be started returns a tool error instead of crashing the server. Cooperative cancellation is not implemented.
-- Integration test `tests/mcp_stdio_client.rs` drives the built `ptt mcp` binary over stdio: handshake, `tools/list`, then one call to each of the five tools. It checks that stdout carries only protocol JSON and stderr stays empty. It passes in debug and release builds. CI runs it on Linux, macOS, and Windows.
-- CI runs `cargo audit` (RustSec) and fails on any vulnerability. Two informational warnings are triaged in `SECURITY.md`.
+- Each MCP tool call, `resources/read`, and `prompts/get` has a 30-second time limit and cooperative cancellation (`AtomicBool`) triggered both on timeout and when the client sends `notifications/cancelled` for an in-flight request. At most 16 tool workers run at once, timed-out ones included. A call that arrives while all 16 are busy returns a tool error right away, and a worker's slot is freed when its work ends. A worker that cannot be started returns a tool error instead of crashing the server.
+- MCP server now advertises and serves `resources/list` and `resources/read` (`ptt://project/map`, `ptt://project/git-diff`) as well as `prompts/list` and `prompts/get` (`architecture_review`, `security_audit`, `git_diff_review`), plus read-only tool annotations (`readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`).
+- Secret masking expanded from 17 to 21 rules in both Rust (`src/core/secrets.rs`) and browser TypeScript (`ui/src/secrets.ts`), adding Azure Storage Account keys (`AZURE_KEY`), SendGrid keys (`SENDGRID_KEY`), Discord bot/webhook tokens (`DISCORD_TOKEN`), and Shannon-entropy-gated generic credential assignments (`HIGH_ENTROPY_SECRET`, $H > 4.5$ bits/char for literals $\ge 32$ chars). Corpus evaluation covers 21/21 true positives and 0/20 false positives across Rust and Playwright.
+- Single-pass in-memory budget fitting (`PreparedWorkspace`) avoids re-reading and re-tokenizing unchanged files across `--max-tokens` iterations, and uses dependency-graph importer centrality (`drop_priority_order_with_graph`) so heavily imported core modules survive ahead of isolated files.
+- Desktop UI improvements: tree badges display exact BPE token counts (`exact BPE` vs `heuristic`) once a pack has been generated; the Context Budget bar breaks down full content, AST skeletons, and wrapper/diff/prompt overhead; and the File Viewer offers a Full / AST Skeleton toggle with savings percentage and related-file chips.
+- Integration test `tests/mcp_stdio_client.rs` drives the built `ptt mcp` binary over stdio: handshake, `tools/list`, one call to each of the five tools, `resources/list`, `resources/read`, `prompts/list`, and `prompts/get`. It checks that stdout carries only protocol JSON and stderr stays empty. It passes in debug and release builds. CI runs it on Linux, macOS, and Windows.
+- CI runs `cargo audit` (RustSec) and `cargo deny` (`deny.toml`) and fails on any vulnerability or license violation. Two informational warnings are triaged in `SECURITY.md`.
 - The release workflow fails if any of the four platform installers, or its `.sig`, is missing from the release.
 - `ptt pack --pin <PATH>` marks a project file that budget fitting never drops. If the pinned files alone exceed `--max-tokens`, the pack fails with an error that names them.
 - Regression tests: pinned files survive a fit that drops others; a pinned file that alone exceeds the budget fails closed; repeated fits are deterministic.

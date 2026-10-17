@@ -3,20 +3,20 @@
 //! The MCP server calls [`tool_workers`] for each `tools/call`. The pool owns the slot count,
 //! so timed-out workers that keep running still count against the cap.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Maximum tool workers that may run at once, including timed-out workers that are still running.
 /// Normal calls use one slot at a time, so the cap only binds after several calls have timed out.
-const MAX_TOOL_WORKERS: usize = 4;
+const MAX_TOOL_WORKERS: usize = 16;
 
 /// Runs tool calls on worker threads with a time limit. Each running worker holds one slot until its
 /// work ends, so timed-out workers count against the cap. Without the cap, an untrusted client could
 /// make timed-out workers pile up without limit.
 ///
-/// A worker cannot be stopped safely, so a timed-out call keeps running in the background. The client
-/// gets the timeout error at once, and a later call that needs the shared workspace index waits for
-/// that worker to finish.
+/// Timeout cancellation is cooperative: tasks that check the flag can stop early. Non-cooperative
+/// work continues in the background and holds its slot until it finishes; the client gets the timeout
+/// error immediately.
 pub(super) struct ToolWorkers {
     in_flight: Arc<AtomicUsize>,
     limit: usize,
@@ -63,8 +63,13 @@ impl ToolWorkers {
     }
 
     /// Runs `work` on a worker and returns its result, or an error once `time_limit` has elapsed.
-    /// Refuses without starting a worker when all slots are taken.
-    pub(super) fn run<F>(&self, time_limit: std::time::Duration, work: F) -> Result<String, String>
+    /// Sets `cancelled` to true upon timeout or thread disconnect to abort long-running tasks.
+    pub(super) fn run_cancellable<F>(
+        &self,
+        time_limit: std::time::Duration,
+        cancelled: Arc<AtomicBool>,
+        work: F,
+    ) -> Result<String, String>
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
     {
@@ -75,6 +80,7 @@ impl ToolWorkers {
             ));
         };
         let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel_worker = Arc::clone(&cancelled);
         let spawned = std::thread::Builder::new().spawn(move || {
             let result = work();
             // Free the slot before reporting, so a client that sends its next call on receiving this
@@ -88,14 +94,28 @@ impl ToolWorkers {
         }
         match receiver.recv_timeout(time_limit) {
             Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-                "tool call exceeded the {:.0}s time limit; it was not cancelled and may still finish in the background",
-                time_limit.as_secs_f64()
-            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                cancel_worker.store(true, Ordering::SeqCst);
+                Err(format!(
+                    "tool call exceeded the {:.0}s time limit; cancellation was requested, but work may continue if it does not check the flag",
+                    time_limit.as_secs_f64()
+                ))
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                cancel_worker.store(true, Ordering::SeqCst);
                 Err("tool worker stopped before returning a result".to_string())
             }
         }
+    }
+
+    /// Runs `work` on a worker and returns its result, or an error once `time_limit` has elapsed.
+    /// Refuses without starting a worker when all slots are taken.
+    #[cfg(test)]
+    pub(super) fn run<F>(&self, time_limit: std::time::Duration, work: F) -> Result<String, String>
+    where
+        F: FnOnce() -> Result<String, String> + Send + 'static,
+    {
+        self.run_cancellable(time_limit, Arc::new(AtomicBool::new(false)), work)
     }
 }
 
@@ -113,11 +133,20 @@ mod tests {
     fn tool_work_that_exceeds_the_time_limit_returns_an_error_without_waiting() {
         let workers = ToolWorkers::new(MAX_TOOL_WORKERS);
         let started = std::time::Instant::now();
-        let slow = workers.run(std::time::Duration::from_millis(50), || {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            Ok("late".to_string())
-        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let slow = workers.run_cancellable(
+            std::time::Duration::from_millis(50),
+            Arc::clone(&cancelled),
+            || {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok("late".to_string())
+            },
+        );
         let err = slow.unwrap_err();
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "timeout must request cancellation"
+        );
         assert!(err.contains("time limit"), "{err}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),

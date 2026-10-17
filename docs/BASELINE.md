@@ -20,8 +20,8 @@
 - `src/core/tokenizer.rs`: Exact BPE counting via `tiktoken-rs` (`o200k_base` and `cl100k_base`) plus approximate scaled profiles (`claude` = `1.04 * o200k_base`, `gemini` = `0.96 * o200k_base`).
 - `src/core/skeleton.rs`: Tree-sitter AST compression and `find_symbols` across Rust, TypeScript, JavaScript, Python, Go, C#, Java, C, and C++.
 - `src/core/deps.rs`: Parallel intra-repo import/importers/test resolver (`DependencyGraph::build_incremental`) with in-memory content caching (`Arc<str>`).
-- `src/core/secrets.rs`: 17 regex credential rules with placeholder filtering and `RedactionSummary`.
-- `src/core/preview.rs`: Path sandboxing (`resolve_under_root`, `resolve_under_canonical_root`, `is_link`) and bounded file preview (`load_preview`).
+- `src/core/secrets.rs`: 21 regex & Shannon-entropy credential rules with placeholder filtering and `RedactionSummary`.
+- `src/core/preview.rs`: Path sandboxing (`resolve_under_root`, `resolve_under_canonical_root`, `is_link`, `open_verified_regular_file` with `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT` and `fstat` `(dev, ino)` check) and bounded file preview (`load_preview`).
 - `src/core/git.rs`: Working-tree status (`git status --porcelain=v1 -z -uall`), branch diff detection (`base...HEAD`), recent commits, and bounded `compute_git_diff`.
 - `src/core/text.rs`: Strict UTF-8 and BOM-declared UTF-16LE/BE decoding (`decode_text`) and backtick-safe `markdown_fence`.
 
@@ -68,13 +68,13 @@
    - Original finding (Stage 0): token totals excluded wrappers and the fit could silently keep one over-budget file. **Now fixed:** `write_output_with_stats` counts the complete rendered artifact (`count_tokens_with_model` on the full document), and `fit_to_bpe_budget_with_pins` (`src/cli.rs`) re-renders and recounts each round, returning an explicit error when no file can be dropped.
    - Original finding: MCP `ptt_pack_files` computed `git_diff` after the fit. **Already correct in the working tree:** the diff is computed before `fit_to_bpe_budget`.
    - Approximate profiles (`claude`, `gemini`) are scaled estimates and are labeled with `~` in the CLI.
-2. **P0-B (Browser-Mode Ignore Discrepancy)**:
-   - `ui/src/browserFs.ts` (`scanDirectoryHandle`, `scanFileList`) only filters `CANONICAL_JUNK_DIRS`. It ignores `.gitignore` and `.pttignore` files completely, does not report skipped files/reasons, and does not enforce `.pttignore` fail-closed semantics.
-3. **P0-C (MCP Compatibility & Validation)**:
-   - `src/mcp.rs` hardcodes `"2024-11-05"` without version negotiation (`2025-11-25` / `2025-06-18` / `2024-11-05`), does not validate argument types/unknown properties strictly (returning JSON-RPC `-32602` or tool errors), does not bound input line lengths on `stdin`, and does not support `notifications/cancelled`.
-4. **P0-D (Secret Detection & Visible Redaction Report)**:
-   - *Status update (P0-D):* `RedactionSummary` already carried `redaction_enabled`, `files_scanned`, and `files_skipped`, and an adversarial performance test exists. Two gaps were real and are now fixed: the task prompt was never masked (now masked in Rust and the browser), and the CLI printed no redaction report (now a stderr line on every pack path). The report still does not prove the absence of secrets; that limit is stated in the output.
-5. **P0-E (Filesystem Attack Surface / TOCTOU)**:
-   - `read_and_redact_file` (`src/core/output.rs`) and `load_preview` (`src/core/preview.rs`) check `symlink_metadata` on the path and then call `std::fs::File::open(&path)` without `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT` or post-open `fstat` verification (inode/device/file-type comparison).
-6. **P0-F (Release Workflow & Supply Chain)**:
-   - `.github/workflows/ci.yml` and `.github/workflows/release.yml` use mutable tags (`@v7`, `@v2`, `@stable`, `@v1`), lack an explicit MSRV (`1.90`) check job, and lack automated release binary smoke tests in CI.
+2. **P0-B (Browser-Mode Ignore Discrepancy)** — *status update after Stage 1–2 work*:
+   - Original finding: `ui/src/browserFs.ts` (`scanDirectoryHandle`, `scanFileList`) only filtered `CANONICAL_JUNK_DIRS`. **Now fixed:** `browserFs.ts` implements `parseIgnoreFile` and `applyIgnoreSemanticsToFileMap` with top-down parent pruning, scoped negations, fail-closed `.pttignore` syntax validation, and skipped-file reason reporting (`gitignore`, `pttignore`, `junk_dir`, `unreadable`).
+3. **P0-C (MCP Compatibility & Validation)** — *status update after Stage 1–2 work*:
+   - Original finding: `src/mcp.rs` hardcoded `"2024-11-05"` without version negotiation, schema validation, stdin caps, or cancellation. **Now fixed:** negotiates `2025-11-25`, `2025-06-18`, and `2024-11-05` (and rejects `2026-07-28`), validates tool arguments against schemas (`-32602`), enforces a 4 MiB stdin line cap and 8 MiB output cap, caps pending cancellations at 1024, runs a 16-worker pool with 30 s timeouts and cooperative `AtomicBool` cancellation, and exposes MCP resources (`resources/list`, `resources/read`) and prompts (`prompts/list`, `prompts/get`).
+4. **P0-D (Secret Detection & Visible Redaction Report)** — *status update after Stage 1–2 work*:
+   - `RedactionSummary` carries `redaction_enabled`, `files_scanned`, and `files_skipped`; the task prompt is masked in Rust and browser mode; `ptt pack` prints a one-line redaction report to stderr on every path; and the rule set is expanded to 21 rules (adding `AZURE_KEY`, `SENDGRID_KEY`, `DISCORD_TOKEN`, and Shannon-entropy-gated `HIGH_ENTROPY_SECRET`) verified by a 21/21 TP and 0/20 FP corpus in Rust and Playwright.
+5. **P0-E (Filesystem Attack Surface / TOCTOU)** — *status update after Stage 1–2 work*:
+   - **Now fixed for final component:** `open_verified_regular_file` (`src/core/preview.rs`) opens files with `O_NOFOLLOW` on Unix and `FILE_FLAG_OPEN_REPARSE_POINT` on Windows and verifies `(dev, ino)` equality against `file.metadata()` (`fstat`). Intermediate-directory race risk is explicitly documented in `SECURITY.md`.
+6. **P0-F (Release Workflow & Supply Chain)** — *status update after Stage 1–2 work*:
+   - **Now fixed:** `.github/workflows/ci.yml` and `.github/workflows/release.yml` pin all actions to full commit SHAs, run an explicit `1.90.0` MSRV check job, run `cargo audit`, `cargo deny` (`deny.toml`), and `npm audit --audit-level=high`, run automated release binary CLI + MCP smoke tests across Linux/macOS/Windows, and attach a CycloneDX SBOM (`ptt-sbom.cdx.json`) on release.

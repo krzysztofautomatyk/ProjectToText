@@ -753,9 +753,18 @@ export function useWorkspace() {
       );
     }
     if (output && view === 'packed') {
+      const isExact = stats.tokenizerExact === true;
+      const breakdown =
+        stats.contentTokens !== undefined
+          ? ` (Content: ${isExact ? '' : '~'}${formatTokens(stats.contentTokens)}, Overhead: ${isExact ? '' : '~'}${formatTokens(stats.overheadTokens ?? 0)})`
+          : '';
+      const hint = isExact
+        ? `Exact BPE token count (o200k_base) on complete serialized artifact.${breakdown}`
+        : `${TOKEN_ESTIMATE_HINT}${breakdown}`;
       return (
-        <span className={tokenBadgeClass(stats.tokens)} title={TOKEN_ESTIMATE_HINT}>
-          <Check size={11} /> ready · ~{formatTokens(stats.tokens)} tokens (approx)
+        <span className={tokenBadgeClass(stats.tokens)} title={hint} data-testid="ready-token-badge">
+          <Check size={11} /> ready · {isExact ? '' : '~'}
+          {formatTokens(stats.tokens)} tokens ({isExact ? 'exact BPE' : 'approx'})
         </span>
       );
     }

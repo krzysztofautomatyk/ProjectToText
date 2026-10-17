@@ -53,7 +53,7 @@ pub const DEFAULT_EXCLUDED_FILE_NAMES: &[&str] = &[
 ];
 
 /// Generated directories (relative, forward-slash, with trailing slash) excluded by presets.
-pub const DEFAULT_EXCLUDED_DIR_PREFIXES: &[&str] = &["gen/schemas/"];
+pub const DEFAULT_EXCLUDED_DIR_PREFIXES: &[&str] = &["gen/schemas/", "benchmarks/"];
 
 /// True when a relative path is a lockfile or generated schema that presets leave unchecked.
 pub fn is_default_excluded_path(rel: &str) -> bool {
@@ -615,8 +615,11 @@ mod tests {
         assert!(is_default_excluded_path("ui/package-lock.json"));
         assert!(is_default_excluded_path("Cargo.lock"));
         assert!(is_default_excluded_path("gen/schemas/desktop-schema.json"));
+        assert!(is_default_excluded_path("benchmarks/context-v1/prior.xml"));
+        assert!(is_default_excluded_path("benchmarks/"));
         assert!(!is_default_excluded_path("src/main.rs"));
         assert!(!is_default_excluded_path("docs/gen/schemas-notes.md"));
+        assert!(!is_default_excluded_path("docs/benchmarks/notes.md"));
     }
 
     #[test]

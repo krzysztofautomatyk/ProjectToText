@@ -852,6 +852,15 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         type="button"
         role="menuitem"
         className="ctx-item"
+        style={{ fontWeight: 600 }}
+        onClick={() => void selectRelatedFiles(contextMenu.path, 'all')}
+      >
+        Select with Related Files (Imports + Tests)
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        className="ctx-item"
         onClick={() => void selectRelatedFiles(contextMenu.path, 'imports')}
       >
         Select file + direct imports (1-hop)

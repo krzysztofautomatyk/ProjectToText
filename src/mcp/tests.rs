@@ -1,3 +1,4 @@
+use super::tools::dispatch_tool;
 use super::*;
 use std::fs;
 use tempfile::tempdir;
@@ -134,6 +135,119 @@ fn mcp_symbol_search_returns_src_first_and_pack_accepts_new_params() {
 }
 
 #[test]
+fn mcp_pack_files_supports_include_exclude_and_git_filters() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/keep.rs"), "pub fn keep() {}\n").unwrap();
+    fs::write(dir.path().join("src/drop.rs"), "pub fn drop_me() {}\n").unwrap();
+    fs::write(dir.path().join("notes.md"), "notes\n").unwrap();
+
+    let filtered = call(
+        "ptt_pack_files",
+        json!({ "include": ["src/*.rs"], "exclude": ["*drop.rs"] }),
+        dir.path(),
+    );
+    assert_eq!(filtered["result"]["isError"], false, "{filtered}");
+    let text = filtered["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("src/keep.rs"), "{text}");
+    assert!(!text.contains("src/drop.rs"), "{text}");
+    assert!(!text.contains("notes.md"), "{text}");
+
+    let git_dir = tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(git_dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    git(&["init"]);
+    git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(&["config", "user.email", "ptt-test@example.com"]);
+    git(&["config", "user.name", "PTT test"]);
+    fs::create_dir_all(git_dir.path().join("src")).unwrap();
+    fs::write(git_dir.path().join("src/base.rs"), "pub fn base() {}\n").unwrap();
+    fs::write(
+        git_dir.path().join("src/branch.rs"),
+        "pub fn branch_v1() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        git_dir.path().join("src/working.rs"),
+        "pub fn working_v1() {}\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+    git(&["checkout", "-b", "feature"]);
+    fs::write(
+        git_dir.path().join("src/branch.rs"),
+        "pub fn branch_v2() {}\n",
+    )
+    .unwrap();
+    git(&["commit", "-am", "change branch file"]);
+    fs::write(
+        git_dir.path().join("src/working.rs"),
+        "pub fn working_v2() {}\n",
+    )
+    .unwrap();
+
+    let selected_paths = |filter: &str| {
+        let mut args = serde_json::Map::new();
+        args.insert("format".into(), json!("json"));
+        args.insert(filter.into(), json!(true));
+        let response = call("ptt_pack_files", Value::Object(args), git_dir.path());
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let packed: Value = serde_json::from_str(text).unwrap();
+        packed["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let modified = selected_paths("git_modified");
+    assert_eq!(modified, ["src/working.rs"]);
+    let branch = selected_paths("git_branch");
+    assert_eq!(branch, ["src/branch.rs", "src/working.rs"]);
+
+    let definitions = super::tools::tool_definitions();
+    let pack_schema = definitions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "ptt_pack_files")
+        .unwrap();
+    for (name, expected_type) in [
+        ("include", "array"),
+        ("exclude", "array"),
+        ("git_modified", "boolean"),
+        ("git_branch", "boolean"),
+    ] {
+        assert_eq!(
+            pack_schema["inputSchema"]["properties"][name]["type"],
+            expected_type
+        );
+    }
+
+    let invalid = call("ptt_pack_files", json!({ "include": [false] }), dir.path());
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    let invalid = call(
+        "ptt_pack_files",
+        json!({ "git_modified": "yes" }),
+        dir.path(),
+    );
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+}
+
+#[test]
 fn mcp_search_symbols_and_related_files() {
     let dir = tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -256,4 +370,272 @@ fn mcp_negotiates_protocol_versions_and_validates_schemas_and_cancellation() {
     )
     .unwrap();
     assert_eq!(cancelled["error"]["code"], -32800, "{cancelled}");
+}
+
+#[test]
+fn mcp_resources_and_tool_annotations() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    // 1. Verify initialize reports resources capability
+    let init_resp = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(
+        init_resp["result"]["capabilities"]["resources"]["listChanged"],
+        false
+    );
+
+    // 2. Verify all tool definitions contain MCP 2025-11-25 annotations
+    let list_resp = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    let tools = list_resp["result"]["tools"].as_array().unwrap();
+    for tool in tools {
+        let ann = &tool["annotations"];
+        assert_eq!(ann["readOnlyHint"], true);
+        assert_eq!(ann["destructiveHint"], false);
+        assert_eq!(ann["idempotentHint"], true);
+        assert_eq!(ann["openWorldHint"], false);
+    }
+
+    // 3. Verify resources/list returns ptt://project/map and ptt://project/git-diff
+    let res_list = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    let resources = res_list["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 2);
+    let uris: Vec<&str> = resources.iter().filter_map(|r| r["uri"].as_str()).collect();
+    assert!(uris.contains(&"ptt://project/map"));
+    assert!(uris.contains(&"ptt://project/git-diff"));
+
+    // 4. Verify resources/read reads ptt://project/map as text/markdown
+    let res_read = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"ptt://project/map"}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    let contents = res_read["result"]["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0]["uri"], "ptt://project/map");
+    assert_eq!(contents[0]["mimeType"], "text/markdown");
+    assert!(contents[0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Project Map"));
+
+    // 5. Verify resources/read reads ptt://project/git-diff as application/json
+    let res_read_diff = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"ptt://project/git-diff"}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    let contents_diff = res_read_diff["result"]["contents"].as_array().unwrap();
+    assert_eq!(contents_diff.len(), 1);
+    assert_eq!(contents_diff[0]["uri"], "ptt://project/git-diff");
+    assert_eq!(contents_diff[0]["mimeType"], "application/json");
+}
+
+#[test]
+fn mcp_prompts_list_and_get() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn core_logic() -> &'static str {\n    \"proscada\"\n}\n",
+    )
+    .unwrap();
+
+    // 1. Verify initialize reports prompts capability
+    let init_resp = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(
+        init_resp["result"]["capabilities"]["prompts"]["listChanged"],
+        false
+    );
+
+    // 2. Verify prompts/list returns the 3 standard engineering prompts
+    let list_resp = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":2,"method":"prompts/list","params":{}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    let prompts = list_resp["result"]["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 3);
+    let names: Vec<&str> = prompts.iter().filter_map(|p| p["name"].as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["architecture_review", "security_audit", "git_diff_review"]
+    );
+
+    // 3. Verify prompts/get for architecture_review (with and without focus_path)
+    let arch_get = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"architecture_review","arguments":{"focus_path":"src/lib.rs"}}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(
+        arch_get["result"]["description"],
+        "Deep architectural, modularity, and dependency-graph review of the repository"
+    );
+    let arch_text = arch_get["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(arch_text.contains("Architecture & Dependency-Graph Review Request"));
+    assert!(arch_text.contains("src/lib.rs"));
+    assert!(arch_text.contains("core_logic"));
+
+    // 4. Verify prompts/get for security_audit
+    let sec_get = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"security_audit"}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    let sec_text = sec_get["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(sec_text.contains("Security & Secret-Exposure Audit Request"));
+    assert!(sec_text.contains("Path traversal & sandboxing"));
+
+    // 5. Verify prompts/get for git_diff_review
+    let git_get = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"name":"git_diff_review"}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    let git_text = git_get["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(git_text.contains("Pre-Merge Git Diff Review Request"));
+
+    // 6. Verify error handling for missing name and unknown prompt
+    let missing_name = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":6,"method":"prompts/get","params":{}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(missing_name["error"]["code"], -32602);
+
+    let unknown_prompt = handle_jsonrpc_message(
+        r#"{"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{"name":"non_existent"}}"#,
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(unknown_prompt["error"]["code"], -32602);
+}
+
+#[test]
+fn mcp_pack_files_supports_pinned_paths_and_budget() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/pinned.rs"),
+        "pub fn pinned_fn() -> usize { 42 }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/drop_me.rs"),
+        (0..100)
+            .map(|i| format!("pub fn filler_{i}() -> usize {{ {i} }}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "ptt_pack_files",
+            "arguments": {
+                "pinned_paths": ["src/pinned.rs"],
+                "max_tokens": 500
+            }
+        }
+    })
+    .to_string();
+
+    let resp = handle_jsonrpc_message(&req, dir.path()).unwrap();
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("pinned.rs"),
+        "pinned file must be preserved: {text}"
+    );
+    assert!(
+        !text.contains("drop_me.rs"),
+        "non-pinned file must be dropped: {text}"
+    );
+}
+
+#[test]
+fn mcp_pack_files_accepts_tokenizer_and_prompt() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn core_logic() -> &'static str { \"valid\" }\n",
+    )
+    .unwrap();
+
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/call",
+        "params": {
+            "name": "ptt_pack_files",
+            "arguments": {
+                "paths": ["src/lib.rs"],
+                "tokenizer": "claude",
+                "prompt": "Review this module"
+            }
+        }
+    })
+    .to_string();
+
+    let resp = handle_jsonrpc_message(&req, dir.path()).unwrap();
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("src/lib.rs"), "{text}");
+    assert!(text.contains("<task_instructions>"), "{text}");
+    assert!(text.contains("Review this module"), "{text}");
+
+    // Invalid tokenizer must be rejected
+    let invalid_req = json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "tools/call",
+        "params": {
+            "name": "ptt_pack_files",
+            "arguments": {
+                "tokenizer": "invalid_model"
+            }
+        }
+    })
+    .to_string();
+    let invalid_resp = handle_jsonrpc_message(&invalid_req, dir.path()).unwrap();
+    assert_eq!(invalid_resp["error"]["code"], -32602, "{invalid_resp}");
+
+    // Also verify get_git_context works cleanly via snapshot
+    let git_req = json!({
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "tools/call",
+        "params": {
+            "name": "ptt_get_git_context",
+            "arguments": {}
+        }
+    })
+    .to_string();
+    let git_resp = handle_jsonrpc_message(&git_req, dir.path()).unwrap();
+    assert_eq!(git_resp["result"]["isError"], false, "{git_resp}");
 }

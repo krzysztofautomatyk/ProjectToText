@@ -16,11 +16,17 @@
 
 pub mod core;
 
+pub use core::budget::{
+    drop_priority_order_with_graph, fit_to_bpe_budget, fit_to_bpe_budget_with_graph,
+    fit_to_bpe_budget_with_pins, fit_workspace_to_bpe_budget, prefit_by_estimate,
+    prefit_by_estimate_with_graph,
+};
 pub use core::deps::{DependencyGraph, RelatedFiles};
 pub use core::git::{compute_git_diff, inspect_git_context, GitRepoContext};
 pub use core::output::{
     write_output, write_output_cancellable, write_output_with_stats, FilePackMode, FileTokenStat,
-    OutputFormat, PackStats, WriteOptions, DEFAULT_MAX_FILE_SIZE,
+    OutputFormat, PackStats, PreparedWorkspace, PreparedWorkspaceFile, WriteOptions,
+    DEFAULT_MAX_FILE_SIZE,
 };
 pub use core::preview::{
     guess_language, load_preview, resolve_under_root, FilePreview, DEFAULT_PREVIEW_MAX,

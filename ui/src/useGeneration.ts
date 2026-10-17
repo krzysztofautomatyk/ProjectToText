@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { downloadText, generateBrowserOutputWithStats, type BrowserProject } from './browserFs';
 import { redactSecretsWithReport, type RedactionSummary } from './secrets';
 import { isTauriRuntime } from './tauriEnv';
-import { type FileNode, type PackOptions, type FileTokenStat, type GenerateOutputResponse, type OutputFormat, type ToastKind, normalizePath, formatTokens, estimateTokens } from './treeModel';
+import { type FileNode, type PackOptions, type FileTokenStat, type PackTokenStats, type GenerateOutputResponse, type OutputFormat, type ToastKind, normalizePath, formatTokens, estimateTokens } from './treeModel';
 import type { MutableRefObject } from 'react';
 
 const IN_TAURI = isTauriRuntime();
@@ -21,7 +21,7 @@ interface GenerationParams {
 export function useGeneration({ currentPath, nodes, format, taskPrompt, pushToast, browserProjectRef, workspaceRevision }: GenerationParams) {
   const [output, setOutput] = useState('');
   const [generating, setGenerating] = useState(false);
-  const [stats, setStats] = useState({ files: 0, tokens: 0 });
+  const [stats, setStats] = useState<PackTokenStats>({ files: 0, tokens: 0 });
   const genSeq = useRef(0);
   const hasLoadedOnce = useRef(false);
   const generateTimer = useRef<number | null>(null);
@@ -84,6 +84,7 @@ export function useGeneration({ currentPath, nodes, format, taskPrompt, pushToas
             redactSecrets: activeRedact,
             skeletonFiles: activeSkeletons,
             taskPrompt: activePrompt,
+            includeSummary: true,
           });
           if (seq !== genSeq.current) return;
           setOutput(res.text);
@@ -93,7 +94,16 @@ export function useGeneration({ currentPath, nodes, format, taskPrompt, pushToas
           setRedactionSummary(res.redactions);
           setFileTokens(res.fileTokens);
           setFullOutputPreview(wantFullPreview);
-          setStats({ files: sel.length, tokens: estimateTokens(res.text) });
+          const totalContentTokens = res.fileTokens.reduce((sum, f) => sum + f.tokens, 0);
+          const totalTokens = estimateTokens(res.text);
+          const overheadTokens = Math.max(0, totalTokens - totalContentTokens);
+          setStats({
+            files: sel.length,
+            tokens: totalTokens,
+            contentTokens: totalContentTokens,
+            overheadTokens: overheadTokens,
+            tokenizerExact: false,
+          });
           hasLoadedOnce.current = true;
         } else {
           const opts: PackOptions = {
@@ -124,7 +134,11 @@ export function useGeneration({ currentPath, nodes, format, taskPrompt, pushToas
             setTotalBytes(new Blob([raw]).size);
             setRedactionSummary(rep);
             setFullOutputPreview(wantFullPreview);
-            setStats({ files: sel.length, tokens: estimateTokens(raw) });
+            setStats({
+              files: sel.length,
+              tokens: estimateTokens(raw),
+              tokenizerExact: false,
+            });
           } else {
             setOutput(raw.preview);
             setFullOutputText(raw.truncatedPreview ? null : raw.preview);
@@ -138,6 +152,9 @@ export function useGeneration({ currentPath, nodes, format, taskPrompt, pushToas
             setStats({
               files: raw.filesPacked ?? sel.length,
               tokens: raw.totalTokens || estimateTokens(raw.preview),
+              contentTokens: raw.contentTokens,
+              overheadTokens: raw.overheadTokens,
+              tokenizerExact: raw.tokenizerExact ?? Boolean(raw.totalTokens),
             });
           }
           hasLoadedOnce.current = true;

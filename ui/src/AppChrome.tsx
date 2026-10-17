@@ -200,12 +200,15 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
       </header>
 
       {browserMode && (
-        <div className="browser-mode-banner" role="status">
+        <div className="browser-mode-banner" role="status" data-testid="browser-mode-banner">
           <Info size={13} aria-hidden />
           <span>
-            <strong>Browser mode</strong> — folder dialog works here, but for native
-            dialogs and “Open with VS Code / Notepad++” run{' '}
-            <code>cargo tauri dev</code> (desktop app), not only the Vite URL.
+            <strong>Browser mode</strong> — evaluates in-folder <code>.gitignore</code> and{' '}
+            <code>.pttignore</code> rules, caps packs at 400 files, and uses approximate token
+            estimates (<code>chars ÷ 3.8</code>). It does not run Git (tracked-file state, global
+            ignores, or <code>git diff</code>) or native editor launchers; run{' '}
+            <code>cargo tauri dev</code> or <code>ptt pack</code> when full Git/BPE fidelity is
+            required.
           </span>
         </div>
       )}
@@ -472,11 +475,13 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
                 stats.tokens >= TOKEN_HARD
                   ? 'Very large context — consider deselecting files'
                   : stats.tokens >= TOKEN_SOFT
-                    ? `Large pack — may exceed smaller model windows. ${TOKEN_ESTIMATE_HINT}`
-                    : TOKEN_ESTIMATE_HINT
+                    ? `Large pack — may exceed smaller model windows. ${stats.tokenizerExact ? 'Exact BPE count (o200k_base).' : TOKEN_ESTIMATE_HINT}`
+                    : stats.tokenizerExact
+                      ? 'Exact BPE token count (o200k_base) on complete serialized artifact.'
+                      : TOKEN_ESTIMATE_HINT
               }
             >
-              ~
+              {stats.tokenizerExact ? '' : '~'}
               <span
                 className={[
                   'status-value accent',
@@ -491,7 +496,7 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
               >
                 {formatTokens(stats.tokens)}
               </span>{' '}
-              tokens
+              tokens ({stats.tokenizerExact ? 'exact' : 'approx'})
             </span>
           )}
           <span className="sep">|</span>

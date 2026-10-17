@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from 'react';
 import { applyDeselectDelta, clearDeselectPaths, projectPrefKey, rememberProject, type ProjectPref } from './projectPrefs';
-import { type FileNode, type GitRepoContext, type FileTokenStat, type OutputFormat, type SelectionPreset, type ToastKind, normalizePath, applySavedDeselects, formatTokens, estimateTokensFromBytes, isLowPriorityPath, applyPreset, buildFileTree, sortTreeByTokens, flattenVisibleTree, type SubtreeStats, computeSubtree, filterTree, collectDirPaths, collectFilePaths } from './treeModel';
+import { type FileNode, type GitRepoContext, type FileTokenStat, type PackTokenStats, type OutputFormat, type SelectionPreset, type ToastKind, normalizePath, applySavedDeselects, formatTokens, estimateTokensFromBytes, isLowPriorityPath, applyPreset, buildFileTree, sortTreeByTokens, flattenVisibleTree, type SubtreeStats, computeSubtree, filterTree, collectDirPaths, collectFilePaths } from './treeModel';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import type { useGeneration } from './useGeneration';
 
@@ -16,14 +16,14 @@ interface SelectionParams {
   customProjects: ProjectPref[];
   setCustomProjects: Dispatch<SetStateAction<ProjectPref[]>>;
   targetBudgetTokens: number;
-  stats: { files: number; tokens: number };
+  stats: PackTokenStats;
   fileTokens: FileTokenStat[];
   skeletonSet: Set<string>;
   setSkeletonSet: Dispatch<SetStateAction<Set<string>>>;
   setRedactSecretsEnabled: Dispatch<SetStateAction<boolean>>;
   setIncludeGitDiff: Dispatch<SetStateAction<boolean>>;
   setOutput: Dispatch<SetStateAction<string>>;
-  setStats: Dispatch<SetStateAction<{ files: number; tokens: number }>>;
+  setStats: Dispatch<SetStateAction<PackTokenStats>>;
   setGenerating: Dispatch<SetStateAction<boolean>>;
   genSeq: MutableRefObject<number>;
   generateTimer: MutableRefObject<number | null>;

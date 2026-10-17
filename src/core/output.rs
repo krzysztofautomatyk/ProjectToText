@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,7 @@ pub struct WriteOptions {
     pub task_prompt: Option<String>,
     pub tokenizer_model: TokenizerModel,
     pub compute_bpe_tokens: bool,
+    pub modified_files: HashSet<String>,
 }
 
 impl Default for WriteOptions {
@@ -99,7 +101,355 @@ impl Default for WriteOptions {
             task_prompt: None,
             tokenizer_model: TokenizerModel::O200kBase,
             compute_bpe_tokens: false,
+            modified_files: HashSet::new(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedWorkspaceFile {
+    pub meta: DirEntryMeta,
+    pub path: String,
+    pub ext: String,
+    pub size: Option<u64>,
+    pub full_content: String,
+    pub full_tokens: usize,
+    pub skeleton_content: Option<String>,
+    pub skeleton_tokens: Option<usize>,
+    pub redactions: RedactionSummary,
+    pub is_text_ok: bool,
+    pub is_modified: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CachedRender {
+    kept_paths: Vec<PathBuf>,
+    skeleton_files: HashSet<String>,
+    skeleton_all: bool,
+    rendered: Vec<u8>,
+    stats: PackStats,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedWorkspace {
+    files: Vec<PreparedWorkspaceFile>,
+    files_by_path: HashMap<String, usize>,
+    root: PathBuf,
+    options: WriteOptions,
+    last_render: Arc<Mutex<Option<CachedRender>>>,
+}
+
+impl PreparedWorkspace {
+    /// Reads, decodes, and redacts each file in `entries` exactly once. Precomputes full content,
+    /// tokens, and skeleton content (for supported languages).
+    pub fn prepare<F>(
+        entries: &[DirEntryMeta],
+        root: &Path,
+        options: &WriteOptions,
+        cancelled: &F,
+    ) -> std::io::Result<Self>
+    where
+        F: Fn() -> bool + Sync,
+    {
+        Self::prepare_with_mode(entries, root, options, cancelled, false)
+    }
+
+    /// Precomputes skeletons for all supported files, used by the token budget fitting loop.
+    pub fn prepare_for_budget<F>(
+        entries: &[DirEntryMeta],
+        root: &Path,
+        options: &WriteOptions,
+        cancelled: &F,
+    ) -> std::io::Result<Self>
+    where
+        F: Fn() -> bool + Sync,
+    {
+        Self::prepare_with_mode(entries, root, options, cancelled, true)
+    }
+
+    /// Reads, decodes, and redacts each file once, optionally precomputing AST skeletons for all files.
+    pub fn prepare_with_mode<F>(
+        entries: &[DirEntryMeta],
+        root: &Path,
+        options: &WriteOptions,
+        cancelled: &F,
+        precompute_all_skeletons: bool,
+    ) -> std::io::Result<Self>
+    where
+        F: Fn() -> bool + Sync,
+    {
+        let canonical_root = std::fs::canonicalize(root)?;
+        let root = canonical_root.as_path();
+        let file_metas: Vec<&DirEntryMeta> = entries.iter().filter(|e| !e.is_dir).collect();
+        let valid_parents = build_valid_parent_cache(root, &file_metas);
+
+        let prepare_one = |f: &DirEntryMeta| -> PreparedWorkspaceFile {
+            let path_str = display_path(&f.path);
+            let ext = f
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+            let is_modified = options.modified_files.contains(&path_str);
+
+            let (full_content, redactions, is_text_ok) = read_and_redact_file(
+                root,
+                &f.path,
+                &valid_parents,
+                options.max_file_size,
+                options.redact_secrets,
+            );
+
+            let (skeleton_content, skeleton_tokens) = if is_text_ok {
+                let should_compute = precompute_all_skeletons
+                    || options.skeleton_all
+                    || options.skeleton_files.contains(&path_str);
+                if should_compute {
+                    let lang = language_for_path(&f.path);
+                    if lang != "other" {
+                        let skel = extract_skeleton(&full_content, lang);
+                        let tok = if options.compute_bpe_tokens {
+                            count_tokens_with_model(&skel, options.tokenizer_model)
+                        } else {
+                            ((skel.len() as f64) / 3.8).round() as usize
+                        };
+                        (Some(skel), Some(tok))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            let full_tokens = if options.compute_bpe_tokens {
+                count_tokens_with_model(&full_content, options.tokenizer_model)
+            } else {
+                ((full_content.len() as f64) / 3.8).round() as usize
+            };
+
+            PreparedWorkspaceFile {
+                meta: (*f).clone(),
+                path: path_str,
+                ext,
+                size: f.size,
+                full_content,
+                full_tokens,
+                skeleton_content,
+                skeleton_tokens,
+                redactions,
+                is_text_ok,
+                is_modified,
+            }
+        };
+
+        let prepared_files: Vec<PreparedWorkspaceFile> = if file_metas.len() < 16 {
+            let mut out = Vec::with_capacity(file_metas.len());
+            for f in file_metas {
+                ensure_not_cancelled(cancelled)?;
+                out.push(prepare_one(f));
+            }
+            out
+        } else {
+            file_metas
+                .par_iter()
+                .map(|f| {
+                    if cancelled() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "output superseded by a newer request",
+                        ));
+                    }
+                    Ok(prepare_one(f))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?
+        };
+
+        let mut files_by_path = HashMap::with_capacity(prepared_files.len());
+        for (i, pf) in prepared_files.iter().enumerate() {
+            files_by_path.insert(pf.path.clone(), i);
+        }
+
+        Ok(Self {
+            files: prepared_files,
+            files_by_path,
+            root: canonical_root,
+            options: options.clone(),
+            last_render: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    pub fn files(&self) -> &[PreparedWorkspaceFile] {
+        &self.files
+    }
+
+    pub fn file_by_path(&self, rel_path: &str) -> Option<&PreparedWorkspaceFile> {
+        let norm = normalize_rel_path(Path::new(rel_path));
+        self.files_by_path
+            .get(&norm)
+            .or_else(|| self.files_by_path.get(rel_path))
+            .and_then(|&idx| self.files.get(idx))
+    }
+
+    pub fn render_with_stats<W: Write>(
+        &self,
+        writer: &mut W,
+        kept_entries: &[DirEntryMeta],
+        skeleton_files: &HashSet<String>,
+        skeleton_all: bool,
+    ) -> std::io::Result<PackStats> {
+        let (rendered, stats) =
+            self.render_in_memory(kept_entries, skeleton_files, skeleton_all)?;
+        writer.write_all(&rendered)?;
+        Ok(stats)
+    }
+
+    pub fn render_stats(
+        &self,
+        kept_entries: &[DirEntryMeta],
+        skeleton_files: &HashSet<String>,
+        skeleton_all: bool,
+    ) -> std::io::Result<PackStats> {
+        let (_rendered, stats) =
+            self.render_in_memory(kept_entries, skeleton_files, skeleton_all)?;
+        Ok(stats)
+    }
+
+    pub fn render_in_memory(
+        &self,
+        kept_entries: &[DirEntryMeta],
+        skeleton_files: &HashSet<String>,
+        skeleton_all: bool,
+    ) -> std::io::Result<(Vec<u8>, PackStats)> {
+        let kept_paths: Vec<PathBuf> = kept_entries.iter().map(|e| e.path.clone()).collect();
+        if let Ok(guard) = self.last_render.lock() {
+            if let Some(ref cached) = *guard {
+                if cached.skeleton_all == skeleton_all
+                    && cached.skeleton_files == *skeleton_files
+                    && cached.kept_paths == kept_paths
+                {
+                    return Ok((cached.rendered.clone(), cached.stats.clone()));
+                }
+            }
+        }
+
+        let kept_files: Vec<&DirEntryMeta> = kept_entries.iter().filter(|e| !e.is_dir).collect();
+        let ordered = architectural_order(&kept_files, &self.options.modified_files);
+
+        let mut prepared: Vec<PreparedFile> = Vec::with_capacity(ordered.len());
+        for meta in &ordered {
+            let rel = display_path(&meta.path);
+            if let Some(&idx) = self.files_by_path.get(&rel) {
+                let wf = &self.files[idx];
+                let want_skeleton = skeleton_all || skeleton_files.contains(&wf.path);
+                let (mode, content, tokens) = match (
+                    want_skeleton && wf.is_text_ok,
+                    &wf.skeleton_content,
+                    wf.skeleton_tokens,
+                ) {
+                    (true, Some(skel), Some(tok)) => (FilePackMode::Skeleton, skel.clone(), tok),
+                    _ => (FilePackMode::Full, wf.full_content.clone(), wf.full_tokens),
+                };
+
+                prepared.push(PreparedFile {
+                    path: wf.path.clone(),
+                    ext: wf.ext.clone(),
+                    size: wf.size,
+                    mode,
+                    content,
+                    tokens,
+                    redactions: wf.redactions.clone(),
+                    is_modified: wf.is_modified,
+                });
+            }
+        }
+
+        let mut rendered = Vec::new();
+        let mut extra_redactions = RedactionSummary {
+            redaction_enabled: self.options.redact_secrets,
+            ..RedactionSummary::default()
+        };
+        match self.options.format {
+            OutputFormat::Xml => write_xml_prepared(
+                &mut rendered,
+                &kept_files,
+                &prepared,
+                &self.root,
+                &self.options,
+                &mut extra_redactions,
+            )?,
+            OutputFormat::Markdown => write_markdown_prepared(
+                &mut rendered,
+                &kept_files,
+                &prepared,
+                &self.root,
+                &self.options,
+                &mut extra_redactions,
+            )?,
+            OutputFormat::Json => write_json_prepared(
+                &mut rendered,
+                &kept_files,
+                &prepared,
+                &self.root,
+                &self.options,
+                &mut extra_redactions,
+            )?,
+            OutputFormat::Plain => write_plain_prepared(
+                &mut rendered,
+                &prepared,
+                &self.root,
+                &self.options,
+                &mut extra_redactions,
+            )?,
+        }
+
+        let mut stats = PackStats {
+            files_packed: prepared.len(),
+            total_tokens: 0,
+            content_tokens: 0,
+            overhead_tokens: 0,
+            tokenizer_exact: self.options.compute_bpe_tokens
+                && self.options.tokenizer_model.is_exact_bpe(),
+            file_tokens: Vec::with_capacity(prepared.len()),
+            redactions: extra_redactions,
+        };
+
+        for pf in prepared {
+            stats.content_tokens += pf.tokens;
+            stats.redactions.merge(&pf.redactions);
+            stats.file_tokens.push(FileTokenStat {
+                path: pf.path,
+                bytes: pf.content.len(),
+                tokens: pf.tokens,
+                mode: pf.mode,
+            });
+        }
+
+        if self.options.compute_bpe_tokens {
+            let rendered_str = std::str::from_utf8(&rendered)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            stats.total_tokens =
+                count_tokens_with_model(rendered_str, self.options.tokenizer_model);
+        } else {
+            let approx_total = ((rendered.len() as f64) / 3.8).round() as usize;
+            stats.total_tokens = approx_total.max(stats.content_tokens);
+        }
+        stats.overhead_tokens = stats.total_tokens.saturating_sub(stats.content_tokens);
+
+        if let Ok(mut guard) = self.last_render.lock() {
+            *guard = Some(CachedRender {
+                kept_paths,
+                skeleton_files: skeleton_files.clone(),
+                skeleton_all,
+                rendered: rendered.clone(),
+                stats: stats.clone(),
+            });
+        }
+
+        Ok((rendered, stats))
     }
 }
 
@@ -111,6 +461,7 @@ struct PreparedFile {
     content: String,
     tokens: usize,
     redactions: RedactionSummary,
+    is_modified: bool,
 }
 
 /// Main high-quality writer.
@@ -136,7 +487,7 @@ pub fn write_output_cancellable<W: Write>(
     let root = canonical_root.as_path();
     let files: Vec<&DirEntryMeta> = entries.iter().filter(|e| !e.is_dir).collect();
     let valid_parents = build_valid_parent_cache(root, &files);
-    let ordered = architectural_order(&files);
+    let ordered = architectural_order(&files, &options.modified_files);
 
     let mut dummy_redactions = RedactionSummary::default();
     match options.format {
@@ -150,7 +501,7 @@ pub fn write_output_cancellable<W: Write>(
             write_xml_footer(writer, options, &mut dummy_redactions)
         }
         OutputFormat::Markdown => {
-            write_markdown_header(writer, root, options)?;
+            write_markdown_header(writer, &files, root, options)?;
             for f in &ordered {
                 ensure_not_cancelled(cancelled)?;
                 let pf = prepare_single_file(f, root, &valid_parents, options);
@@ -164,7 +515,14 @@ pub fn write_output_cancellable<W: Write>(
                 ensure_not_cancelled(cancelled)?;
                 prepared.push(prepare_single_file(f, root, &valid_parents, options));
             }
-            write_json_prepared(writer, &prepared, root, options, &mut dummy_redactions)
+            write_json_prepared(
+                writer,
+                &files,
+                &prepared,
+                root,
+                options,
+                &mut dummy_redactions,
+            )
         }
         OutputFormat::Plain => {
             write_plain_header(writer, root, options)?;
@@ -190,83 +548,13 @@ where
     W: Write,
     F: Fn() -> bool + Sync,
 {
-    let canonical_root = std::fs::canonicalize(root)?;
-    let root = canonical_root.as_path();
-    let files: Vec<&DirEntryMeta> = entries.iter().filter(|e| !e.is_dir).collect();
-
-    let ordered = architectural_order(&files);
-    let prepared = prepare_files_parallel(&ordered, root, options, cancelled)?;
-
-    let mut rendered = Vec::new();
-    let mut extra_redactions = RedactionSummary {
-        redaction_enabled: options.redact_secrets,
-        ..RedactionSummary::default()
-    };
-    match options.format {
-        OutputFormat::Xml => write_xml_prepared(
-            &mut rendered,
-            &files,
-            &prepared,
-            root,
-            options,
-            &mut extra_redactions,
-        )?,
-        OutputFormat::Markdown => write_markdown_prepared(
-            &mut rendered,
-            &prepared,
-            root,
-            options,
-            &mut extra_redactions,
-        )?,
-        OutputFormat::Json => write_json_prepared(
-            &mut rendered,
-            &prepared,
-            root,
-            options,
-            &mut extra_redactions,
-        )?,
-        OutputFormat::Plain => write_plain_prepared(
-            &mut rendered,
-            &prepared,
-            root,
-            options,
-            &mut extra_redactions,
-        )?,
-    }
-    writer.write_all(&rendered)?;
-
-    let mut stats = PackStats {
-        files_packed: prepared.len(),
-        total_tokens: 0,
-        content_tokens: 0,
-        overhead_tokens: 0,
-        tokenizer_exact: options.compute_bpe_tokens && options.tokenizer_model.is_exact_bpe(),
-        file_tokens: Vec::with_capacity(prepared.len()),
-        redactions: extra_redactions,
-    };
-
-    for pf in prepared {
-        stats.content_tokens += pf.tokens;
-        stats.redactions.merge(&pf.redactions);
-        stats.file_tokens.push(FileTokenStat {
-            path: pf.path,
-            bytes: pf.content.len(),
-            tokens: pf.tokens,
-            mode: pf.mode,
-        });
-    }
-
-    if options.compute_bpe_tokens {
-        let rendered_str = std::str::from_utf8(&rendered)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        stats.total_tokens = count_tokens_with_model(rendered_str, options.tokenizer_model);
-    } else {
-        let approx_total = ((rendered.len() as f64) / 3.8).round() as usize;
-        stats.total_tokens = approx_total.max(stats.content_tokens);
-    }
-    stats.overhead_tokens = stats.total_tokens.saturating_sub(stats.content_tokens);
-
-    Ok(stats)
+    let workspace = PreparedWorkspace::prepare(entries, root, options, cancelled)?;
+    workspace.render_with_stats(
+        writer,
+        entries,
+        &options.skeleton_files,
+        options.skeleton_all,
+    )
 }
 
 /// Architectural emission tier for `<files>` content (lower is emitted first). Truncating a pack
@@ -301,7 +589,7 @@ pub fn architectural_tier(rel: &str) -> u8 {
         || name.contains("_test.")
         || name.starts_with("test_");
     if is_test_name
-        || ["tests", "e2e", "examples", "benches"]
+        || ["tests", "e2e", "examples", "benches", "benchmarks"]
             .iter()
             .any(|d| in_dir(&lower, d))
     {
@@ -315,20 +603,25 @@ pub fn architectural_tier(rel: &str) -> u8 {
         ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".cs", ".java", ".c", ".cpp", ".h",
         ".hpp",
     ];
-    let is_root_source = !lower.contains('/') && SOURCE_EXTS.iter().any(|e| lower.ends_with(e));
-    if is_root_source || SOURCE_DIRS.iter().any(|d| in_dir(&lower, d)) {
+    let is_source_ext = SOURCE_EXTS.iter().any(|e| lower.ends_with(e));
+    if is_source_ext || SOURCE_DIRS.iter().any(|d| in_dir(&lower, d)) {
         return 0;
     }
 
     3
 }
 
-/// `files` ordered for content emission: by [`architectural_tier`], then by path.
-fn architectural_order<'a>(files: &[&'a DirEntryMeta]) -> Vec<&'a DirEntryMeta> {
+/// `files` ordered for content emission: unmodified files first, modified files last,
+/// both sorted by [`architectural_tier`], then by path.
+pub fn architectural_order<'a>(
+    files: &[&'a DirEntryMeta],
+    modified_files: &HashSet<String>,
+) -> Vec<&'a DirEntryMeta> {
     let mut ordered: Vec<&DirEntryMeta> = files.to_vec();
     ordered.sort_by_cached_key(|f| {
         let rel = normalize_rel_path(&f.path);
-        (architectural_tier(&rel), rel)
+        let is_mod = modified_files.contains(&rel);
+        (is_mod, architectural_tier(&rel), rel)
     });
     ordered
 }
@@ -445,6 +738,8 @@ fn prepare_single_file(
         ((content.len() as f64) / 3.8).round() as usize
     };
 
+    let is_modified = options.modified_files.contains(&path_str);
+
     PreparedFile {
         path: path_str,
         ext,
@@ -453,46 +748,8 @@ fn prepare_single_file(
         content,
         tokens,
         redactions,
+        is_modified,
     }
-}
-
-fn prepare_files_parallel<F>(
-    files: &[&DirEntryMeta],
-    root: &Path,
-    options: &WriteOptions,
-    cancelled: &F,
-) -> std::io::Result<Vec<PreparedFile>>
-where
-    F: Fn() -> bool + Sync,
-{
-    let valid_parents = build_valid_parent_cache(root, files);
-
-    // For small file counts, process sequentially so deterministic per-file cancellation tests
-    // (like `superseded_pack_stops_before_reading_next_file`) behave identically.
-    if files.len() < 16 {
-        let mut out = Vec::with_capacity(files.len());
-        for f in files {
-            ensure_not_cancelled(cancelled)?;
-            out.push(prepare_single_file(f, root, &valid_parents, options));
-        }
-        return Ok(out);
-    }
-
-    // One parallel pass over all files. Chunked passes would join the pool after every chunk,
-    // so work-stealing could not balance uneven files. Each worker checks `cancelled` before
-    // reading; `collect` stops at the first error, which keeps cancellation prompt.
-    files
-        .par_iter()
-        .map(|f| {
-            if cancelled() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "output superseded by a newer request",
-                ));
-            }
-            Ok(prepare_single_file(f, root, &valid_parents, options))
-        })
-        .collect()
 }
 
 fn display_path(path: &Path) -> String {
@@ -574,12 +831,26 @@ fn write_xml_header<W: Write>(
         writeln!(w, "  <file_summary>")?;
         writeln!(w, "    Total files included: {}", files.len())?;
         // Oversized files are replaced by a note, so they are not counted as included bytes.
-        let total_size: u64 = files
-            .iter()
-            .filter_map(|f| f.size)
-            .filter(|&size| size <= options.max_file_size)
-            .sum();
-        writeln!(w, "    Total size: {total_size} bytes")?;
+        if options.modified_files.is_empty() {
+            let total_size: u64 = files
+                .iter()
+                .filter_map(|f| f.size)
+                .filter(|&size| size <= options.max_file_size)
+                .sum();
+            writeln!(w, "    Total size: {total_size} bytes")?;
+        } else {
+            let base_size: u64 = files
+                .iter()
+                .filter(|f| {
+                    !options
+                        .modified_files
+                        .contains(&normalize_rel_path(&f.path))
+                })
+                .filter_map(|f| f.size)
+                .filter(|&size| size <= options.max_file_size)
+                .sum();
+            writeln!(w, "    Unmodified base size: {base_size} bytes")?;
+        }
         writeln!(
             w,
             "    Note: File contents were read with size limits ({} bytes max), binary detection, and UTF-8 / BOM-declared UTF-16 decoding.",
@@ -599,9 +870,17 @@ fn write_xml_header<W: Write>(
 
 fn write_xml_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io::Result<()> {
     let path_attr = escape_xml_attr(&pf.path);
+    let status_attr = if pf.is_modified {
+        " status=\"modified\""
+    } else {
+        ""
+    };
     match pf.mode {
-        FilePackMode::Full => writeln!(w, "    <file path=\"{path_attr}\">")?,
-        FilePackMode::Skeleton => writeln!(w, "    <file path=\"{path_attr}\" mode=\"skeleton\">")?,
+        FilePackMode::Full => writeln!(w, "    <file path=\"{path_attr}\"{status_attr}>")?,
+        FilePackMode::Skeleton => writeln!(
+            w,
+            "    <file path=\"{path_attr}\" mode=\"skeleton\"{status_attr}>"
+        )?,
     }
     write_cdata(w, &pf.content)?;
     writeln!(w, "    </file>")
@@ -660,6 +939,7 @@ fn write_xml_prepared<W: Write>(
 
 fn write_markdown_header<W: Write>(
     w: &mut W,
+    files: &[&DirEntryMeta],
     root: &Path,
     options: &WriteOptions,
 ) -> std::io::Result<()> {
@@ -669,14 +949,23 @@ fn write_markdown_header<W: Write>(
         w,
         "Reading info: Files processed with size/binary limits (max {} bytes) and encoding handling.\n",
         options.max_file_size
-    )
+    )?;
+    if options.include_file_summary {
+        writeln!(w, "## Directory Structure")?;
+        for file in files {
+            writeln!(w, "- `{}`", display_path(&file.path))?;
+        }
+        writeln!(w)?;
+    }
+    Ok(())
 }
 
 fn write_markdown_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io::Result<()> {
     let fence = markdown_fence(&pf.content);
+    let mod_suffix = if pf.is_modified { " *(modified)*" } else { "" };
     match pf.mode {
-        FilePackMode::Full => writeln!(w, "## `{}`", pf.path)?,
-        FilePackMode::Skeleton => writeln!(w, "## `{}` *(skeleton)*", pf.path)?,
+        FilePackMode::Full => writeln!(w, "## `{}`{mod_suffix}", pf.path)?,
+        FilePackMode::Skeleton => writeln!(w, "## `{}` *(skeleton)*{mod_suffix}", pf.path)?,
     }
     writeln!(w, "{fence}{}", pf.ext)?;
     writeln!(w, "{}", pf.content)?;
@@ -720,12 +1009,13 @@ fn write_markdown_footer<W: Write>(
 
 fn write_markdown_prepared<W: Write>(
     w: &mut W,
+    files: &[&DirEntryMeta],
     prepared: &[PreparedFile],
     root: &Path,
     options: &WriteOptions,
     extra_redactions: &mut RedactionSummary,
 ) -> std::io::Result<()> {
-    write_markdown_header(w, root, options)?;
+    write_markdown_header(w, files, root, options)?;
     for pf in prepared {
         write_markdown_file_entry(w, pf)?;
     }
@@ -734,6 +1024,7 @@ fn write_markdown_prepared<W: Write>(
 
 fn write_json_prepared<W: Write>(
     w: &mut W,
+    files: &[&DirEntryMeta],
     prepared: &[PreparedFile],
     root: &Path,
     options: &WriteOptions,
@@ -749,6 +1040,9 @@ fn write_json_prepared<W: Write>(
         if pf.mode == FilePackMode::Skeleton {
             obj["mode"] = json!("skeleton");
         }
+        if pf.is_modified {
+            obj["status"] = json!("modified");
+        }
         file_objs.push(obj);
     }
 
@@ -762,6 +1056,12 @@ fn write_json_prepared<W: Write>(
         "file_count": prepared.len(),
         "files": file_objs,
     });
+    if options.include_file_summary {
+        doc["directory_structure"] = json!(files
+            .iter()
+            .map(|file| display_path(&file.path))
+            .collect::<Vec<_>>());
+    }
 
     if let Some(diff) = options
         .git_diff
@@ -804,9 +1104,10 @@ fn write_plain_header<W: Write>(
 }
 
 fn write_plain_file_entry<W: Write>(w: &mut W, pf: &PreparedFile) -> std::io::Result<()> {
+    let mod_suffix = if pf.is_modified { " [modified]" } else { "" };
     match pf.mode {
-        FilePackMode::Full => writeln!(w, ">>> {}", pf.path)?,
-        FilePackMode::Skeleton => writeln!(w, ">>> {} [skeleton]", pf.path)?,
+        FilePackMode::Full => writeln!(w, ">>> {}{mod_suffix}", pf.path)?,
+        FilePackMode::Skeleton => writeln!(w, ">>> {} [skeleton]{mod_suffix}", pf.path)?,
     }
     writeln!(w, "{}", pf.content)?;
     writeln!(w, "--------------------------------\n")
@@ -932,7 +1233,14 @@ fn read_and_redact_file(
         ),
         Ok(bytes) => match decode_text(&bytes, false) {
             Ok(text) => {
-                if redact {
+                if is_generated_project_context(&text) {
+                    (
+                        "[Generated ptt context artifact skipped to prevent recursive packing]"
+                            .into(),
+                        skipped_summary(),
+                        false,
+                    )
+                } else if redact {
                     let (redacted, mut summary) = redact_secrets_with_report(&text);
                     summary.redaction_enabled = true;
                     summary.files_scanned = 1;
@@ -967,6 +1275,25 @@ fn read_and_redact_file(
             false,
         ),
     }
+}
+
+/// Matches only PTT's own serialized context envelope, not arbitrary project files that mention
+/// the marker elsewhere. The check runs after decoding and before redaction/skeleton extraction.
+fn is_generated_project_context(text: &str) -> bool {
+    let mut cut = text.len().min(512);
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = &text[..cut];
+    let trimmed = head.trim_start();
+    (trimmed.starts_with("<project_context>")
+        && head.contains("This file was generated by ptt (ProjectToText)"))
+        || (trimmed.starts_with('{') && head.contains("\"generator\": \"ptt (ProjectToText)\""))
+        || (trimmed.starts_with("# Project Context\nGenerated from: `")
+            && head.contains("Reading info: Files processed with size/binary limits (max "))
+        || (trimmed.starts_with("Project: ")
+            && head.contains("\nReading info: Data read with limits (")
+            && head.contains("================================\n"))
 }
 
 #[cfg(test)]
@@ -1009,7 +1336,8 @@ mod tests {
     #[test]
     fn json_is_valid_and_roundtrips() {
         let (_dir, root) = tmp_project();
-        let entries = entries_for(&root);
+        let mut entries = entries_for(&root);
+        entries.reverse();
         let mut buf = Vec::new();
         let opts = WriteOptions {
             format: OutputFormat::Json,
@@ -1021,6 +1349,7 @@ mod tests {
         let v: Value = serde_json::from_slice(&buf).expect("valid JSON");
         assert_eq!(v["file_count"], 2);
         assert!(v["files"].as_array().unwrap().len() == 2);
+        assert_eq!(v["directory_structure"], json!(["notes.md", "hello.rs"]));
         let content = v["files"][0]["content"].as_str().unwrap();
         assert!(content.contains("fn main") || content.contains("hello"));
     }
@@ -1144,11 +1473,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("doc.md"), "```\ncode\n```\n").unwrap();
-        let entries = vec![DirEntryMeta {
-            path: PathBuf::from("doc.md"),
-            is_dir: false,
-            size: Some(12),
-        }];
+        fs::write(root.join("alpha.md"), "alpha\n").unwrap();
+        let entries = vec![
+            DirEntryMeta {
+                path: PathBuf::from("doc.md"),
+                is_dir: false,
+                size: Some(12),
+            },
+            DirEntryMeta {
+                path: PathBuf::from("alpha.md"),
+                is_dir: false,
+                size: Some(6),
+            },
+        ];
         let mut buf = Vec::new();
         let opts = WriteOptions {
             format: OutputFormat::Markdown,
@@ -1156,7 +1493,33 @@ mod tests {
         };
         write_output(&mut buf, &entries, root, &opts).unwrap();
         let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("## Directory Structure\n- `doc.md`\n- `alpha.md`"));
+        assert!(s.find("## Directory Structure").unwrap() < s.find("## `alpha.md`").unwrap());
         assert!(s.contains("````md"));
+    }
+
+    #[test]
+    fn markdown_and_json_omit_directory_structure_when_summary_is_disabled() {
+        let (_dir, root) = tmp_project();
+        let entries = entries_for(&root);
+        for format in [OutputFormat::Markdown, OutputFormat::Json] {
+            let mut buf = Vec::new();
+            let options = WriteOptions {
+                format,
+                include_file_summary: false,
+                ..Default::default()
+            };
+            write_output(&mut buf, &entries, &root, &options).unwrap();
+            let text = String::from_utf8(buf).unwrap();
+            match format {
+                OutputFormat::Markdown => assert!(!text.contains("## Directory Structure")),
+                OutputFormat::Json => {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    assert!(value.get("directory_structure").is_none());
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1210,5 +1573,237 @@ mod tests {
     #[test]
     fn escape_xml_attr_basics() {
         assert_eq!(escape_xml_attr(r#"a&b"c"#), "a&amp;b&quot;c");
+    }
+
+    #[test]
+    fn modified_files_emitted_last_for_kv_cache_stability() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn b() {}").unwrap();
+        std::fs::write(root.join("src/c.rs"), "fn c() {}").unwrap();
+
+        let entries = crate::core::walker::walk(&root).unwrap();
+        let mut modified = std::collections::HashSet::new();
+        modified.insert("src/a.rs".to_string());
+
+        let opts = WriteOptions {
+            format: OutputFormat::Xml,
+            modified_files: modified,
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        write_output(&mut buf, &entries, &root, &opts).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        let pos_a = out
+            .find(r#"<file path="src/a.rs" status="modified">"#)
+            .unwrap();
+        let pos_b = out.find(r#"<file path="src/b.rs">"#).unwrap();
+        let pos_c = out.find(r#"<file path="src/c.rs">"#).unwrap();
+
+        assert!(pos_b < pos_c, "unmodified files keep alphabetical order");
+        assert!(pos_c < pos_a, "modified file src/a.rs must be emitted last");
+    }
+
+    #[test]
+    fn kv_cache_prefix_stays_byte_identical_when_modified_file_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn stable_logic() -> &'static str { \"stable\" }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/active.rs"), "fn tiny() {}\n").unwrap();
+
+        let mut modified = std::collections::HashSet::new();
+        modified.insert("src/active.rs".to_string());
+
+        let opts = WriteOptions {
+            format: OutputFormat::Xml,
+            include_file_summary: true,
+            modified_files: modified.clone(),
+            ..Default::default()
+        };
+
+        // Render 1: active.rs is 13 bytes
+        let entries1 = crate::core::walker::walk(&root).unwrap();
+        let mut buf1 = Vec::new();
+        write_output(&mut buf1, &entries1, &root, &opts).unwrap();
+        let out1 = String::from_utf8(buf1).unwrap();
+
+        // Now modify active.rs so it grows to ~500 bytes
+        let large_content = (0..30)
+            .map(|i| format!("pub fn dynamic_{i}() -> usize {{ {i} }}\n"))
+            .collect::<String>();
+        std::fs::write(root.join("src/active.rs"), &large_content).unwrap();
+
+        // Render 2: active.rs is ~500 bytes
+        let entries2 = crate::core::walker::walk(&root).unwrap();
+        let mut buf2 = Vec::new();
+        write_output(&mut buf2, &entries2, &root, &opts).unwrap();
+        let out2 = String::from_utf8(buf2).unwrap();
+
+        let marker = r#"<file path="src/active.rs" status="modified">"#;
+        let pos1 = out1.find(marker).expect("marker must exist in out1");
+        let pos2 = out2.find(marker).expect("marker must exist in out2");
+
+        assert_eq!(pos1, pos2, "prefix split point must match");
+        assert_eq!(
+            &out1[..pos1],
+            &out2[..pos2],
+            "entire XML prefix before modified file must be 100% byte-for-byte identical"
+        );
+        assert!(out1[..pos1].contains("<file_summary>"));
+        assert!(out1[..pos1].contains("Unmodified base size:"));
+        assert!(out1[..pos1].contains(r#"<file path="src/lib.rs">"#));
+    }
+
+    #[test]
+    fn generated_project_context_is_always_skipped_even_when_in_skeleton_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let generated = "<project_context>\n  <source> This file was generated by ptt (ProjectToText) from earlier</source>\n  <files>old context</files>\n</project_context>\n";
+        fs::write(root.join("previous.xml"), generated).unwrap();
+        fs::write(
+            root.join("ordinary.xml"),
+            "<other>mention <project_context> in prose</other>",
+        )
+        .unwrap();
+        let entries = vec!["previous.xml", "ordinary.xml"]
+            .into_iter()
+            .map(|path| DirEntryMeta {
+                path: PathBuf::from(path),
+                is_dir: false,
+                size: fs::metadata(root.join(path)).unwrap().len().into(),
+            })
+            .collect::<Vec<_>>();
+
+        for format in [
+            OutputFormat::Xml,
+            OutputFormat::Markdown,
+            OutputFormat::Json,
+            OutputFormat::Plain,
+        ] {
+            let mut skipped = Vec::new();
+            write_output(
+                &mut skipped,
+                &entries,
+                &root,
+                &WriteOptions {
+                    format,
+                    redact_secrets: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let skipped = String::from_utf8(skipped).unwrap();
+            assert!(!skipped.contains("old context"), "{format:?}: {skipped}");
+            assert!(
+                skipped.contains("Generated ptt context artifact skipped"),
+                "{format:?}: {skipped}"
+            );
+        }
+
+        let mut ordinary = Vec::new();
+        write_output(
+            &mut ordinary,
+            &entries[1..],
+            &root,
+            &WriteOptions {
+                redact_secrets: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ordinary = String::from_utf8(ordinary).unwrap();
+        assert!(
+            ordinary.contains("mention <project_context> in prose"),
+            "{ordinary}"
+        );
+        assert!(!is_generated_project_context(
+            "<project_context> mention in prose without generator marker</project_context>"
+        ));
+        assert!(is_generated_project_context(
+            "\n<project_context> This file was generated by ptt (ProjectToText)"
+        ));
+        assert!(is_generated_project_context(
+            "<project_context>\n  <source> This file was generated by ptt (ProjectToText)</source>"
+        ));
+        assert!(is_generated_project_context(
+            "   {\n  \"generator\": \"ptt (ProjectToText)\"\n}"
+        ));
+        assert!(is_generated_project_context(
+            "# Project Context\nGenerated from: `my_project`\nReading info: Files processed with size/binary limits (max 2097152 bytes) and encoding handling.\n\n## Directory Structure\n"
+        ));
+        assert!(is_generated_project_context(
+            "Project: my_project\nReading info: Data read with limits (2097152 bytes), binary skip, UTF-8 / BOM-declared UTF-16.\n================================\n\n>>> src/lib.rs\n"
+        ));
+
+        let mut explicitly_selected = std::collections::HashSet::new();
+        explicitly_selected.insert("previous.xml".to_string());
+        let mut skipped_even_in_skeleton = Vec::new();
+        write_output_with_stats(
+            &mut skipped_even_in_skeleton,
+            &entries,
+            &root,
+            &WriteOptions {
+                redact_secrets: false,
+                skeleton_files: explicitly_selected,
+                ..Default::default()
+            },
+            &|| false,
+        )
+        .unwrap();
+        let skipped_even_in_skeleton = String::from_utf8(skipped_even_in_skeleton).unwrap();
+        assert!(
+            !skipped_even_in_skeleton.contains("old context"),
+            "{skipped_even_in_skeleton}"
+        );
+        assert!(
+            skipped_even_in_skeleton.contains("Generated ptt context artifact skipped"),
+            "{skipped_even_in_skeleton}"
+        );
+    }
+
+    #[test]
+    fn benchmark_artifacts_are_architectural_tier_two() {
+        assert_eq!(architectural_tier("benchmarks/context-v1/prior.xml"), 2);
+    }
+
+    #[test]
+    fn prepared_workspace_reuses_cached_render_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn cached() -> u32 { 1 }\n").unwrap();
+
+        let entries = crate::core::walker::walk(&root).unwrap();
+        let opts = WriteOptions {
+            format: OutputFormat::Xml,
+            compute_bpe_tokens: true,
+            ..Default::default()
+        };
+
+        let ws = PreparedWorkspace::prepare_for_budget(&entries, &root, &opts, &|| false).unwrap();
+        let skeleton_files = HashSet::new();
+
+        // Call render_stats first (e.g. inside budget loop)
+        let stats1 = ws.render_stats(&entries, &skeleton_files, false).unwrap();
+
+        // Now render_with_stats directly afterwards
+        let mut buf = Vec::new();
+        let stats2 = ws
+            .render_with_stats(&mut buf, &entries, &skeleton_files, false)
+            .unwrap();
+
+        assert_eq!(stats1.total_tokens, stats2.total_tokens);
+        assert!(!buf.is_empty());
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("pub fn cached"));
     }
 }

@@ -41,7 +41,7 @@ ProjectToText (`ptt`) is a **Tauri v2** desktop application, a headless CLI, and
 | `core::walker` | Git-first discovery, `ignore` fallback, `.pttignore`, junk directories, default exclusions for lockfiles and `gen/schemas/`. `SelectionMatcher` checks each candidate's ancestors against a normalized set. |
 | `core::workspace` | A revisioned `Arc<WorkspaceSnapshot>`. Ignore-rule freshness uses cached `(mtime, len)` metadata. Also holds the dependency graph. |
 | `core::output` | Writers for the four formats. Reads, decodes, skeletonizes, redacts, and counts tokens per file in parallel. `architectural_tier` orders `<files>` content; `<directory_structure>` stays alphabetical. |
-| `core::secrets` | Regex rules for provider tokens, PEM blocks, URL passwords, `Password=` pairs, and `.env` secrets. Placeholders are skipped. `redact_secrets_with_report` returns per-kind counts. |
+| `core::secrets` | 21 regex & Shannon-entropy rules for provider tokens (AWS, Anthropic, OpenAI, Google, Stripe, GitHub, GitLab, Slack, Hugging Face, npm, Azure, SendGrid, Discord), JWTs, PEM blocks, URL passwords, `Password=` pairs, `.env` secrets, and high-entropy assignments. Placeholders are skipped. `redact_secrets_with_report` returns per-kind counts. |
 | `core::tokenizer` | `tiktoken-rs` encodings (`o200k_base`, `cl100k_base`). Claude and Gemini profiles scale the `o200k_base` count by fixed factors. |
 | `core::skeleton` | tree-sitter grammars for Rust, TypeScript/TSX, JavaScript, Python, Go, C#, Java, C, and C++; brace/indentation fallback for other text. |
 | `core::deps` | One-hop import, importer, and test relationships used by the desktop context menu. |
@@ -53,7 +53,7 @@ ProjectToText (`ptt`) is a **Tauri v2** desktop application, a headless CLI, and
 | `mcp` | JSON-RPC 2.0 envelope only: protocol negotiation, the stdio loop, `tools/call` routing, cancellations, and the output cap. |
 | `mcp::tools` | Tool schemas and argument validation (`tool_definitions`, `validate_tool_arguments`), the project-root sandbox (`resolve_root`), and dispatch for the five tools: `ptt_get_project_map`, `ptt_pack_files`, `ptt_get_git_context`, `ptt_get_related_files`, `ptt_search_symbols`. |
 | `mcp::tests`, `mcp::fuzz_tests` | Protocol and tool unit tests. Seeded fuzzing and hostile-directory tests live apart in `fuzz_tests`. |
-| `mcp::workers` | Runs each `tools/call` on a worker thread with a 30 s limit. At most four workers run at once, and timed-out workers keep their slot until they finish. |
+| `mcp::workers` | Runs each `tools/call`, `resources/read`, and `prompts/get` on a worker thread with a 30 s limit and cooperative cancellation (`AtomicBool`). At most 16 workers run at once, and timed-out workers keep their slot until they finish. |
 
 ## Data flow (desktop pack)
 
@@ -82,7 +82,7 @@ On the Rust side, `WorkspaceIndex::refresh_paths` updates the current snapshot i
 
 ## Browser mode
 
-`ui/src/browserFs.ts` reimplements scan and pack in TypeScript. It emits `<files>` in the same architectural tier order, keeps `<directory_structure>` alphabetical, and caps the pack at 400 files **after** tier ordering so the cap drops docs before source. Secret rules live in `ui/src/secrets.ts`, which mirrors `src/core/secrets.rs`. Browser mode does not run Git and does not implement `.gitignore` or `.pttignore`.
+`ui/src/browserFs.ts` reimplements scan and pack in TypeScript. It evaluates in-folder `.gitignore` and `.pttignore` rules top-down (with parent-directory pruning and fail-closed `.pttignore` syntax validation), emits `<files>` in the same architectural tier order, keeps `<directory_structure>` alphabetical, and caps the pack at 400 files **after** tier ordering so the cap drops docs before source. Secret rules live in `ui/src/secrets.ts`, which mirrors all 21 rules in `src/core/secrets.rs`. Browser mode does not spawn `git` (no tracked-file index, global gitignore, or `git diff`).
 
 ## Security notes
 

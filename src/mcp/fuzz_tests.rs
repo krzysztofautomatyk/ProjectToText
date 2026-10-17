@@ -26,8 +26,8 @@ fn mcp_fuzzed_messages_never_panic_and_always_get_a_well_formed_reply() {
     let seeds = [
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ptt_search_symbols","arguments":{"query":"f"}}}"#,
-        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}"#,
+        r#"{"jsonrpc":"2.0","id":9003,"method":"tools/call","params":{"name":"ptt_search_symbols","arguments":{"query":"f"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9003}}"#,
     ];
 
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);

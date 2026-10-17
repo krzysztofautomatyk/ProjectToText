@@ -48,10 +48,12 @@ test.beforeEach(async ({ page }) => {
             totalBytes: fullOutput.length,
             totalChars: fullOutput.length,
             totalTokens: 48_000,
+            contentTokens: 47_500,
+            overheadTokens: 500,
             filesPacked: Array.isArray(args?.selectedPaths) ? args.selectedPaths.length : 2,
             fileTokens: [
               { path: 'src/main.rs', bytes: 200, tokens: 45_000, mode: 'full' },
-              { path: 'src/lib.rs', bytes: 20, tokens: 3_000, mode: 'full' },
+              { path: 'src/lib.rs', bytes: 20, tokens: 2_500, mode: 'full' },
             ],
             redactions: redactOn
               ? { totalRedactions: 2, kinds: [['OPENAI_API_KEY', 2]] }
@@ -134,8 +136,12 @@ test('tree shows estimated token totals and a token sort toggle', async ({ page 
 test('shows redaction badge, context budget bar, git badges, and prompt studio', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByTestId('redaction-badge')).toContainText('2 secrets masked');
+  await expect(page.getByTestId('ready-token-badge')).toContainText('48k tokens (exact BPE)');
   await expect(page.getByTestId('context-budget-bar')).toBeVisible();
   await expect(page.getByTestId('budget-progress-label')).toContainText('48k / 128k tokens');
+  await expect(page.getByTestId('budget-breakdown-chips')).toBeVisible();
+  await expect(page.getByTestId('budget-chip-content')).toContainText('Content: 48k');
+  await expect(page.getByTestId('budget-chip-overhead')).toContainText('Overhead: 500');
   await expect(page.getByTestId('git-badge-src/main.rs')).toHaveText('M');
 
   await page.getByTestId('btn-top-consumers').click();

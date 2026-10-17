@@ -50,6 +50,14 @@ export interface FileTokenStat {
   mode: 'full' | 'skeleton';
 }
 
+export interface PackTokenStats {
+  files: number;
+  tokens: number;
+  contentTokens?: number;
+  overheadTokens?: number;
+  tokenizerExact?: boolean;
+}
+
 export interface GenerateOutputResponse {
   preview: string;
   truncatedPreview: boolean;
@@ -303,7 +311,7 @@ export function isLowPriorityPath(path: string): boolean {
   );
 }
 
-/** Lockfiles and generated manifests: visible in the tree, unchecked by every preset. */
+/** Lockfiles and generated paths: visible in the tree, unchecked by every preset. */
 export const DEFAULT_EXCLUDED_FILE_NAMES = new Set([
   'package-lock.json',
   'pnpm-lock.yaml',
@@ -314,7 +322,7 @@ export const DEFAULT_EXCLUDED_FILE_NAMES = new Set([
   'poetry.lock',
   'uv.lock',
 ]);
-export const DEFAULT_EXCLUDED_DIR_PREFIXES = ['gen/schemas/'];
+export const DEFAULT_EXCLUDED_DIR_PREFIXES = ['gen/schemas/', 'benchmarks/'];
 
 export function isDefaultExcludedPath(path: string): boolean {
   const normalized = normalizePath(path);

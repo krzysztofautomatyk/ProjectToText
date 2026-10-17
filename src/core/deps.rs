@@ -71,6 +71,7 @@ impl DependencyGraph {
             .collect();
 
         let same_file_set = previous.is_some_and(|p| p.cached_files == file_set);
+        let index = FileLookupIndex::new(&file_set);
 
         // Reading and parsing each file is independent, so it runs on the rayon pool. The
         // results are merged afterwards, which keeps the graph deterministic (BTreeSet values).
@@ -108,7 +109,7 @@ impl DependencyGraph {
                         let resolved = if same_file_set {
                             entry.resolved.clone()
                         } else {
-                            resolve_file_imports(rel, &ext, &entry.content, &file_set)
+                            resolve_file_imports(rel, &ext, &entry.content, &index)
                         };
                         CachedFileEntry {
                             mtime: stamp.0,
@@ -120,7 +121,7 @@ impl DependencyGraph {
                     None => {
                         let content: Arc<str> =
                             read_verified_file_string(&full, 512 * 1024).ok()?.into();
-                        let resolved = resolve_file_imports(rel, &ext, &content, &file_set);
+                        let resolved = resolve_file_imports(rel, &ext, &content, &index);
                         CachedFileEntry {
                             mtime: stamp.0,
                             len: stamp.1,
@@ -225,6 +226,36 @@ fn py_import_re() -> &'static Regex {
     })
 }
 
+fn go_single_import_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?m)^\s*import\s+(?:[a-zA-Z0-9_.]+\s+)?"([^"]+)""#)
+            .expect("valid go single import regex")
+    })
+}
+
+fn go_grouped_import_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?ms)^\s*import\s*\(([^)]*)\)"#).expect("valid go grouped import regex")
+    })
+}
+
+fn go_spec_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?:[a-zA-Z0-9_.]+\s+)?"([^"]+)""#).expect("valid go spec regex")
+    })
+}
+
+fn cs_using_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?m)^\s*using\s+(?:static\s+)?(?:[a-zA-Z0-9_]+\s*=\s*)?([a-zA-Z0-9_.]+)\s*;"#)
+            .expect("valid cs using regex")
+    })
+}
+
 /// The first identifier of each top-level item in a brace group.
 /// `deps::Foo, git::{Bar, Baz}, self` -> `["deps", "git"]` (`self` refers to the prefix itself).
 fn group_items(body: &str) -> Vec<String> {
@@ -303,11 +334,83 @@ fn probe_ts_module(joined: &str, all_files: &HashSet<String>) -> Option<String> 
         .find(|candidate| all_files.contains(candidate))
 }
 
+struct FileLookupIndex<'a> {
+    all_files: &'a HashSet<String>,
+    /// dir_path (bez końcowego '/') -> posortowana lista plików .go bezpośrednio w tym katalogu
+    go_files_by_dir: HashMap<String, Vec<String>>,
+    /// suffix katalogu (do 4 segmentów) -> lista plików .go lub .cs
+    go_by_suffix: HashMap<String, Vec<String>>,
+    cs_by_suffix: HashMap<String, Vec<String>>,
+    /// nazwa pliku "ClassName.cs" -> lista pełnych ścieżek względnych
+    cs_by_filename: HashMap<String, Vec<String>>,
+}
+
+impl<'a> FileLookupIndex<'a> {
+    fn new(all_files: &'a HashSet<String>) -> Self {
+        let mut go_files_by_dir: HashMap<String, Vec<String>> = HashMap::new();
+        let mut go_by_suffix: HashMap<String, Vec<String>> = HashMap::new();
+        let mut cs_by_suffix: HashMap<String, Vec<String>> = HashMap::new();
+        let mut cs_by_filename: HashMap<String, Vec<String>> = HashMap::new();
+
+        for f in all_files {
+            let (dir, file_name) = match f.rfind('/') {
+                Some(idx) => (&f[..idx], &f[idx + 1..]),
+                None => ("", f.as_str()),
+            };
+
+            if f.ends_with(".go") {
+                go_files_by_dir
+                    .entry(dir.to_string())
+                    .or_default()
+                    .push(f.clone());
+
+                let segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+                for len in 1..=segments.len().min(4) {
+                    let suffix = segments[segments.len() - len..].join("/");
+                    go_by_suffix.entry(suffix).or_default().push(f.clone());
+                }
+            } else if f.ends_with(".cs") {
+                let segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+                for len in 1..=segments.len().min(4) {
+                    let suffix = segments[segments.len() - len..].join("/");
+                    cs_by_suffix.entry(suffix).or_default().push(f.clone());
+                }
+
+                cs_by_filename
+                    .entry(file_name.to_string())
+                    .or_default()
+                    .push(f.clone());
+            }
+        }
+
+        for list in go_files_by_dir.values_mut() {
+            list.sort();
+        }
+        for list in go_by_suffix.values_mut() {
+            list.sort();
+        }
+        for list in cs_by_suffix.values_mut() {
+            list.sort();
+        }
+        for list in cs_by_filename.values_mut() {
+            list.sort();
+        }
+
+        Self {
+            all_files,
+            go_files_by_dir,
+            go_by_suffix,
+            cs_by_suffix,
+            cs_by_filename,
+        }
+    }
+}
+
 fn resolve_file_imports(
     source_path: &str,
     ext: &str,
     content: &str,
-    all_files: &HashSet<String>,
+    index: &FileLookupIndex<'_>,
 ) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let parent_dir = Path::new(source_path)
@@ -340,7 +443,7 @@ fn resolve_file_imports(
                     continue;
                 };
                 for joined in joins {
-                    if let Some(hit) = probe_ts_module(&joined, all_files) {
+                    if let Some(hit) = probe_ts_module(&joined, index.all_files) {
                         found.insert(hit);
                         break;
                     }
@@ -363,7 +466,7 @@ fn resolve_file_imports(
                         use_path.split("::").filter(|s| !s.is_empty()).collect();
                     for len in (1..=segments.len().min(3)).rev() {
                         let rel_mod = segments[..len].join("/");
-                        if let Some(hit) = find_rust_module(&rel_mod, crate_dir, all_files) {
+                        if let Some(hit) = find_rust_module(&rel_mod, crate_dir, index.all_files) {
                             found.insert(hit);
                         }
                     }
@@ -386,7 +489,7 @@ fn resolve_file_imports(
                             format!("{dir}/{mod_name}")
                         };
                         for candidate in [format!("{prefix}.rs"), format!("{prefix}/mod.rs")] {
-                            if all_files.contains(&candidate) {
+                            if index.all_files.contains(&candidate) {
                                 found.insert(candidate);
                             }
                         }
@@ -413,7 +516,7 @@ fn resolve_file_imports(
                     modules.push(prefix_path.clone());
                 }
                 for module in modules {
-                    if let Some(hit) = find_rust_module(&module, crate_dir, all_files) {
+                    if let Some(hit) = find_rust_module(&module, crate_dir, index.all_files) {
                         found.insert(hit);
                     }
                 }
@@ -436,9 +539,90 @@ fn resolve_file_imports(
                         format!("{base}/{rel_mod}")
                     };
                     for candidate in [format!("{prefix}.py"), format!("{prefix}/__init__.py")] {
-                        if all_files.contains(&candidate) {
+                        if index.all_files.contains(&candidate) {
                             found.insert(candidate);
                         }
+                    }
+                }
+            }
+        }
+        "go" => {
+            let mut specs = Vec::new();
+            for caps in go_single_import_re().captures_iter(content) {
+                if let Some(spec) = caps.get(1).map(|m| m.as_str()) {
+                    specs.push(spec);
+                }
+            }
+            for group in go_grouped_import_re().captures_iter(content) {
+                if let Some(body) = group.get(1).map(|m| m.as_str()) {
+                    for caps in go_spec_re().captures_iter(body) {
+                        if let Some(spec) = caps.get(1).map(|m| m.as_str()) {
+                            specs.push(spec);
+                        }
+                    }
+                }
+            }
+
+            for spec in specs {
+                let spec = spec.trim();
+                if spec.is_empty() {
+                    continue;
+                }
+                if spec.starts_with('.') {
+                    let target_dir = join_relative(&parent_dir, spec);
+                    if let Some(files) = index.go_files_by_dir.get(&target_dir) {
+                        for f in files {
+                            found.insert(f.clone());
+                        }
+                    }
+                } else {
+                    let segments: Vec<&str> = spec.split('/').filter(|s| !s.is_empty()).collect();
+                    for len in (1..=segments.len().min(4)).rev() {
+                        let sub_dir = segments[segments.len() - len..].join("/");
+                        if let Some(files) = index.go_by_suffix.get(&sub_dir) {
+                            for f in files {
+                                found.insert(f.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        "cs" => {
+            for caps in cs_using_re().captures_iter(content) {
+                let Some(spec) = caps.get(1).map(|m| m.as_str()) else {
+                    continue;
+                };
+                let spec = spec.trim();
+                if spec.is_empty()
+                    || spec == "System"
+                    || spec.starts_with("System.")
+                    || spec == "Microsoft"
+                    || spec.starts_with("Microsoft.")
+                {
+                    continue;
+                }
+
+                let segments: Vec<&str> = spec.split('.').filter(|s| !s.is_empty()).collect();
+                if segments.is_empty() {
+                    continue;
+                }
+
+                for len in (1..=segments.len().min(4)).rev() {
+                    let sub_dir = segments[segments.len() - len..].join("/");
+                    if let Some(files) = index.cs_by_suffix.get(&sub_dir) {
+                        for f in files {
+                            found.insert(f.clone());
+                        }
+                        break;
+                    }
+                }
+
+                let class_file = format!("{}.cs", segments[segments.len() - 1]);
+                if let Some(files) = index.cs_by_filename.get(&class_file) {
+                    for f in files {
+                        found.insert(f.clone());
                     }
                 }
             }
@@ -505,9 +689,15 @@ fn match_test_files(
     all_files: &HashSet<String>,
     importers: &HashMap<String, BTreeSet<String>>,
 ) -> HashMap<String, BTreeSet<String>> {
-    let test_files: Vec<&String> = all_files.iter().filter(|p| is_test_path(p)).collect();
-    let mut map: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut tests_by_stem: HashMap<String, Vec<&String>> = HashMap::new();
+    for path in all_files.iter().filter(|path| is_test_path(path)) {
+        let stem = file_stem_normalized(path);
+        if !stem.is_empty() && !matches!(stem.as_str(), "mod" | "index" | "main" | "lib") {
+            tests_by_stem.entry(stem).or_default().push(path);
+        }
+    }
 
+    let mut map: HashMap<String, BTreeSet<String>> = HashMap::new();
     for file in all_files {
         let mut matched = BTreeSet::new();
         // 1. Any test file that directly imports `file`
@@ -520,10 +710,10 @@ fn match_test_files(
         }
         // 2. Any test file sharing the normalized stem (e.g., `secrets.rs` <-> `secrets.spec.ts` / `secrets_test.rs`)
         let stem = file_stem_normalized(file);
-        if !stem.is_empty() && stem != "mod" && stem != "index" && stem != "main" && stem != "lib" {
-            for &tf in &test_files {
-                if tf != file && file_stem_normalized(tf) == stem {
-                    matched.insert(tf.clone());
+        if let Some(candidates) = tests_by_stem.get(&stem) {
+            for &test_file in candidates {
+                if test_file != file {
+                    matched.insert(test_file.clone());
                 }
             }
         }
@@ -598,6 +788,75 @@ mod tests {
         let util_rel = graph.related_for("src/util.rs");
         assert!(util_rel.importers.contains(&"src/main.rs".to_string()));
         assert!(util_rel.tests.contains(&"tests/util_test.rs".to_string()));
+    }
+
+    #[test]
+    fn match_test_files_indexes_stems_and_preserves_direct_import_matches() {
+        let all_files: HashSet<String> = [
+            "src/auth.rs",
+            "src/service.rs",
+            "src/auth_test.rs",
+            "tests/auth.spec.ts",
+            "tests/service_flow_test.rs",
+            "src/mod.rs",
+            "tests/mod_test.rs",
+            "src/index.rs",
+            "tests/index_test.rs",
+            "src/main.rs",
+            "tests/main_test.rs",
+            "src/lib.rs",
+            "tests/lib_test.rs",
+            "src/.rs",
+            "tests/test_.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let importers: HashMap<String, BTreeSet<String>> = [
+            (
+                "src/service.rs".to_string(),
+                ["tests/service_flow_test.rs".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+            (
+                "src/mod.rs".to_string(),
+                ["tests/mod_test.rs".to_string()].into_iter().collect(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let matches = match_test_files(&all_files, &importers);
+        let expected = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect();
+        assert_eq!(
+            matches.get("src/auth.rs"),
+            Some(&expected(&["src/auth_test.rs", "tests/auth.spec.ts"]))
+        );
+        assert_eq!(
+            matches.get("src/service.rs"),
+            Some(&expected(&["tests/service_flow_test.rs"]))
+        );
+        assert_eq!(
+            matches.get("src/mod.rs"),
+            Some(&expected(&["tests/mod_test.rs"]))
+        );
+
+        for stem in ["mod", "index", "main", "lib"] {
+            assert!(
+                !matches.contains_key(&format!("tests/{stem}_test.rs")),
+                "reserved test stem {stem:?} should not match by stem"
+            );
+            if stem != "mod" {
+                assert!(
+                    !matches.contains_key(&format!("src/{stem}.rs")),
+                    "reserved target stem {stem:?} should not match by stem"
+                );
+            }
+        }
+        assert!(file_stem_normalized("tests/test_.rs").is_empty());
+        assert!(!matches.contains_key("src/.rs"));
+        assert!(!matches.contains_key("tests/test_.rs"));
     }
 
     #[test]
@@ -698,5 +957,125 @@ mod tests {
 
         let app = graph.related_for("src/app.ts");
         assert_eq!(app.imports, vec!["src/util.ts"], "{app:?}");
+    }
+
+    #[test]
+    fn resolves_go_and_csharp_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("pkg/auth")).unwrap();
+        fs::create_dir_all(root.join("cmd/server")).unwrap();
+        fs::write(root.join("pkg/auth/auth.go"), "package auth\n").unwrap();
+        fs::write(
+            root.join("cmd/server/main.go"),
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"example.com/project/pkg/auth\"\n)\n\nfunc main() {}\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join("ProSCADA/Core/Preview")).unwrap();
+        fs::create_dir_all(root.join("ProSCADA/Services")).unwrap();
+        fs::write(
+            root.join("ProSCADA/Core/Preview/PreviewEngine.cs"),
+            "namespace ProSCADA.Core.Preview;\npublic class PreviewEngine {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("ProSCADA/Services/ProjectService.cs"),
+            "using System;\nusing ProSCADA.Core.Preview;\nusing static PreviewEngine;\n\nnamespace ProSCADA.Services;\npublic class ProjectService {}\n",
+        )
+        .unwrap();
+
+        let entries: Vec<DirEntryMeta> = [
+            "pkg/auth/auth.go",
+            "cmd/server/main.go",
+            "ProSCADA/Core/Preview/PreviewEngine.cs",
+            "ProSCADA/Services/ProjectService.cs",
+        ]
+        .iter()
+        .map(|p| DirEntryMeta {
+            path: PathBuf::from(p),
+            is_dir: false,
+            size: Some(50),
+        })
+        .collect();
+
+        let graph = DependencyGraph::build(root, &entries);
+
+        let go_main = graph.related_for("cmd/server/main.go");
+        assert!(
+            go_main.imports.contains(&"pkg/auth/auth.go".to_string()),
+            "Go import not resolved: {go_main:?}"
+        );
+
+        let cs_service = graph.related_for("ProSCADA/Services/ProjectService.cs");
+        assert!(
+            cs_service
+                .imports
+                .contains(&"ProSCADA/Core/Preview/PreviewEngine.cs".to_string()),
+            "C# using not resolved: {cs_service:?}"
+        );
+    }
+
+    #[test]
+    fn go_and_csharp_o1_lookup_resolves_relative_and_multi_segment_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("pkg/api/sub")).unwrap();
+        fs::create_dir_all(root.join("pkg/models")).unwrap();
+        fs::write(root.join("pkg/api/sub/sub.go"), "package sub\n").unwrap();
+        fs::write(root.join("pkg/models/user.go"), "package models\n").unwrap();
+        fs::write(
+            root.join("pkg/api/handlers.go"),
+            "package api\n\nimport (\n\t\"./sub\"\n\t\"../models\"\n)\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join("Company/Platform/Security/Auth")).unwrap();
+        fs::create_dir_all(root.join("Company/App")).unwrap();
+        fs::write(
+            root.join("Company/Platform/Security/Auth/Token.cs"),
+            "namespace Company.Platform.Security.Auth;\npublic class Token {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Company/App/Program.cs"),
+            "using Company.Platform.Security.Auth;\nusing static Token;\n\nnamespace Company.App;\npublic class Program {}\n",
+        )
+        .unwrap();
+
+        let entries: Vec<DirEntryMeta> = [
+            "pkg/api/sub/sub.go",
+            "pkg/models/user.go",
+            "pkg/api/handlers.go",
+            "Company/Platform/Security/Auth/Token.cs",
+            "Company/App/Program.cs",
+        ]
+        .iter()
+        .map(|p| DirEntryMeta {
+            path: PathBuf::from(p),
+            is_dir: false,
+            size: Some(60),
+        })
+        .collect();
+
+        let graph = DependencyGraph::build(root, &entries);
+
+        let handlers = graph.related_for("pkg/api/handlers.go");
+        assert!(
+            handlers.imports.contains(&"pkg/api/sub/sub.go".to_string()),
+            "Go relative ./sub not resolved: {handlers:?}"
+        );
+        assert!(
+            handlers.imports.contains(&"pkg/models/user.go".to_string()),
+            "Go relative ../models not resolved: {handlers:?}"
+        );
+
+        let prog = graph.related_for("Company/App/Program.cs");
+        assert!(
+            prog.imports
+                .contains(&"Company/Platform/Security/Auth/Token.cs".to_string()),
+            "C# deep namespace or static class not resolved: {prog:?}"
+        );
     }
 }

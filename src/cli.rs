@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ptt::core::budget::{fit_to_bpe_budget_with_pins, prefit_by_estimate};
-use ptt::core::git::{compute_git_diff, inspect_git_context};
+use ptt::core::budget::{fit_workspace_to_bpe_budget, prefit_by_estimate_with_graph};
+use ptt::core::deps::DependencyGraph;
+use ptt::core::git::{compute_git_diff, inspect_git_context, GitRepoContext};
 use ptt::core::output::{
-    write_output_with_stats, OutputFormat, WriteOptions, DEFAULT_MAX_FILE_SIZE,
+    write_output_with_stats, OutputFormat, PreparedWorkspace, WriteOptions, DEFAULT_MAX_FILE_SIZE,
 };
 use ptt::core::tokenizer::TokenizerModel;
 use ptt::core::walker::{
@@ -450,31 +451,41 @@ impl PackArgs {
     }
 }
 
-/// Filters and auto-fits `entries` according to `args`. Returns `(filtered_entries, skeleton_files)`.
-pub fn filter_entries_for_cli(
+/// Filters `entries` according to `--preset`, git context (`--git-modified`, `--git-branch`),
+/// `--include`, and `--exclude`. Directories are also filtered out.
+pub fn prefilter_cli_entries(
     entries: Vec<DirEntryMeta>,
     root: &Path,
     args: &PackArgs,
-) -> Result<(Vec<DirEntryMeta>, HashSet<String>), String> {
+    git_ctx: Option<&GitRepoContext>,
+) -> Result<Vec<DirEntryMeta>, String> {
     let include_set = build_globset(&args.include_globs)?;
     let exclude_set = build_globset(&args.exclude_globs)?;
-    let skeleton_glob_set = build_globset(&args.skeleton_globs)?;
 
     let git_mod_set: Option<HashSet<String>> = if args.git_modified || args.git_branch {
-        let ctx = inspect_git_context(root);
         let mut set = HashSet::new();
-        if args.git_modified {
-            set.extend(ctx.modified_files);
-        }
-        if args.git_branch {
-            set.extend(ctx.branch_changed_files);
+        if let Some(ctx) = git_ctx {
+            if args.git_modified {
+                set.extend(ctx.modified_files.clone());
+            }
+            if args.git_branch {
+                set.extend(ctx.branch_changed_files.clone());
+            }
+        } else {
+            let ctx = inspect_git_context(root);
+            if args.git_modified {
+                set.extend(ctx.modified_files);
+            }
+            if args.git_branch {
+                set.extend(ctx.branch_changed_files);
+            }
         }
         Some(set)
     } else {
         None
     };
 
-    let mut files: Vec<DirEntryMeta> = entries
+    let files: Vec<DirEntryMeta> = entries
         .into_iter()
         .filter(|e| {
             if e.is_dir {
@@ -511,6 +522,17 @@ pub fn filter_entries_for_cli(
         })
         .collect();
 
+    Ok(files)
+}
+
+/// Applies `--skeleton-globs` and prefits files within token budget when active.
+pub fn apply_skeleton_globs_and_prefit(
+    mut files: Vec<DirEntryMeta>,
+    root: &Path,
+    args: &PackArgs,
+    dep_graph: Option<&DependencyGraph>,
+) -> Result<(Vec<DirEntryMeta>, HashSet<String>), String> {
+    let skeleton_glob_set = build_globset(&args.skeleton_globs)?;
     let mut skeleton_files = HashSet::new();
     if let Some(ref skel_set) = skeleton_glob_set {
         for f in &files {
@@ -527,16 +549,37 @@ pub fn filter_entries_for_cli(
     }
 
     if let Some(budget) = args.max_tokens {
-        files = prefit_by_estimate(
+        let local_graph;
+        let graph_ref = match dep_graph {
+            Some(g) => g,
+            None => {
+                local_graph = DependencyGraph::build(root, &files);
+                &local_graph
+            }
+        };
+        files = prefit_by_estimate_with_graph(
             files,
             &mut skeleton_files,
             args.skeleton,
             budget,
             &args.pinned_rel_paths(),
+            Some(graph_ref),
         );
     }
 
     Ok((files, skeleton_files))
+}
+
+/// Filters and auto-fits `entries` according to `args`, reusing precomputed git context and dependency graph if provided.
+pub fn filter_entries_for_cli_with_context(
+    entries: Vec<DirEntryMeta>,
+    root: &Path,
+    args: &PackArgs,
+    git_ctx: Option<&GitRepoContext>,
+    dep_graph: Option<&DependencyGraph>,
+) -> Result<(Vec<DirEntryMeta>, HashSet<String>), String> {
+    let files = prefilter_cli_entries(entries, root, args, git_ctx)?;
+    apply_skeleton_globs_and_prefit(files, root, args, dep_graph)
 }
 
 /// One-line pre-export redaction report for stderr. Says what was masked, what was skipped, and
@@ -571,7 +614,23 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
     }
 
     let entries = walk(&root).map_err(|e| e.to_string())?;
-    let (filtered_entries, skeleton_files) = filter_entries_for_cli(entries, &root, args)?;
+
+    // 1. Inspect git context exactly once.
+    let git_context = inspect_git_context(&root);
+    let modified_files: HashSet<String> = git_context.modified_files.iter().cloned().collect();
+
+    // 2. Pre-filter entries before building dependency graph so excluded/unselected files are never parsed.
+    let prefiltered = prefilter_cli_entries(entries, &root, args, Some(&git_context))?;
+
+    // 3. Build dependency graph at most once (only when budget is active, on prefiltered entries).
+    let dep_graph = if args.max_tokens.is_some() {
+        Some(DependencyGraph::build(&root, &prefiltered))
+    } else {
+        None
+    };
+
+    let (filtered_entries, skeleton_files) =
+        apply_skeleton_globs_and_prefit(prefiltered, &root, args, dep_graph.as_ref())?;
     let git_diff = if args.git_diff {
         compute_git_diff(&root, 256 * 1024)
     } else {
@@ -591,29 +650,42 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
         task_prompt: args.task_prompt.clone(),
         tokenizer_model: args.tokenizer_model,
         compute_bpe_tokens: true,
+        modified_files,
     };
 
-    // `--max-tokens` is a hard limit on the exact BPE count, not only on the heuristic estimate.
-    let filtered_entries = match args.max_tokens {
+    // `--max-tokens` is a hard limit on the exact BPE count; reuse the in-memory PreparedWorkspace!
+    let (filtered_entries, fitted_workspace) = match args.max_tokens {
         Some(budget) => {
-            let (entries, skeleton_files) = fit_to_bpe_budget_with_pins(
+            let (entries, skeleton_files, workspace) = fit_workspace_to_bpe_budget(
                 filtered_entries,
                 &root,
                 &opts,
                 budget,
                 &pinned_rel_paths,
+                dep_graph.as_ref(),
+                &|| false,
             )?;
             opts.skeleton_files = skeleton_files;
-            entries
+            (entries, Some(workspace))
         }
-        None => filtered_entries,
+        None => (filtered_entries, None),
     };
     let file_count = filtered_entries.iter().filter(|e| !e.is_dir).count();
 
     if args.copy_to_clipboard {
         let mut buf = Vec::new();
-        let stats = write_output_with_stats(&mut buf, &filtered_entries, &root, &opts, &|| false)
-            .map_err(|e| e.to_string())?;
+        let stats = if let Some(ref ws) = fitted_workspace {
+            ws.render_with_stats(
+                &mut buf,
+                &filtered_entries,
+                &opts.skeleton_files,
+                opts.skeleton_all,
+            )
+            .map_err(|e| e.to_string())?
+        } else {
+            write_output_with_stats(&mut buf, &filtered_entries, &root, &opts, &|| false)
+                .map_err(|e| e.to_string())?
+        };
         let text = String::from_utf8(buf).map_err(|e| e.to_string())?;
 
         if let Some(path) = &args.output {
@@ -640,10 +712,21 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
         entries: &[DirEntryMeta],
         root: &Path,
         opts: &WriteOptions,
+        workspace: Option<&PreparedWorkspace>,
     ) -> Result<ptt::PackStats, String> {
         let mut writer = BufWriter::new(writer);
-        let stats = write_output_with_stats(&mut writer, entries, root, opts, &|| false)
-            .map_err(|error| error.to_string())?;
+        let stats = if let Some(ws) = workspace {
+            ws.render_with_stats(
+                &mut writer,
+                entries,
+                &opts.skeleton_files,
+                opts.skeleton_all,
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            write_output_with_stats(&mut writer, entries, root, opts, &|| false)
+                .map_err(|error| error.to_string())?
+        };
         writer.flush().map_err(|error| error.to_string())?;
         Ok(stats)
     }
@@ -668,7 +751,13 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
                 }
             }
             let file = fs::File::create(path).map_err(|error| error.to_string())?;
-            let stats = stream(file, &filtered_entries, &root, &opts)?;
+            let stats = stream(
+                file,
+                &filtered_entries,
+                &root,
+                &opts,
+                fitted_workspace.as_ref(),
+            )?;
             let tok_prefix = if stats.tokenizer_exact { "" } else { "~" };
             eprintln!(
                 "ptt pack: wrote {} files ({}{} tokens, {}) → {}",
@@ -681,7 +770,13 @@ pub fn run_pack(args: &PackArgs) -> Result<(), String> {
             eprintln!("{}", redaction_report(&stats));
         }
         None => {
-            let stats = stream(io::stdout().lock(), &filtered_entries, &root, &opts)?;
+            let stats = stream(
+                io::stdout().lock(),
+                &filtered_entries,
+                &root,
+                &opts,
+                fitted_workspace.as_ref(),
+            )?;
             let tok_prefix = if stats.tokenizer_exact { "" } else { "~" };
             eprintln!(
                 "ptt pack: {} files · {}{} tokens ({}) · {}",
@@ -735,7 +830,7 @@ fn format_label(f: OutputFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ptt::core::budget::{fit_to_bpe_budget, pack_stats};
+    use ptt::core::budget::{fit_to_bpe_budget, fit_to_bpe_budget_with_graph, pack_stats};
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -812,6 +907,117 @@ mod tests {
     }
 
     #[test]
+    fn all_selection_presets_leave_benchmarks_unselected() {
+        let root = tempdir().unwrap();
+        let entries = vec![
+            DirEntryMeta {
+                path: PathBuf::from("src/main.rs"),
+                is_dir: false,
+                size: Some(12),
+            },
+            DirEntryMeta {
+                path: PathBuf::from("benchmarks/context-v1/prior.xml"),
+                is_dir: false,
+                size: Some(20),
+            },
+        ];
+
+        for preset in [CliPreset::Source, CliPreset::Docs, CliPreset::All] {
+            let args = PackArgs {
+                preset: Some(preset),
+                ..Default::default()
+            };
+            let (filtered, _) = filter_entries_for_cli_with_context(
+                entries.clone(),
+                root.path(),
+                &args,
+                None,
+                None,
+            )
+            .unwrap();
+            let paths: Vec<_> = filtered
+                .iter()
+                .map(|entry| normalize_rel_path(&entry.path))
+                .collect();
+            assert!(
+                paths.contains(&"src/main.rs".to_string()),
+                "{preset:?}: {paths:?}"
+            );
+            assert!(
+                !paths.contains(&"benchmarks/context-v1/prior.xml".to_string()),
+                "{preset:?}: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unqualified_cli_pack_skips_prior_generated_context() {
+        let project = tempdir().unwrap();
+        let output_dir = tempdir().unwrap();
+        let artifact = project.path().join("benchmarks/context-v1/prior.xml");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(
+            &artifact,
+            "<project_context>\n  <source>This file was generated by ptt (ProjectToText) from earlier</source>\n  <files>old context sentinel</files>\n</project_context>\n",
+        )
+        .unwrap();
+        let output = output_dir.path().join("packed.xml");
+
+        run_pack(&PackArgs {
+            dir: project.path().to_path_buf(),
+            output: Some(output.clone()),
+            redact_secrets: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let packed = fs::read_to_string(output).unwrap();
+        assert!(
+            packed.contains("Generated ptt context artifact skipped"),
+            "{packed}"
+        );
+        assert!(!packed.contains("old context sentinel"), "{packed}");
+    }
+
+    #[test]
+    fn cli_pack_with_budget_skips_prior_generated_context_even_in_skeleton_files() {
+        let project = tempdir().unwrap();
+        let output_dir = tempdir().unwrap();
+        let artifact = project.path().join("benchmarks/context-v1/prior.xml");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(
+            &artifact,
+            format!(
+                "<project_context>\n  <source>This file was generated by ptt (ProjectToText) from earlier</source>\n  <files>old context sentinel</files>\n  {}\n</project_context>\n",
+                "<!-- filler large comment -->\n".repeat(200)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("main.rs"),
+            "pub fn main() { println!(\"hello\"); }\n",
+        )
+        .unwrap();
+        let output = output_dir.path().join("packed.xml");
+
+        run_pack(&PackArgs {
+            dir: project.path().to_path_buf(),
+            output: Some(output.clone()),
+            redact_secrets: false,
+            max_tokens: Some(5_000),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let packed = fs::read_to_string(output).unwrap();
+        assert!(
+            packed.contains("Generated ptt context artifact skipped"),
+            "{packed}"
+        );
+        assert!(!packed.contains("old context sentinel"), "{packed}");
+    }
+
+    #[test]
     fn max_tokens_is_enforced_on_the_exact_bpe_count() {
         let dir = tempdir().unwrap();
         for i in 0..8 {
@@ -828,7 +1034,8 @@ mod tests {
             ..Default::default()
         };
         let entries = walk(&root).unwrap();
-        let (filtered, skeleton_files) = filter_entries_for_cli(entries, &root, &args).unwrap();
+        let (filtered, skeleton_files) =
+            filter_entries_for_cli_with_context(entries, &root, &args, None, None).unwrap();
         let opts = WriteOptions {
             skeleton_files,
             compute_bpe_tokens: true,
@@ -857,5 +1064,67 @@ mod tests {
     fn parse_format_aliases() {
         assert_eq!(parse_format("md").unwrap(), OutputFormat::Markdown);
         assert_eq!(parse_format("JSON").unwrap(), OutputFormat::Json);
+    }
+
+    #[test]
+    fn budget_fitting_retains_heavily_imported_file_over_unimported_file() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        // core_hub.rs: central module imported by multiple peers
+        let hub_body: String = (0..50)
+            .map(|j| format!("pub fn hub_func_{j}() -> u64 {{ {j} }}\n"))
+            .collect();
+        fs::write(src_dir.join("core_hub.rs"), hub_body).unwrap();
+
+        // user_a.rs and user_b.rs import core_hub
+        fs::write(
+            src_dir.join("user_a.rs"),
+            "use crate::core_hub;\npub fn use_a() { core_hub::hub_func_0(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            src_dir.join("user_b.rs"),
+            "use crate::core_hub;\npub fn use_b() { core_hub::hub_func_1(); }\n",
+        )
+        .unwrap();
+
+        // orphan.rs: standalone unimported file
+        let orphan_body: String = (0..50)
+            .map(|j| format!("pub fn orphan_func_{j}() -> u64 {{ {j} }}\n"))
+            .collect();
+        fs::write(src_dir.join("orphan.rs"), orphan_body).unwrap();
+
+        let root = dir.path().canonicalize().unwrap();
+        let entries = walk(&root).unwrap();
+
+        let dep_graph = DependencyGraph::build(&root, &entries);
+        let opts = WriteOptions {
+            compute_bpe_tokens: true,
+            ..Default::default()
+        };
+
+        // Budget that forces dropping one large file: core_hub must be prioritized over orphan.
+        let budget = 1300;
+        let (fitted, _) = fit_to_bpe_budget_with_graph(
+            entries,
+            &root,
+            &opts,
+            budget,
+            &HashSet::new(),
+            Some(&dep_graph),
+        )
+        .unwrap();
+
+        let kept_paths: Vec<String> = fitted.iter().map(|e| normalize_rel_path(&e.path)).collect();
+        assert!(
+            kept_paths.contains(&"src/core_hub.rs".to_string()),
+            "heavily imported core_hub.rs should be kept, but kept: {kept_paths:?}"
+        );
+        assert!(
+            !kept_paths.contains(&"src/orphan.rs".to_string()),
+            "unimported orphan.rs should be dropped before core_hub.rs, but kept: {kept_paths:?}"
+        );
     }
 }

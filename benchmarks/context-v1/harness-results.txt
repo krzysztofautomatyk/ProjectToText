@@ -1,0 +1,23 @@
+selection: 10000 paths / 8000 exact selections, 3 repetitions
+legacy_ms=4911.831; matcher_including_build_ms=1.046; matcher_p95_ms=1.095
+initial_non_git_scan_1000_files_ms=28.387
+cached_lookup_mtime_rules_check_and_selection_ms=0.168; p95_ms=0.202 (5 repetitions)
+pack_800_files: threads_parallel=14; sequential_1_thread_median_ms=25.252; parallel_median_ms=18.718; parallel_p95_ms=18.847
+bpe_tokenizer_full_source: files=51; bytes=732042; tokens=175470; median_ms=30.309; tokens_per_sec=5789378; mib_per_sec=23.03
+ast_skeleton_extraction: median_ms=39.457
+ptt_source_skeleton_compression: full_bpe_tokens=175470; skeleton_bpe_tokens=41585; token_reduction=76.3%; skeleton_bpe_median_ms=6.305
+pack_800_files_uneven: single_thread_ms=152.857; chunked_64_ms=126.598; single_pass_rayon_ms=110.185; single_pass_p95_ms=112.908
+context_quality_gold_benchmark: tasks=3; graph_required_recall=83.3%; baseline_required_recall=33.3%; graph_noise_ratio=16.7%; baseline_noise_ratio=50.0%
+
+Replay on reconstructed tree (2026-10-17, same macOS M4 Pro environment):
+legacy_ms=5578.383; matcher_including_build_ms=1.232; matcher_p95_ms=1.260
+initial_non_git_scan_1000_files_ms=33.119
+cached_lookup_mtime_rules_check_and_selection_ms=0.184; p95_ms=0.280 (5 repetitions)
+pack_800_files: threads_parallel=14; sequential_1_thread_median_ms=29.648; parallel_median_ms=20.739; parallel_p95_ms=20.807
+bpe_tokenizer_full_source: files=51; bytes=732042; tokens=175470; median_ms=36.256; tokens_per_sec=4839729; mib_per_sec=19.26
+ast_skeleton_extraction: median_ms=45.550
+ptt_source_skeleton_compression: full_bpe_tokens=175470; skeleton_bpe_tokens=41585; token_reduction=76.3%; skeleton_bpe_median_ms=8.098
+pack_800_files_uneven: single_thread_ms=171.774; chunked_64_ms=137.869; single_pass_rayon_ms=122.351; single_pass_p95_ms=125.092
+context_quality_gold_benchmark: tasks=3; graph_required_recall=83.3%; baseline_required_recall=33.3%; graph_noise_ratio=16.7%; baseline_noise_ratio=50.0%
+
+Behavior rerun on 2026-10-17: `cargo test --release --locked --bin ptt cli::tests -- --nocapture` passed 6/6. Output inventory and exact PTT selection paths replayed; strict pinned 8k rejection returned exit 1 and did not overwrite an existing destination file.

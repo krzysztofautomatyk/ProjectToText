@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AppWindow,
   Code2,
@@ -53,9 +53,48 @@ export default function FileViewer({
   onOpenWithPicker,
   onOpenWithCommand,
 }: Props) {
-  const html = useMemo(() => {
-    if (!preview || preview.binary) return '';
-    return highlightCode(preview.content, preview.language);
+  const [highlightedHtml, setHighlightedHtml] = useState<string>('');
+  const [isHighlighting, setIsHighlighting] = useState(false);
+
+  useEffect(() => {
+    if (!preview || preview.binary) {
+      setHighlightedHtml('');
+      setIsHighlighting(false);
+      return;
+    }
+
+    // Fast path: small files (< 20 KB) highlight immediately
+    if (preview.content.length < 20_000) {
+      setHighlightedHtml(highlightCode(preview.content, preview.language));
+      setIsHighlighting(false);
+      return;
+    }
+
+    // Large files: display plain text immediately, defer heavy AST highlight off the main animation frame
+    setIsHighlighting(true);
+    let active = true;
+    const timer = setTimeout(() => {
+      if (!active) return;
+      // Cap highlight at 250 KB for memory & DOM performance
+      const capped =
+        preview.content.length > 250_000
+          ? preview.content.slice(0, 250_000)
+          : preview.content;
+      const res = highlightCode(capped, preview.language);
+      if (active) {
+        setHighlightedHtml(
+          preview.content.length > 250_000
+            ? `${res}\n\n/* ... [syntax highlighting capped at 250 KB for smooth UI performance] ... */`
+            : res,
+        );
+        setIsHighlighting(false);
+      }
+    }, 16);
+
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
   }, [preview]);
 
   if (loading) {
@@ -102,6 +141,7 @@ export default function FileViewer({
           <span className="file-viewer-chip">{formatBytes(preview.size)}</span>
           {preview.truncated && <span className="file-viewer-chip warn">truncated</span>}
           {preview.binary && <span className="file-viewer-chip warn">binary</span>}
+          {isHighlighting && <span className="file-viewer-chip">highlighting…</span>}
         </div>
         <div className="file-viewer-actions" role="group" aria-label="Open file">
           <button
@@ -154,12 +194,18 @@ export default function FileViewer({
 
       {preview.binary ? (
         <pre className="output-text file-viewer-code">{preview.content}</pre>
-      ) : (
+      ) : highlightedHtml ? (
         <pre className="hljs file-viewer-code">
           <code
             className={`language-${preview.language}`}
-            dangerouslySetInnerHTML={{ __html: html }}
+            dangerouslySetInnerHTML={{ __html: highlightedHtml }}
           />
+        </pre>
+      ) : (
+        <pre className="hljs file-viewer-code">
+          <code className={`language-${preview.language}`}>
+            {preview.content}
+          </code>
         </pre>
       )}
     </div>

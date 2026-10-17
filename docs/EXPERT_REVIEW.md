@@ -1,6 +1,6 @@
-# Engineering review: 0.4.0 through 0.8.0
+# Engineering review: 0.4.0 through 0.8.1
 
-**Scope:** changes on top of v0.3.0. The 0.4.0 section describes the release prepared on 2026-10-14. The 0.5.0 section covers hardening on top of it. The 0.6.0 section covers the UI split, auto-refresh, and the stale-artifact guard. The 0.7.0 section covers the desktop state hook, the incremental dependency graph, and re-export symbol search. The 0.8.0 section covers grouped Rust re-exports, the file-set-independent graph cache, incremental watcher updates, and the UI hook split. The secret-scanning evaluation is below.
+**Scope:** changes on top of v0.3.0. The 0.4.0 section describes the release prepared on 2026-10-14. The 0.5.0 section covers hardening on top of it. The 0.6.0 section covers the UI split, auto-refresh, and the stale-artifact guard. The 0.7.0 section covers the desktop state hook, the incremental dependency graph, and re-export symbol search. The 0.8.0 section covers grouped Rust re-exports, the file-set-independent graph cache, incremental watcher updates, and the UI hook split. The 0.8.1 section covers strict full-artifact BPE budgets, `PreparedWorkspace` single-pass budget fitting, graph-centrality drop priority, 21 secret-scanning rules (including Shannon entropy), MCP resources/prompts/cooperative cancellation, and browser `.gitignore`/`.pttignore` parity. The secret-scanning evaluation is below.
 
 **Status:** regression-driven hardening with measured behavior. No independent certification or competitive ranking.
 
@@ -71,11 +71,20 @@ An earlier self-assessment claiming a “10.0 / 10 panel consensus” was withdr
 - **Incremental watcher updates**: `WorkspaceIndex::refresh_paths` updates the snapshot in place when watcher events only modify indexed files. The desktop app queues the changed paths. Creating or removing a file, or changing an ignore file, still triggers a full scan.
 - **UI split**: `ui/src/useWorkspace.tsx` is composed from `ui/src/useThemeAndLayout.ts` (theme, sidebar resize, tree viewport) and `ui/src/useFilePreviewAndMenu.ts` (preview, editor launchers, context menu, dependency selection). Each file in `ui/src/` is under 38 KB.
 
+## 0.8.1 changes
+
+- **Strict full-artifact BPE budget & `--pin` support**: `--max-tokens` (CLI and MCP `ptt_pack_files`) is enforced on the exact token count of the complete serialized artifact (wrappers, directory structure, paths, escaping, `<git_diff>`, and `<task_instructions>`). `PreparedWorkspace` prepares files in memory once and re-renders across budget iterations without re-reading disk. `drop_priority_order_with_graph` uses dependency-graph importer centrality so heavily imported core modules are retained ahead of isolated files. Pinned paths (`--pin` / `pinned_paths`) are never dropped; an impossible budget fails closed with an explicit diagnostic.
+- **Browser ignore parity**: `ui/src/browserFs.ts` evaluates in-folder `.gitignore` and `.pttignore` rules top-down (with parent-directory pruning, scoped negations, fail-closed `.pttignore` validation, and skipped-file reason reporting).
+- **Race-safe final-component file open**: `open_verified_regular_file` (`src/core/preview.rs`) opens files with `O_NOFOLLOW` on Unix and `FILE_FLAG_OPEN_REPARSE_POINT` on Windows and checks `(dev, ino)` equality against `file.metadata()` (`fstat`).
+- **MCP protocol negotiation, resources, prompts & cooperative cancellation**: negotiates `2025-11-25`, `2025-06-18`, and `2024-11-05` (and rejects `2026-07-28`); adds `resources/list` + `resources/read` (`ptt://project/map`, `ptt://project/git-diff`) and `prompts/list` + `prompts/get` (`architecture_review`, `security_audit`, `git_diff_review`), read-only tool annotations, a 16-worker pool with 30 s timeouts, and cooperative cancellation (`AtomicBool`) on timeout or `notifications/cancelled`.
+- **Expanded secret scanner (21 rules + Shannon entropy) & task prompt redaction**: adds `AZURE_KEY`, `SENDGRID_KEY`, `DISCORD_TOKEN`, and Shannon-entropy-gated generic assignments (`HIGH_ENTROPY_SECRET`, $H > 4.5$ bits/char for literals $\ge 32$ chars) in both Rust and TypeScript. `<task_instructions>` is redacted alongside file contents and diffs, and `ptt pack` emits a one-line redaction report on stderr.
+- **Desktop UX**: tree badges display `exact BPE` token counts once a pack is generated; the Context Budget bar breaks down full content, AST skeletons, and wrapper/diff/prompt overhead; and the File Viewer provides a Full / AST Skeleton toggle with savings percentage and 1-hop related-file chips.
+
 ## Secret-scanning evaluation
 
 Method: a fixture corpus in `tests/phase1_regressions.rs` (`secret_scanner_fp_fn_corpus_evaluation`), mirrored in `ui/e2e/secrets.spec.ts`.
 
-- **True positives**: 17 synthetic credentials, one for each of the 17 rules. Each is built with `concat!()` or `.join('')`, so packing this repository never masks the fixtures. Result: 17/17 masked (false negatives = 0).
+- **True positives**: 21 synthetic credentials, one for each of the 21 rules (including high-entropy generic secret assignments). Each is built with `concat!()` or `.join('')`, so packing this repository never masks the fixtures. Result: 21/21 masked (false negatives = 0).
 - **True negatives**: 20 benign snippets. They cover UUIDs, SHA-256 hashes, base64 data URIs, CSS classes, TypeScript generics, SQL, comparison operators, documentation placeholders, Markdown links, localhost URLs, commit SHAs, package scopes, and identifiers that contain `TOKEN` or `SECRET`. Result: 0/20 changed (false positives = 0).
 - **Limits of this measurement**: the corpus is small, and its authors wrote the rules too. It covers one shape per rule, and the corpus is not a measurement on real code.
 
@@ -127,25 +136,25 @@ The original 350 KB target was not achievable for full source, because `ui/src/A
 
 ## Verification
 
-- `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`: pass.
-- `cargo test --all-targets`: 89 Rust tests pass (55 library, 14 binary, 20 integration and regression). The 0.7.0 additions are the fail-closed artifact test, the incremental dependency test, the re-export symbol tests, and the 17-rule secret corpus. The 0.8.0 additions are grouped `pub use` and TypeScript alias symbol tests, the file-set-independent dependency cache test, and the `refresh_paths` test. Earlier tests cover MCP sandboxing, symbol search, related files, grouped Rust imports, `.js` to `.ts` resolution, skeleton element elision, `<task_instructions>` CDATA, and the exact BPE budget.
-- `cargo build --release --bin ptt`: pass.
-- MCP smoke test through the release binary over stdio: `tools/list` returns five tools. `ptt_search_symbols` returns the exact span. `ptt_get_related_files` returns the expected import. A `directory` of `/etc` is rejected.
+- `cargo fmt --all -- --check` and `cargo clippy --all-targets --locked -- -D warnings`: pass.
+- `cargo test --all-targets --locked`: 122 Rust tests pass (75 library, 25 binary, 1 integration stdio in `tests/mcp_stdio_client.rs`, 21 integration and regression in `tests/phase1_regressions.rs`).
+- `cargo build --release --locked --bin ptt`: pass.
+- MCP smoke test through the release binary over stdio (`tests/mcp_stdio_client.rs`): verifies `initialize` (`2025-11-25`), `tools/list` (five tools), all five `tools/call` endpoints, `resources/list`, `resources/read`, `prompts/list`, and `prompts/get`.
 - `npm --prefix ui run lint`, `typecheck`, `build`: pass.
-- `npm --prefix ui run test:e2e`: 21 Playwright tests pass in Chromium.
-- Largest file in `ui/src/`: 30,826 bytes (`useWorkspace.tsx` is under the 38 KB limit after the split).
-- Not run: native desktop tests on macOS, Windows, or Linux; updater and installer flows; the Windows-only junction regression test.
+- `npm --prefix ui run test:e2e`: 25 Playwright tests pass in Chromium (including the 21/21 TP and 0/20 FP secret corpus and `exact BPE` tree badge verification).
+- Largest file in `ui/src/`: `browserFs.ts` (~36 KB), all modules in `ui/src/` remain modular.
+- Not run locally on macOS: native Windows/Linux desktop bundles, updater and installer flows, and the Windows-only junction regression test (covered in CI matrix).
 
 ## Limits
 
 1. **Watcher falls back to a full re-scan on structural changes.** Edits to indexed files are applied in place with `WorkspaceIndex::refresh_paths`. Creating or removing a file, or changing an ignore file, triggers a full re-scan after 800 ms, keeping the selection. The dependency graph reuses unchanged files, and file-set changes re-resolve them from cached source.
-2. **No race-proof filesystem sandbox.** Checks mitigate static link and junction escapes. A concurrent process can change paths between check and open.
-3. **Secret masking is pattern-based.** The fixture corpus (17 positives, 20 negatives) gives 17/17 recall and 0/20 false positives for the listed shapes. That is not a measured rate on real code. The masking has no entropy or context detection and misses credentials in unrecognized shapes.
+2. **Residual intermediate-directory TOCTOU risk.** Final-component file opens use `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT` plus `fstat` `(dev, ino)` verification (`open_verified_regular_file`), and concurrent final-component symlink swap is covered by a regression test. However, portable standard-library Rust does not use `openat2(..., RESOLVE_BENEATH)` across intermediate directories, so a concurrent local process with write access to an ancestor directory can still race intermediate resolution (documented in `SECURITY.md`).
+3. **Secret masking is pattern- and entropy-based.** The fixture corpus (21 positives, 20 negatives) gives 21/21 recall and 0/20 false positives for the listed shapes and high-entropy assignments ($H > 4.5$ bits/char for literals $\ge 32$ chars). That is not a measured rate on arbitrary real code, and credentials in unrecognized low-entropy shapes are not detected.
 4. **Claude and Gemini counts are scaled approximations** of `o200k_base`. Exact counts apply only to `o200k_base` and `cl100k_base`.
 5. **Skeletons are lossy.** Function bodies are removed by design. Languages without a grammar use a fallback that is less precise.
-6. **Browser mode is a separate implementation.** It does not run Git, does not implement `.gitignore` or `.pttignore`, and has a 400-file cap.
-7. **Native release QA is outstanding.** Installer, signing, notarization, and WebView behavior are not covered by browser tests.
-8. **MSRV is declared, not tested.** `rust-version = "1.90"` comes from the resolved dependency graph. CI builds with `stable`.
+6. **Browser mode is a separate implementation.** It evaluates in-folder `.gitignore` and `.pttignore` rules and caps packs at 400 files, but does not spawn `git` (no tracked-file index, global gitignore, or `git diff`) and uses `chars ÷ 3.8` token estimates rather than native BPE.
+7. **Native release code signing is outstanding.** Installer notarization (Apple Developer ID) and Windows Authenticode signing are not configured; updater artifacts are signed with the Tauri minisign key.
+8. **MSRV is checked via `cargo check` in CI.** `rust-version = "1.90"` is verified by the `msrv` job in `.github/workflows/ci.yml`.
 9. **No legacy charset detection.** BOM-less Windows-1252 and similar files must be converted to UTF-8 first.
 10. **MCP symbol search matches name substrings only, under the exported name.** It finds `pub use` re-exports, including grouped lists, `pub mod name;` declarations, TypeScript export and import aliases, and `export * as ns` namespaces. It does not follow glob re-exports (`pub use x::*`).
 

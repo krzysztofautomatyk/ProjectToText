@@ -2,14 +2,16 @@
 //!
 //! `mcp.rs` owns the JSON-RPC envelope and calls [`dispatch_tool`] for each `tools/call`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use rayon::prelude::*;
 use serde_json::{json, Value};
 
-use ptt::core::budget::fit_to_bpe_budget;
-use ptt::core::git::{compute_git_diff, inspect_git_context};
+use ptt::core::budget::fit_workspace_to_bpe_budget;
+use ptt::core::git::compute_git_diff;
 use ptt::core::output::{
     architectural_tier, write_output_with_stats, OutputFormat, WriteOptions, DEFAULT_MAX_FILE_SIZE,
 };
@@ -17,10 +19,10 @@ use ptt::core::preview::{read_verified_file_string, resolve_under_canonical_root
 use ptt::core::secrets::redact_secrets;
 use ptt::core::skeleton::{extract_skeleton, find_symbols, language_for_path, SymbolMatch};
 use ptt::core::tokenizer::{count_tokens, estimate_tokens_from_bytes, TokenizerModel};
-use ptt::core::walker::{normalize_rel_path, walk, SelectionMatcher};
-use ptt::core::workspace::WorkspaceIndex;
+use ptt::core::walker::{normalize_rel_path, SelectionMatcher};
+use ptt::core::workspace::{WorkspaceIndex, WorkspaceSnapshot};
 
-use crate::cli::{filter_entries_for_cli, parse_preset, PackArgs};
+use crate::cli::{filter_entries_for_cli_with_context, parse_preset, PackArgs};
 
 /// Files above this size are never read for skeletons or symbol search.
 const MAP_SKELETON_MAX_BYTES: u64 = 128 * 1024;
@@ -40,7 +42,25 @@ fn mcp_index_lock() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn get_or_scan_snapshot(root: &Path) -> Result<Arc<WorkspaceSnapshot>, String> {
+    let _index_guard = mcp_index_lock();
+    let index = mcp_workspace_index();
+    if let Some(current) = index.current_snapshot() {
+        if current.root == root && index.get(root, current.revision).is_ok() {
+            return Ok(current);
+        }
+    }
+    index.scan(root)
+}
+
 pub(super) fn tool_definitions() -> Value {
+    let read_only_annotations = json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+    });
+
     json!([
         {
             "name": "ptt_get_project_map",
@@ -58,7 +78,8 @@ pub(super) fn tool_definitions() -> Value {
                     }
                 },
                 "additionalProperties": false
-            }
+            },
+            "annotations": read_only_annotations
         },
         {
             "name": "ptt_pack_files",
@@ -74,6 +95,29 @@ pub(super) fn tool_definitions() -> Value {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Relative file or directory paths to pack. If omitted or empty, packs all clean files."
+                    },
+                    "pinned_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Relative file paths that must never be dropped when fitting to max_tokens."
+                    },
+                    "include": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Include only paths matching these glob patterns."
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Exclude paths matching these glob patterns."
+                    },
+                    "git_modified": {
+                        "type": "boolean",
+                        "description": "Keep only files modified in the working tree."
+                    },
+                    "git_branch": {
+                        "type": "boolean",
+                        "description": "Keep only files changed from the base branch."
                     },
                     "skeleton": {
                         "type": "boolean",
@@ -97,10 +141,20 @@ pub(super) fn tool_definitions() -> Value {
                     "git_diff": {
                         "type": "boolean",
                         "description": "Append the unified git diff as <git_diff> (default: false)."
+                    },
+                    "tokenizer": {
+                        "type": "string",
+                        "enum": ["o200k_base", "cl100k_base", "claude", "gemini"],
+                        "description": "Tokenizer model for BPE token counting (default: o200k_base)."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Optional task instructions appended inside <task_instructions> at the end of the pack."
                     }
                 },
                 "additionalProperties": false
-            }
+            },
+            "annotations": read_only_annotations
         },
         {
             "name": "ptt_get_git_context",
@@ -114,9 +168,9 @@ pub(super) fn tool_definitions() -> Value {
                     }
                 },
                 "additionalProperties": false
-            }
-        }
-        ,
+            },
+            "annotations": read_only_annotations
+        },
         {
             "name": "ptt_get_related_files",
             "description": "Returns the 1-hop imports, importers, and matching tests of one file, from the project's dependency graph.",
@@ -134,7 +188,8 @@ pub(super) fn tool_definitions() -> Value {
                 },
                 "required": ["path"],
                 "additionalProperties": false
-            }
+            },
+            "annotations": read_only_annotations
         },
         {
             "name": "ptt_search_symbols",
@@ -158,7 +213,8 @@ pub(super) fn tool_definitions() -> Value {
                 },
                 "required": ["query"],
                 "additionalProperties": false
-            }
+            },
+            "annotations": read_only_annotations
         }
     ])
 }
@@ -216,22 +272,39 @@ pub(super) fn validate_tool_arguments(tool_name: &str, args: &Value) -> Result<(
             check_known(&[
                 "directory",
                 "paths",
+                "pinned_paths",
+                "include",
+                "exclude",
+                "git_modified",
+                "git_branch",
                 "skeleton",
                 "format",
                 "preset",
                 "max_tokens",
                 "git_diff",
+                "tokenizer",
+                "prompt",
             ])?;
             check_opt_str("directory")?;
             check_opt_str_array("paths")?;
+            check_opt_str_array("pinned_paths")?;
+            check_opt_str_array("include")?;
+            check_opt_str_array("exclude")?;
+            check_opt_bool("git_modified")?;
+            check_opt_bool("git_branch")?;
             check_opt_bool("skeleton")?;
             check_opt_str("format")?;
             check_opt_str("preset")?;
             check_opt_bool("git_diff")?;
+            check_opt_str("tokenizer")?;
+            check_opt_str("prompt")?;
             if let Some(v) = obj.get("max_tokens") {
                 if !v.is_null() && v.as_u64().is_none_or(|n| n == 0) {
                     return Err("argument 'max_tokens' must be a positive integer".into());
                 }
+            }
+            if let Some(v) = obj.get("tokenizer").and_then(Value::as_str) {
+                TokenizerModel::try_parse(v)?;
             }
         }
         "ptt_get_git_context" => {
@@ -297,10 +370,20 @@ fn resolve_root(args: &Value, default_root: &Path) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+#[cfg(test)]
 pub(super) fn dispatch_tool(
     name: &str,
     args: &Value,
     default_root: &Path,
+) -> Result<String, String> {
+    dispatch_tool_cancellable(name, args, default_root, Arc::new(AtomicBool::new(false)))
+}
+
+pub(super) fn dispatch_tool_cancellable(
+    name: &str,
+    args: &Value,
+    default_root: &Path,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<String, String> {
     let root = resolve_root(args, default_root)?;
     match name {
@@ -309,8 +392,8 @@ pub(super) fn dispatch_tool(
                 .get("include_skeletons")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let entries = walk(&root).map_err(|e| e.to_string())?;
-            let files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+            let snapshot = get_or_scan_snapshot(&root)?;
+            let files: Vec<_> = snapshot.entries.iter().filter(|e| !e.is_dir).collect();
 
             let mut out = String::new();
             out.push_str(&format!(
@@ -332,12 +415,16 @@ pub(super) fn dispatch_tool(
                     .iter()
                     .filter(|f| language_for_path(&f.path) != "other")
                     .filter(|f| f.size.is_some_and(|s| s <= MAP_SKELETON_MAX_BYTES))
+                    .copied()
                     .collect();
                 candidates.sort_by_cached_key(|f| {
                     let rel = normalize_rel_path(&f.path);
                     (architectural_tier(&rel), rel)
                 });
                 for f in candidates.into_iter().take(MAP_SKELETON_MAX_FILES) {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Err("operation cancelled".into());
+                    }
                     let rel = normalize_rel_path(&f.path);
                     let lang = language_for_path(&f.path);
                     let Ok(full) = resolve_under_canonical_root(&root, &rel) else {
@@ -359,7 +446,7 @@ pub(super) fn dispatch_tool(
             Ok(out)
         }
         "ptt_pack_files" => {
-            let entries = walk(&root).map_err(|e| e.to_string())?;
+            let snapshot = get_or_scan_snapshot(&root)?;
             let requested: Vec<String> = args
                 .get("paths")
                 .and_then(Value::as_array)
@@ -371,14 +458,60 @@ pub(super) fn dispatch_tool(
                 })
                 .unwrap_or_default();
 
+            let pinned_paths: Vec<String> = args
+                .get("pinned_paths")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let pinned_set: HashSet<String> = pinned_paths
+                .iter()
+                .map(|p| normalize_rel_path(Path::new(p)))
+                .collect();
+            let include_globs = args
+                .get("include")
+                .and_then(Value::as_array)
+                .map(|patterns| {
+                    patterns
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let exclude_globs = args
+                .get("exclude")
+                .and_then(Value::as_array)
+                .map(|patterns| {
+                    patterns
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let git_modified = args
+                .get("git_modified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let git_branch = args
+                .get("git_branch")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
             let selected_entries: Vec<_> = if requested.is_empty() {
-                entries.into_iter().filter(|e| !e.is_dir).collect()
-            } else {
-                let matcher = ptt::core::walker::SelectionMatcher::new(&requested);
-                entries
-                    .into_iter()
-                    .filter(|e| !e.is_dir && matcher.is_selected(&e.path))
+                snapshot
+                    .entries
+                    .iter()
+                    .filter(|e| !e.is_dir)
+                    .cloned()
                     .collect()
+            } else {
+                snapshot.selected(&requested)
             };
 
             let skeleton = args
@@ -416,6 +549,15 @@ pub(super) fn dispatch_tool(
                 .get("git_diff")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let tokenizer_model = match args.get("tokenizer").and_then(Value::as_str) {
+                Some(s) => TokenizerModel::try_parse(s)?,
+                None => TokenizerModel::O200kBase,
+            };
+            let task_prompt = args
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty());
 
             // Same selection as `ptt pack`: preset and the heuristic budget pass first.
             let pack_args = PackArgs {
@@ -423,16 +565,35 @@ pub(super) fn dispatch_tool(
                 preset,
                 skeleton,
                 max_tokens,
+                pinned_paths,
+                include_globs,
+                exclude_globs,
+                git_modified,
+                git_branch,
+                tokenizer_model,
+                task_prompt: task_prompt.clone(),
                 ..Default::default()
             };
-            let (selected_entries, skeleton_files) =
-                filter_entries_for_cli(selected_entries, &root, &pack_args)?;
+            let (selected_entries, skeleton_files) = filter_entries_for_cli_with_context(
+                selected_entries,
+                &root,
+                &pack_args,
+                Some(&snapshot.git_context),
+                Some(snapshot.dependency_graph()),
+            )?;
 
             let computed_diff = if git_diff {
                 compute_git_diff(&root, 256 * 1024)
             } else {
                 None
             };
+
+            let modified_files = snapshot
+                .git_context
+                .modified_files
+                .iter()
+                .cloned()
+                .collect();
 
             let mut opts = WriteOptions {
                 format,
@@ -442,29 +603,47 @@ pub(super) fn dispatch_tool(
                 skeleton_all: skeleton,
                 skeleton_files,
                 git_diff: computed_diff,
-                task_prompt: None,
-                tokenizer_model: TokenizerModel::O200kBase,
+                task_prompt,
+                tokenizer_model,
                 compute_bpe_tokens: true,
+                modified_files,
             };
 
-            // The exact BPE fit runs last on the complete final options (including git_diff).
-            let selected_entries = match max_tokens {
-                Some(budget) => {
-                    let (entries, skeleton_files) =
-                        fit_to_bpe_budget(selected_entries, &root, &opts, budget)?;
-                    opts.skeleton_files = skeleton_files;
-                    entries
-                }
-                None => selected_entries,
+            let is_cancelled = {
+                let c = Arc::clone(&cancelled);
+                move || c.load(Ordering::Relaxed)
             };
 
             let mut buf = Vec::new();
-            let _ = write_output_with_stats(&mut buf, &selected_entries, &root, &opts, &|| false)
+            if let Some(budget) = max_tokens {
+                let (entries, skeleton_files, workspace) = fit_workspace_to_bpe_budget(
+                    selected_entries,
+                    &root,
+                    &opts,
+                    budget,
+                    &pinned_set,
+                    Some(snapshot.dependency_graph()),
+                    &is_cancelled,
+                )?;
+                opts.skeleton_files = skeleton_files;
+                let _ = workspace
+                    .render_with_stats(&mut buf, &entries, &opts.skeleton_files, opts.skeleton_all)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let _ = write_output_with_stats(
+                    &mut buf,
+                    &selected_entries,
+                    &root,
+                    &opts,
+                    &is_cancelled,
+                )
                 .map_err(|e| e.to_string())?;
+            }
             String::from_utf8(buf).map_err(|e| e.to_string())
         }
         "ptt_get_git_context" => {
-            let ctx = inspect_git_context(&root);
+            let snapshot = get_or_scan_snapshot(&root)?;
+            let ctx = &snapshot.git_context;
             let diff = compute_git_diff(&root, 256 * 1024).unwrap_or_default();
             let redacted_diff = redact_secrets(&diff);
             let summary = json!({
@@ -485,8 +664,7 @@ pub(super) fn dispatch_tool(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or("ptt_get_related_files requires a non-empty `path`")?;
-            let _index_guard = mcp_index_lock();
-            let snapshot = mcp_workspace_index().scan(&root)?;
+            let snapshot = get_or_scan_snapshot(&root)?;
             let normalized = normalize_rel_path(Path::new(path));
             if !snapshot
                 .entries
@@ -516,8 +694,9 @@ pub(super) fn dispatch_tool(
                 })
                 .unwrap_or_default();
             let matcher = (!requested.is_empty()).then(|| SelectionMatcher::new(&requested));
-            let entries = walk(&root).map_err(|e| e.to_string())?;
-            let mut candidates: Vec<&ptt::core::walker::DirEntryMeta> = entries
+            let snapshot = get_or_scan_snapshot(&root)?;
+            let mut candidates: Vec<&ptt::core::walker::DirEntryMeta> = snapshot
+                .entries
                 .iter()
                 .filter(|e| !e.is_dir)
                 .filter(|e| language_for_path(&e.path) != "other")
@@ -534,6 +713,9 @@ pub(super) fn dispatch_tool(
             let per_file: Vec<(String, Vec<SymbolMatch>)> = candidates
                 .par_iter()
                 .filter_map(|e| {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return None;
+                    }
                     let rel = normalize_rel_path(&e.path);
                     let lang = language_for_path(&e.path);
                     let full = resolve_under_canonical_root(&root, &rel).ok()?;
@@ -544,6 +726,10 @@ pub(super) fn dispatch_tool(
                     (!hits.is_empty()).then_some((rel, hits))
                 })
                 .collect();
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("operation cancelled".into());
+            }
 
             let mut matches = Vec::new();
             let mut truncated = false;

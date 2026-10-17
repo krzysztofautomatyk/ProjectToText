@@ -1,11 +1,13 @@
 use ptt::core::{
+    budget::fit_to_bpe_budget_with_graph,
+    deps::DependencyGraph,
     output::{write_output_with_stats, OutputFormat, WriteOptions},
     skeleton::{extract_skeleton, language_for_path},
     tokenizer::count_tokens,
-    walker::{path_is_selected, walk, DirEntryMeta, SelectionMatcher},
+    walker::{normalize_rel_path, path_is_selected, walk, DirEntryMeta, SelectionMatcher},
     workspace::WorkspaceIndex,
 };
-use std::{hint::black_box, path::Path, path::PathBuf, time::Instant};
+use std::{collections::HashSet, hint::black_box, path::Path, path::PathBuf, time::Instant};
 
 fn pack_once(entries: &[DirEntryMeta], root: &Path, opts: &WriteOptions) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -67,11 +69,19 @@ fn main() {
         times.sort_by(f64::total_cmp);
         times[times.len() / 2]
     };
+    let p95 = |times: &mut Vec<f64>| {
+        times.sort_by(f64::total_cmp);
+        let idx = ((times.len() as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(times.len() - 1);
+        times[idx]
+    };
     println!("selection: 10000 paths / 8000 exact selections, 3 repetitions");
     println!(
-        "legacy_ms={:.3}; matcher_including_build_ms={:.3}",
+        "legacy_ms={:.3}; matcher_including_build_ms={:.3}; matcher_p95_ms={:.3}",
         median(&mut old),
-        median(&mut new)
+        median(&mut new),
+        p95(&mut new)
     );
 
     // 2. Cached lookup + mtime ignore validation benchmark
@@ -107,8 +117,9 @@ fn main() {
         cached.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     println!(
-        "cached_lookup_mtime_rules_check_and_selection_ms={:.3} (5 repetitions)",
-        median(&mut cached)
+        "cached_lookup_mtime_rules_check_and_selection_ms={:.3}; p95_ms={:.3} (5 repetitions)",
+        median(&mut cached),
+        p95(&mut cached)
     );
 
     // 3. Packing throughput with realistic options (BPE counting and secret redaction on).
@@ -138,10 +149,11 @@ fn main() {
         assert_eq!(seq_buf, par_buf);
     }
     println!(
-        "pack_800_files: threads_parallel={}; sequential_1_thread_median_ms={:.3}; parallel_median_ms={:.3}",
+        "pack_800_files: threads_parallel={}; sequential_1_thread_median_ms={:.3}; parallel_median_ms={:.3}; parallel_p95_ms={:.3}",
         rayon::current_num_threads(),
         median(&mut seq_pack_ms),
-        median(&mut par_pack_ms)
+        median(&mut par_pack_ms),
+        p95(&mut par_pack_ms)
     );
 
     // 4. BPE tokenizer throughput and AST skeleton compression ratio on ptt itself.
@@ -247,9 +259,226 @@ fn main() {
         single_pass_ms.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     println!(
-        "pack_800_files_uneven: single_thread_ms={:.3}; chunked_64_ms={:.3}; single_pass_rayon_ms={:.3}",
+        "pack_800_files_uneven: single_thread_ms={:.3}; chunked_64_ms={:.3}; single_pass_rayon_ms={:.3}; single_pass_p95_ms={:.3}",
         median(&mut single_thread_ms),
         median(&mut chunked_ms),
-        median(&mut single_pass_ms)
+        median(&mut single_pass_ms),
+        p95(&mut single_pass_ms)
+    );
+
+    // 6. Context Quality Benchmark (Gold Set Recall / Precision / Token Efficiency):
+    // Compares graph-centrality-aware budget fitting (`fit_to_bpe_budget_with_graph`) against
+    // a graph-unaware baseline (`fit_to_bpe_budget_with_graph(..., None)`) across synthetic
+    // engineering tasks (bug fix, architecture review, security review, feature implementation,
+    // test generation) under a tight 1,800-token budget.
+    run_context_quality_benchmark();
+}
+
+struct GoldTask {
+    name: &'static str,
+    required: &'static [&'static str],
+    helpful: &'static [&'static str],
+    pinned: &'static [&'static str],
+    budget: usize,
+}
+
+fn run_context_quality_benchmark() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src/core")).unwrap();
+    std::fs::create_dir_all(root.join("src/adapters")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+
+    let filler = |prefix: &str, n: usize| -> String {
+        (0..n)
+            .map(|i| format!("pub fn {prefix}_fn_{i}(v: u64) -> u64 {{\n    let a = v.wrapping_add({i});\n    a ^ 0x5A5A\n}}\n"))
+            .collect()
+    };
+
+    // Core modules (heavily imported across the codebase)
+    std::fs::write(
+        root.join("src/core/auth.rs"),
+        format!(
+            "pub struct AuthToken(pub u64);\n{}",
+            filler("auth_verify", 35)
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/core/sandbox.rs"),
+        format!(
+            "pub fn check_boundary(p: &str) -> bool {{ !p.contains(\"..\") }}\n{}",
+            filler("sandbox_guard", 35)
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/core/engine.rs"),
+        format!(
+            "use crate::core::auth;\nuse crate::core::sandbox;\n{}",
+            filler("engine_step", 35)
+        ),
+    )
+    .unwrap();
+
+    // Importers of auth & sandbox
+    for (name, imports) in [
+        (
+            "src/adapters/cli.rs",
+            "use crate::core::auth;\nuse crate::core::engine;\n",
+        ),
+        (
+            "src/adapters/mcp.rs",
+            "use crate::core::auth;\nuse crate::core::sandbox;\n",
+        ),
+        (
+            "src/adapters/http.rs",
+            "use crate::core::auth;\nuse crate::core::sandbox;\nuse crate::core::engine;\n",
+        ),
+    ] {
+        std::fs::write(
+            root.join(name),
+            format!("{imports}{}", filler("adapter", 12)),
+        )
+        .unwrap();
+    }
+
+    // Isolated / peripheral source files (0 importers, larger byte size so size-only tie-break
+    // drops largest first; make isolated files slightly smaller than core files so a size-only
+    // baseline drops core files BEFORE isolated noise, whereas graph centrality keeps core files!)
+    for iso in [
+        "src/adapters/legacy_v1.rs",
+        "src/adapters/scratch_pad.rs",
+        "src/core/unused_experiment.rs",
+    ] {
+        std::fs::write(root.join(iso), filler("isolated_noise", 30)).unwrap();
+    }
+
+    // Tests and docs (low priority tier)
+    std::fs::write(
+        root.join("tests/integration_test.rs"),
+        filler("test_case", 40),
+    )
+    .unwrap();
+    std::fs::write(root.join("docs/guide.md"), "# Guide\n".repeat(120)).unwrap();
+
+    let entries: Vec<DirEntryMeta> = walk(&root)
+        .unwrap()
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .collect();
+    let graph = DependencyGraph::build(&root, &entries);
+
+    let tasks = [
+        GoldTask {
+            name: "security_review",
+            required: &["src/core/auth.rs", "src/core/sandbox.rs"],
+            helpful: &["src/core/engine.rs", "src/adapters/mcp.rs"],
+            pinned: &["src/core/sandbox.rs"],
+            budget: 3_200,
+        },
+        GoldTask {
+            name: "architecture_review",
+            required: &[
+                "src/core/auth.rs",
+                "src/core/sandbox.rs",
+                "src/core/engine.rs",
+            ],
+            helpful: &[
+                "src/adapters/cli.rs",
+                "src/adapters/mcp.rs",
+                "src/adapters/http.rs",
+            ],
+            pinned: &[],
+            budget: 3_400,
+        },
+        GoldTask {
+            name: "bug_fix_auth_flow",
+            required: &["src/core/auth.rs", "src/core/engine.rs"],
+            helpful: &["src/adapters/http.rs"],
+            pinned: &["src/core/auth.rs"],
+            budget: 3_200,
+        },
+    ];
+
+    let opts = WriteOptions {
+        format: OutputFormat::Xml,
+        compute_bpe_tokens: true,
+        ..Default::default()
+    };
+
+    let mut graph_recall_sum = 0.0;
+    let mut naive_recall_sum = 0.0;
+    let mut graph_noise_sum = 0.0;
+    let mut naive_noise_sum = 0.0;
+
+    for task in &tasks {
+        let pinned: HashSet<String> = task.pinned.iter().map(|s| (*s).to_string()).collect();
+
+        // 1. Graph-aware fit (current algorithm)
+        let (kept_graph, skel_graph) = fit_to_bpe_budget_with_graph(
+            entries.clone(),
+            &root,
+            &opts,
+            task.budget,
+            &pinned,
+            Some(&graph),
+        )
+        .unwrap();
+        let kept_graph_set: HashSet<String> = kept_graph
+            .iter()
+            .map(|e| normalize_rel_path(&e.path))
+            .collect();
+
+        // 2. Naive size/alphabetical baseline without dependency graph centrality
+        let (kept_naive, _skel_naive) =
+            fit_to_bpe_budget_with_graph(entries.clone(), &root, &opts, task.budget, &pinned, None)
+                .unwrap();
+        let kept_naive_set: HashSet<String> = kept_naive
+            .iter()
+            .map(|e| normalize_rel_path(&e.path))
+            .collect();
+
+        let req_hits_graph = task
+            .required
+            .iter()
+            .filter(|&&r| kept_graph_set.contains(r))
+            .count();
+        let req_hits_naive = task
+            .required
+            .iter()
+            .filter(|&&r| kept_naive_set.contains(r))
+            .count();
+
+        let recall_graph = req_hits_graph as f64 / task.required.len() as f64;
+        let recall_naive = req_hits_naive as f64 / task.required.len() as f64;
+
+        let is_relevant = |p: &str| task.required.contains(&p) || task.helpful.contains(&p);
+        let noise_graph = kept_graph_set.iter().filter(|p| !is_relevant(p)).count() as f64
+            / kept_graph_set.len().max(1) as f64;
+        let noise_naive = kept_naive_set.iter().filter(|p| !is_relevant(p)).count() as f64
+            / kept_naive_set.len().max(1) as f64;
+
+        graph_recall_sum += recall_graph;
+        naive_recall_sum += recall_naive;
+        graph_noise_sum += noise_graph;
+        naive_noise_sum += noise_naive;
+
+        let _ = (task.name, skel_graph);
+    }
+
+    let n = tasks.len() as f64;
+    println!(
+        "context_quality_gold_benchmark: tasks={}; graph_required_recall={:.1}%; baseline_required_recall={:.1}%; graph_noise_ratio={:.1}%; baseline_noise_ratio={:.1}%",
+        tasks.len(),
+        100.0 * graph_recall_sum / n,
+        100.0 * naive_recall_sum / n,
+        100.0 * graph_noise_sum / n,
+        100.0 * naive_noise_sum / n,
+    );
+    assert!(
+        graph_recall_sum >= naive_recall_sum,
+        "graph-aware budget fitting must not regress required-file recall vs baseline"
     );
 }

@@ -167,7 +167,13 @@ Installing a desktop app does not necessarily add `ptt` to your `PATH`. See [dev
 
 ### Context budget, skeletons, and Git
 
-- **Context budget:** choose a target window (32k, 64k, 128k, 200k, 1M, or a custom size). A progress bar shows packed tokens against it. **Top Token Consumers** lists the heaviest selected files with one-click Skeleton or Exclude actions. **Auto-Fit** deselects low-priority files (tests, fixtures, lockfiles, docs) until the selection is at most 90% of the budget. The CLI equivalent is `--max-tokens`.
+- **Intelligent context budgeting (`--max-tokens`):** choose a target window (32k, 64k, 128k, 200k, 1M, or a custom size). Budget fitting uses a single-pass in-memory `PreparedWorkspace` with `CachedRender`, avoiding redundant disk I/O and re-tokenization across iterations. It employs a two-stage degradation algorithm:
+  - **Round A (AST Skeletonization):** converts candidates to Tree-sitter AST skeletons before dropping them.
+  - **Round B (Centrality-Aware Dropping):** leverages a dependency graph (`DependencyGraph` with an $O(1)$ index covering Rust, TypeScript/JavaScript, Python, Go, and C#) so core modules with high incoming import centrality survive ahead of isolated leaf files.
+  - **File Pinning (`--pin <PATH>`):** pins critical files so budget fitting never drops them.
+  - **Top Token Consumers** lists the heaviest selected files with one-click Skeleton or Exclude actions. **Auto-Fit** fits the selection within $\le 90\%$ of the budget.
+- **Prompt Caching (KV-Cache) optimization:** output generation separates files into a stable prefix of unmodified base files followed by Git-modified files at the end of `<files>` (marked with `status="modified"` in XML/JSON or `*(modified)*` in Markdown). This maximizes prompt cache hit rates in Anthropic Claude, OpenAI, and Google Gemini.
+- **Self-Packing protection:** the engine automatically detects and omits previously generated `ptt` context artifacts across all 4 formats (XML, Markdown, JSON, and Plain Text), replacing them with `[Generated ptt context artifact skipped to prevent recursive packing]` to prevent recursive expansion.
 - **AST skeletons:** a tree-sitter pass keeps signatures, types, imports, and doc comments while removing function bodies. It covers Rust, TypeScript/TSX, JavaScript, Python, Go, C#, Java, C, and C++; other files use a brace or indentation fallback. Mark a file or folder with `[S]`. On this repository's own source, skeleton mode cut the exact token count by about 75% (see [engineering review](docs/EXPERT_REVIEW.md)).
 - **Dependency neighbors (desktop app):** from a file's context menu, select its imports, its importers, or its related tests.
 - **Git context:** tree badges mark modified, added, untracked, and deleted files. **Select Git Modified** and **Select Branch Changes** select them in one step, and **Include `<git_diff>`** adds the unified diff to the pack.
@@ -215,12 +221,14 @@ ptt pack [DIR] [OPTIONS]
 | `--no-summary` | Omit the XML file summary; other formats are unchanged | Include summary |
 | `--max-size <N>` | Maximum file size in bytes; larger files are represented by notes | `2097152` (2 MiB) |
 | `--preset <PRESET>` | `source`, `docs`, or `all` (lockfiles and `gen/schemas/` are never selected by presets) | none |
+| `--pin <PATH>` | Pin a project file so `--max-tokens` fitting never drops it; repeatable | none |
 | `--include <GLOB>` / `--exclude <GLOB>` | Keep only matching files / drop matching files; repeatable | none |
 | `--skeleton [GLOB]` | Pack all files, or files matching `GLOB`, as AST skeletons | off |
 | `--git-modified` | Select only modified, staged, and untracked files | off |
 | `--git-branch` | Select only files changed on the current branch versus its base | off |
 | `--git-diff` | Include a unified `<git_diff>` block | off |
-| `--max-tokens <N>` | Auto-fit the selection to 90% of `N` tokens | none |
+| `--max-tokens <N>` | Fit the complete serialized artifact within `N` tokens | none |
+| `--tokenizer <MODEL>` | `o200k_base`, `cl100k_base` (exact BPE), or `claude`, `gemini` (approximate scaled profiles) | `o200k_base` |
 | `--prompt <TEXT>` | Append `<task_instructions>` at the end of the pack | none |
 | `-c, --copy` | Copy the pack to the system clipboard instead of printing it | off |
 | `--no-redact` | Disable secret masking (not recommended) | redaction on |
@@ -256,15 +264,30 @@ ptt --version
 
 **Protocol compatibility:** the server negotiates MCP revisions `2025-11-25`, `2025-06-18`, and `2024-11-05` using the `initialize` handshake. It does not yet implement the stateless `2026-07-28` revision, so it does not advertise it.
 
-`ptt mcp [DIR]` runs a Model Context Protocol server (JSON-RPC 2.0 over stdio) so AI assistants can request context on demand. It exposes five tools. Every tool accepts an optional `directory`, which must stay inside the server's project root:
+`ptt mcp [DIR]` runs a Model Context Protocol server (JSON-RPC 2.0 over stdio) so AI assistants can request context on demand. Every tool call, resource, and prompt operates with cooperative cancellation and bounded concurrency (up to 16 simultaneous requests):
 
-| Tool | Returns |
-| :--- | :--- |
-| `ptt_get_project_map` | Directory tree, exact token counts per file, and skeletons of key modules. |
-| `ptt_pack_files` | A pack of the requested files, respecting `.gitignore`, `.pttignore`, and secret masking. |
-| `ptt_get_git_context` | Modified files and the current `git diff`. |
-| `ptt_get_related_files` | One file's 1-hop imports, importers, and matching tests from the dependency graph. |
-| `ptt_search_symbols` | Functions, methods, types, classes, and interfaces whose name contains a query, with exact source and line ranges. |
+### Tools (`tools/list`, `tools/call`)
+
+All tools are marked with read-only, non-destructive annotations (`readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`).
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `ptt_get_project_map` | `directory?` | Returns directory tree, exact BPE token counts per file, and skeletons of key modules. |
+| `ptt_pack_files` | `paths?`, `pinned_paths?`, `include?`, `exclude?`, `git_modified?`, `git_branch?`, `skeleton?`, `format?`, `preset?`, `max_tokens?`, `git_diff?`, `tokenizer?`, `prompt?`, `directory?` | Generates a full context pack with identical features to `ptt pack` (including budget fitting, pinned files, and secret redaction). |
+| `ptt_get_git_context` | `directory?` | Returns modified, added, staged, untracked files and the current unified `git diff`. |
+| `ptt_get_related_files` | `file`, `directory?` | Returns 1-hop imports, importers, and matching test files resolved via the internal dependency graph. |
+| `ptt_search_symbols` | `query`, `kinds?`, `limit?`, `directory?` | Locates functions, methods, types, classes, interfaces, and re-exports matching a query, with exact file paths and line ranges. |
+
+### Resources (`resources/list`, `resources/read`)
+
+- `ptt://project/map`: Real-time project map with file tree and exact BPE token weights.
+- `ptt://project/git-diff`: Current branch git status and unified diff.
+
+### Prompts (`prompts/list`, `prompts/get`)
+
+- `architecture_review`: Deep architectural review prompt focusing on maintainability and boundaries.
+- `security_audit`: Focused security and vulnerability audit prompt (OWASP, injection, auth, traversal).
+- `git_diff_review`: Code review prompt tailored specifically for git diffs and modified files.
 
 Example client configuration (Claude Desktop and Cursor accept a similar entry):
 
@@ -287,13 +310,13 @@ Packed data goes to standard output unless `-o` is set; status messages go to st
 
 ## Output formats
 
-In XML, `<directory_structure>` is alphabetical, but `<file>` contents are emitted by architectural tier: source and entrypoints first, then manifests and build configs, then tests and examples, then documentation and CI metadata. If an LLM truncates a long pack, it drops docs before code. `<git_diff>` and `<task_instructions>` come after the files.
+In XML, `<directory_structure>` is alphabetical, but `<file>` contents are emitted in an optimized architectural tier and prompt-caching layout: unmodified base files are emitted first in stable order, while Git-modified files (`status="modified"` or `*(modified)*`) are emitted at the end of `<files>`. This stable prefix layout ensures that unchanged base project context stays identical across sessions, maximizing prompt cache (KV-cache) hit rates in Anthropic Claude, OpenAI, and Google Gemini. If an LLM truncates a long pack, it drops docs before code. `<git_diff>` and `<task_instructions>` come after the files.
 
 | Format | Use it for | Structure |
 | :--- | :--- | :--- |
-| **XML** | Explicit file boundaries in structured prompts | Project metadata, directory listing, and `<file path="…">` entries with CDATA contents. |
-| **Markdown** | Human-readable handoffs and chat context | File headings followed by fenced contents. |
-| **JSON** | Automation and downstream processing | Metadata plus a `files` array with `path`, `size`, and `content`. |
+| **XML** | Explicit file boundaries in structured prompts | Project metadata, directory listing, and `<file path="…" status="modified"?>` entries with CDATA contents. |
+| **Markdown** | Human-readable handoffs and chat context | Directory structure, file headings (`## \`path\` *(modified)*`), and fenced contents. |
+| **JSON** | Automation and downstream processing | Metadata plus a `files` array with `path`, `size`, optional `status: "modified"`, and `content`. |
 | **Plain text** | Simple text-based workflows | File paths and contents separated by markers. |
 
 A shortened XML pack looks like this; metadata and the summary are omitted here for readability:
@@ -353,11 +376,11 @@ context.txt
 
 `.pttignore` uses Gitignore-style patterns. Nested files apply within their own directories; an ignored parent directory must be re-included before one of its children can be re-included. Desktop presets narrow the scanned files further; remembered exclusions are replayed when you reopen a project. Re-checking a file clears its saved exclusion.
 
-Presets never check lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, `poetry.lock`, `uv.lock`) or `gen/schemas/`. They stay visible in the tree, so you can select them by hand when you need them.
+Presets never check lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, `poetry.lock`, `uv.lock`) or `gen/schemas/` and `benchmarks/`. They stay visible in the tree, so you can select them by hand when you need them.
 
 ### Browser mode is different
 
-The browser fallback uses browser file APIs and common junk-directory filters. It does **not** run Git or implement the Rust scanner's `.gitignore` / `.pttignore` behavior. Use desktop or CLI when ignore fidelity matters.
+The browser fallback evaluates in-folder `.gitignore` and `.pttignore` rules (including nested directories, negations, parent pruning, and fail-closed `.pttignore` parsing), filters common junk directories, and caps packs at 400 files (applied after architectural tier ordering). Because it runs inside the browser sandbox without a native process, it does **not** run `git` (so tracked-file overrides, global Git ignores, and `git diff` are unavailable) and uses approximate character-based token estimates (`chars ÷ 3.8`) rather than native BPE. Use desktop or CLI when full Git and exact BPE fidelity matter.
 
 ## Privacy and safety
 
@@ -367,8 +390,9 @@ The browser fallback uses browser file APIs and common junk-directory filters. I
 | :--- | :--- |
 | Local packing | Reading files and generating context do not require an AI service or API key. |
 | Update checks | Desktop release builds contact GitHub for update metadata and, when requested, artifacts. Local packing does not mean the entire app is network-free. |
-| File handling | The Rust packer checks path components and canonical root containment, rejects links/reparse points, and replaces binary or oversized contents with notes. These checks are not a race-proof sandbox against concurrent filesystem mutation. |
-| Secret masking | Packed output (desktop, CLI and browser mode, all formats) replaces recognizable credentials with `[REDACTED: <KIND>]`: provider tokens (AWS, Anthropic, OpenAI, Google, Stripe, GitHub, Slack), PEM private key blocks, URL basic-auth passwords, `Password=` / `*_PASSWORD=` values, and `*_SECRET`, `*_TOKEN`, `*_API_KEY`, and `*_PRIVATE_KEY` assignments in `.env` style. Documentation placeholders such as `Password=...` are left alone. This is **best-effort**: secrets without a recognizable shape are not detected, and ignore rules and presets do not redact anything. Use `--no-redact` only for packs you will never share. Review the pack before sharing. |
+| File handling & TOCTOU | The Rust packer checks path components and canonical root containment, rejects symlinks and reparse points, verifies `dev/ino` inodes after opening regular files to eliminate TOCTOU race conditions, and replaces binary or oversized contents with explanatory notes. |
+| Secret masking | Packed output (desktop, CLI, MCP server, and browser mode, all formats) scans contents via a high-performance DFA `RegexSet` covering 21 cloud provider token patterns (AWS, Anthropic, OpenAI, Google, Stripe, GitHub, GitLab, Slack, Hugging Face, npm, Azure Storage Account Keys, SendGrid, Discord), JWTs, PEM private key blocks, URL basic-auth passwords, `Password=` / `*_PASSWORD=` values, `*_SECRET`, `*_TOKEN`, `*_API_KEY`, and `*_PRIVATE_KEY` assignments in `.env` style, and high-entropy secret assignments ($H > 4.5$ bits/char for literals $\ge 32$ chars with placeholder avoidance). Documentation placeholders such as `Password=...` are preserved. |
+| Self-packing protection | Automatic detection of prior `ptt` context artifacts across all 4 formats (XML, Markdown, JSON, Plain), preventing recursive packing blowup. |
 | Context limits | Token counts are exact for `o200k_base` and `cl100k_base`, and approximate for the Claude and Gemini profiles. The context budget (`--max-tokens` or the desktop budget bar) plans a selection against a window size, but the 2 MiB file limit is per file, not per pack. |
 
 Review both the selection and the generated pack before sharing. Treat source files as untrusted context, not instructions for an assistant to execute.
@@ -381,7 +405,7 @@ For vulnerability reporting, see the [security policy](SECURITY.md). OS signing/
 
 | Requirement | Notes |
 | :--- | :--- |
-| **Rust + Cargo** | Use a current stable toolchain from [rustup](https://rustup.rs/). The package declares Rust 1.90 as its minimum, the highest minimum among its resolved dependencies. CI builds with the current `stable` toolchain, so 1.90 itself is not exercised in CI. |
+| **Rust + Cargo** | Use a current stable toolchain from [rustup](https://rustup.rs/). The package declares Rust 1.90 as its minimum, the highest minimum among its resolved dependencies. CI exercises both `stable` (Linux, macOS, Windows) and a dedicated `1.90.0` MSRV check job. |
 | **Node.js + npm** | Node **22.12+** or a newer supported LTS; Node 24 is a suitable choice for the current toolchain. |
 | **Git** | Required to clone; also enables the native Git scanning path. |
 | **Tauri system dependencies** | Follow the [platform prerequisites](https://v2.tauri.app/start/prerequisites/) for macOS, Windows, or Linux. |
@@ -410,7 +434,7 @@ Open the local URL printed by Vite. This is a development fallback, not a hosted
 
 | Capability | Desktop | CLI | Browser fallback |
 | :--- | :---: | :---: | :---: |
-| Git-aware scan and `.pttignore` | Yes | Yes | No |
+| Git-aware scan and `.pttignore` | Yes | Yes | In-folder `.gitignore` / `.pttignore` only (no Git CLI) |
 | Visual selection and previews | Yes | No | Yes |
 | XML / Markdown / JSON / plain output | Yes | Yes | Yes |
 | Native editor actions | Yes | No | No |
@@ -500,7 +524,7 @@ No. It prepares context files. You choose the assistant or tool and send the out
 <details>
 <summary><strong>Does it work outside a Git repository?</strong></summary>
 
-Yes. Desktop and CLI fall back to the Rust `ignore` crate. The browser UI uses browser file APIs instead and does not offer equivalent ignore behavior.
+Yes. Desktop and CLI fall back to the Rust `ignore` crate. The browser UI parses in-folder `.gitignore` and `.pttignore` files directly, though it does not spawn `git` or read global Git ignore files.
 
 </details>
 

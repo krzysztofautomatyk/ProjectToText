@@ -1,0 +1,124 @@
+[
+  {
+    "path": "all-clean-32k.xml",
+    "sha256": "a2568be223a34897d321d8ca9e68d88d4dc00c3ed733ef31600947790d2d5dd6",
+    "bytes": 105754,
+    "file_count": 21,
+    "paths": [
+      "src/cli.rs",
+      "src/core/git.rs",
+      "src/core/mod.rs",
+      "src/core/preview.rs",
+      "src/core/secrets.rs",
+      "src/core/text.rs",
+      "src/core/tokenizer.rs",
+      "src/core/walker.rs",
+      "ui/src/FileViewer.tsx",
+      "ui/src/Panels.tsx",
+      "ui/src/browserFs.ts",
+      "ui/src/folderHistory.ts",
+      "ui/src/index.css",
+      "ui/src/platform.ts",
+      "ui/src/projectPrefs.ts",
+      "ui/src/secrets.ts",
+      "ui/src/tauriEnv.ts",
+      "ui/src/treeModel.ts",
+      "ui/src/useGeneration.ts",
+      "ui/src/useWorkspace.tsx",
+      "ui/src/version.ts"
+    ]
+  },
+  {
+    "path": "all-clean-8k.xml",
+    "sha256": "ff86d4d052c21b3466f09c5d6e8dae11f1e9f3bcbbcb9dfb301574d7d3c3fea7",
+    "bytes": 29008,
+    "file_count": 8,
+    "paths": [
+      "src/core/mod.rs",
+      "src/core/preview.rs",
+      "src/core/walker.rs",
+      "ui/src/platform.ts",
+      "ui/src/projectPrefs.ts",
+      "ui/src/secrets.ts",
+      "ui/src/treeModel.ts",
+      "ui/src/useWorkspace.tsx"
+    ]
+  },
+  {
+    "path": "budget-regression-32k.xml",
+    "sha256": "1aaa52de2a5bf3c502af029ab6bdc2c32da48c8bda47fe560c0f58f1187b5277",
+    "bytes": 115125,
+    "file_count": 3,
+    "paths": [
+      "src/cli.rs",
+      "src/core/budget.rs",
+      "src/core/output.rs"
+    ]
+  },
+  {
+    "path": "ignore-parity-32k.xml",
+    "sha256": "aa0d6bc7a0ff911b9c618e7347bbcb76032c1185931a59ff8d067ccc1fab91bb",
+    "bytes": 68351,
+    "file_count": 3,
+    "paths": [
+      "src/core/walker.rs",
+      "ui/src/browserFs.ts",
+      "ui/e2e/smoke.spec.ts"
+    ]
+  },
+  {
+    "path": "path-safety-32k.xml",
+    "sha256": "74cb711dcab5fbade3abaf501dbe0bc6c90ba9fadc0599cdda4d1c2f7c529dc2",
+    "bytes": 64160,
+    "file_count": 3,
+    "paths": [
+      "src/core/preview.rs",
+      "src/mcp/tests.rs",
+      "src/mcp/tools.rs"
+    ]
+  },
+  {
+    "path": "source-32k.xml",
+    "sha256": "c6852c4616f4d76d506b286055b39be9ed330f1ea08f3d6cdbc22d7115bb2f59",
+    "bytes": 99089,
+    "file_count": 20,
+    "paths": [
+      "src/core/git.rs",
+      "src/core/mod.rs",
+      "src/core/preview.rs",
+      "src/core/secrets.rs",
+      "src/core/text.rs",
+      "src/core/tokenizer.rs",
+      "src/core/walker.rs",
+      "ui/src/FileViewer.tsx",
+      "ui/src/Panels.tsx",
+      "ui/src/browserFs.ts",
+      "ui/src/folderHistory.ts",
+      "ui/src/index.css",
+      "ui/src/platform.ts",
+      "ui/src/projectPrefs.ts",
+      "ui/src/secrets.ts",
+      "ui/src/tauriEnv.ts",
+      "ui/src/treeModel.ts",
+      "ui/src/useGeneration.ts",
+      "ui/src/useWorkspace.tsx",
+      "ui/src/version.ts"
+    ]
+  },
+  {
+    "path": "source-8k.xml",
+    "sha256": "ff86d4d052c21b3466f09c5d6e8dae11f1e9f3bcbbcb9dfb301574d7d3c3fea7",
+    "bytes": 29008,
+    "file_count": 8,
+    "paths": [
+      "src/core/mod.rs",
+      "src/core/preview.rs",
+      "src/core/walker.rs",
+      "ui/src/platform.ts",
+      "ui/src/projectPrefs.ts",
+      "ui/src/secrets.ts",
+      "ui/src/treeModel.ts",
+      "ui/src/useWorkspace.tsx"
+    ]
+  }
+]

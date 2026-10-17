@@ -61,6 +61,10 @@ fn every_advertised_tool_answers_over_stdio_with_a_clean_protocol_stream() {
         requests.push(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
             "params": {"name": name, "arguments": arguments}}));
     }
+    requests.push(json!({"jsonrpc": "2.0", "id": 8, "method": "resources/list", "params": {}}));
+    requests.push(json!({"jsonrpc": "2.0", "id": 9, "method": "resources/read", "params": {"uri": "ptt://project/map"}}));
+    requests.push(json!({"jsonrpc": "2.0", "id": 10, "method": "prompts/list", "params": {}}));
+    requests.push(json!({"jsonrpc": "2.0", "id": 11, "method": "prompts/get", "params": {"name": "architecture_review", "arguments": {"focus_path": "src/lib.rs"}}}));
     {
         let stdin = child.stdin.as_mut().unwrap();
         for request in &requests {
@@ -89,7 +93,7 @@ fn every_advertised_tool_answers_over_stdio_with_a_clean_protocol_stream() {
         })
         .collect();
     // One reply per request; the `notifications/initialized` notification gets none.
-    assert_eq!(responses.len(), 7, "unexpected reply count:\n{stdout}");
+    assert_eq!(responses.len(), 11, "unexpected reply count:\n{stdout}");
     let reply_for = |id: u64| {
         responses
             .iter()
@@ -142,4 +146,25 @@ fn every_advertised_tool_answers_over_stdio_with_a_clean_protocol_stream() {
         git.get("isGitRepo").is_some(),
         "git context lacks isGitRepo: {git}"
     );
+
+    // Resources and prompts checks over stdio
+    assert_eq!(
+        reply_for(8)["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(reply_for(9)["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Project Map"));
+    assert_eq!(
+        reply_for(10)["result"]["prompts"].as_array().unwrap().len(),
+        3
+    );
+    assert!(reply_for(11)["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("entry_point"));
 }

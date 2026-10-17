@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "snapshot": {
+    "base_commit": "fff6120ab82c533374a1869677edd59f4c834f2b",
+    "tracked_patch_sha256": "9e5a880fba9240c6672830c86ba588234c663a3ea2570785eb4bafd6463c911b",
+    "tracked_patch_bytes": 227867,
+    "tree_id": "46bd9734d03df2d13d1bc1a5569cda34127a2bf4",
+    "untracked_exclusions": ["deny.toml", "docs/PRODUCT_STRATEGY_LLM_BRIEF.md"]
+  },
+  "environment": {
+    "os": "macOS 27.0.0 original benchmark run; 27.0.1 on resumed verification",
+    "cpu": "Apple M4 Pro arm64",
+    "logical_processors": 14,
+    "rustc": "1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo": "1.97.1 (c980f4866 2026-06-30)",
+    "node": "v24.3.0 verification environment",
+    "npm": "11.16.0 verification environment",
+    "python": "3.9.6",
+    "tokenizer_library": "tiktoken-rs 0.11.0",
+    "tokenizer_model": "o200k_base"
+  },
+  "tools": {
+    "projecttotext": {
+      "version": "0.8.1",
+      "build": "cargo build --release --locked --bin ptt --example selection_benchmark",
+      "cli_args": "--tokenizer o200k_base --max-tokens 8000 or 32000"
+    },
+    "repomix": {
+      "version": "1.18.1",
+      "invocation": "npx --yes repomix@1.18.1",
+      "executed": true
+    },
+    "aider_chat": {
+      "version": "0.86.2 intended",
+      "executed": false,
+      "reason": "launcher Python missing; requirement Python >=3.10,<3.13; Python 3.13.11 import failure (audioop/pyaudioop)"
+    },
+    "ollama": {
+      "version": "0.30.11",
+      "executed": false,
+      "reason": "no local models installed"
+    },
+    "code2prompt": {"executed": false},
+    "gitingest": {"executed": false},
+    "repoprompt_ce": {"executed": false}
+  },
+  "corpus": {
+    "benchmark_mode": "fixed relevant-file packs; not selection-quality evaluation",
+    "tasks_file": "tasks.jsonl",
+    "task_fixture_files_each": 3,
+    "source_corpus": {"files": 51, "bytes": 732042, "o200k_base_tokens": 175470},
+    "synthetic_context_fixture_tasks": 3,
+    "synthetic_context_fixture_budget_tokens": [3200, 3400]
+  },
+  "constraints": {
+    "remote_models": false,
+    "source_uploaded_to_hosted_model": false,
+    "platforms_tested": ["macOS arm64"],
+    "timing_protocol": "single-host local, no CPU isolation; timing samples descriptive only",
+    "gold_file_labels_independently_reviewed": false,
+    "line_span_gold": false,
+    "repomix_output_retokenized_with_common_encoder": false,
+    "aider_map_available": false
+  }
+}

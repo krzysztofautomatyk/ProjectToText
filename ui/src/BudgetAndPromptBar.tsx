@@ -35,29 +35,103 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
               aria-label="Custom token budget"
             />
           )}
-          <div className="budget-meter-wrap">
-            <div className="budget-track" role="progressbar" aria-valuenow={stats.tokens} aria-valuemax={targetBudgetTokens}>
-              <div
-                className={[
-                  'budget-fill',
-                  stats.tokens > targetBudgetTokens
-                    ? 'is-over'
-                    : stats.tokens > targetBudgetTokens * 0.85
-                      ? 'is-warn'
-                      : '',
-                ]
-                  .filter(Boolean)
-                  .join(' ')}
-                style={{
-                  width: `${Math.min(100, Math.round((stats.tokens / Math.max(1, targetBudgetTokens)) * 100))}%`,
-                }}
-              />
-            </div>
-            <span className="budget-label" data-testid="budget-progress-label">
-              {formatTokens(stats.tokens)} / {formatTokens(targetBudgetTokens)} tokens (
-              {Math.round((stats.tokens / Math.max(1, targetBudgetTokens)) * 100)}%)
-            </span>
-          </div>
+          {(() => {
+            const fullTokens = ws.fileTokens
+              .filter((f) => f.mode === 'full')
+              .reduce((sum, f) => sum + f.tokens, 0);
+            const skeletonTokens = ws.fileTokens
+              .filter((f) => f.mode === 'skeleton')
+              .reduce((sum, f) => sum + f.tokens, 0);
+            const totalContentTokens = ws.stats.contentTokens ?? (fullTokens + skeletonTokens);
+            const overheadTokens = ws.stats.overheadTokens ?? Math.max(0, ws.stats.tokens - totalContentTokens);
+
+            const budgetMax = Math.max(1, targetBudgetTokens);
+            const fullPct = Math.min(100, (fullTokens / budgetMax) * 100);
+            const skeletonPct = Math.min(100 - fullPct, (skeletonTokens / budgetMax) * 100);
+            const overheadPct = Math.min(100 - fullPct - skeletonPct, (overheadTokens / budgetMax) * 100);
+            const totalPct = Math.min(100, Math.round((stats.tokens / budgetMax) * 100));
+
+            return (
+              <div className="budget-meter-wrap">
+                <div
+                  className="budget-track"
+                  role="progressbar"
+                  aria-valuenow={stats.tokens}
+                  aria-valuemax={targetBudgetTokens}
+                  style={{ display: 'flex', overflow: 'hidden' }}
+                >
+                  {fullTokens > 0 && (
+                    <div
+                      className="budget-segment budget-segment-full"
+                      title={`Full Content: ${formatTokens(fullTokens)} tokens (${Math.round((fullTokens / Math.max(1, stats.tokens)) * 100)}%)`}
+                      style={{
+                        width: `${fullPct}%`,
+                        height: '100%',
+                        backgroundColor: 'var(--color-accent, #38bdf8)',
+                        transition: 'width 0.2s ease',
+                      }}
+                    />
+                  )}
+                  {skeletonTokens > 0 && (
+                    <div
+                      className="budget-segment budget-segment-skeleton"
+                      title={`AST Skeletons: ${formatTokens(skeletonTokens)} tokens (${Math.round((skeletonTokens / Math.max(1, stats.tokens)) * 100)}%)`}
+                      style={{
+                        width: `${skeletonPct}%`,
+                        height: '100%',
+                        backgroundColor: 'var(--color-skeleton, #a78bfa)',
+                        transition: 'width 0.2s ease',
+                      }}
+                    />
+                  )}
+                  {overheadTokens > 0 && (
+                    <div
+                      className="budget-segment budget-segment-overhead"
+                      title={`Wrapper/Diff/Prompt Overhead: ${formatTokens(overheadTokens)} tokens (${Math.round((overheadTokens / Math.max(1, stats.tokens)) * 100)}%)`}
+                      style={{
+                        width: `${overheadPct}%`,
+                        height: '100%',
+                        backgroundColor: 'var(--color-overhead, #94a3b8)',
+                        transition: 'width 0.2s ease',
+                      }}
+                    />
+                  )}
+                  {fullTokens === 0 && skeletonTokens === 0 && stats.tokens > 0 && (
+                    <div
+                      className={[
+                        'budget-fill',
+                        stats.tokens > targetBudgetTokens
+                          ? 'is-over'
+                          : stats.tokens > targetBudgetTokens * 0.85
+                            ? 'is-warn'
+                            : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ')}
+                      style={{ width: `${totalPct}%` }}
+                    />
+                  )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                  <span className="budget-label" data-testid="budget-progress-label">
+                    {stats.tokenizerExact === false ? '~' : ''}{formatTokens(stats.tokens)} / {formatTokens(targetBudgetTokens)} tokens ({totalPct}%)
+                  </span>
+                  {stats.tokens > 0 && (
+                    <span className="budget-breakdown-chips" data-testid="budget-breakdown-chips" style={{ fontSize: '10px', opacity: 0.75, display: 'flex', gap: '6px' }}>
+                      <span data-testid="budget-chip-content" title={`Content tokens (full + skeletons)${stats.tokenizerExact === false ? ' (approximate)' : ''}`}>
+                        Content: {stats.tokenizerExact === false ? '~' : ''}{formatTokens(totalContentTokens)}
+                      </span>
+                      {overheadTokens > 0 && (
+                        <span data-testid="budget-chip-overhead" title={`Wrapper, Diff & Task Prompt overhead tokens${stats.tokenizerExact === false ? ' (approximate)' : ''}`}>
+                          Overhead: {stats.tokenizerExact === false ? '~' : ''}{formatTokens(overheadTokens)}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
 
           <button
             type="button"

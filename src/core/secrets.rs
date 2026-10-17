@@ -69,140 +69,197 @@ impl RedactionSummary {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum RuleAction {
+    Simple,
+    PlaceholderAware,
+    HighEntropy,
+}
+
 struct Rule {
     kind: &'static str,
     pattern: Regex,
     replacement: &'static str,
-    /// When true, the captured value (group 2) is skipped if it is a documented placeholder.
-    placeholder_aware: bool,
+    action: RuleAction,
 }
 
 fn rules() -> &'static [Rule] {
     static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
     RULES.get_or_init(|| {
-        let raw: [(&str, &str, &str, bool); 17] = [
+        let raw: [(&str, &str, &str, RuleAction); 21] = [
             (
                 "PRIVATE_KEY",
                 r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=:, \t\r\n-]+?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
                 "[REDACTED: PRIVATE_KEY]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "AWS_ACCESS_KEY",
                 r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
                 "[REDACTED: AWS_ACCESS_KEY]",
-                false,
+                RuleAction::Simple,
             ),
             // Anthropic must run before generic sk- OpenAI rule
             (
                 "ANTHROPIC_API_KEY",
                 r"\bsk-ant-[A-Za-z0-9_-]{20,}\b",
                 "[REDACTED: ANTHROPIC_API_KEY]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "OPENAI_API_KEY",
                 r"\bsk-[A-Za-z0-9_-]{20,}",
                 "[REDACTED: OPENAI_API_KEY]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "GOOGLE_API_KEY",
                 r"\bAIza[0-9A-Za-z_-]{35}\b",
                 "[REDACTED: GOOGLE_API_KEY]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "STRIPE_KEY",
                 r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{20,}\b",
                 "[REDACTED: STRIPE_KEY]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "GITHUB_TOKEN",
                 r"\bgh[pousr]_[A-Za-z0-9]{36,}\b",
                 "[REDACTED: GITHUB_TOKEN]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "GITHUB_TOKEN",
                 r"\bgithub_pat_[A-Za-z0-9_]{22,}\b",
                 "[REDACTED: GITHUB_TOKEN]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "SLACK_TOKEN",
                 r"\bxox[abposr]-[A-Za-z0-9-]{10,}",
                 "[REDACTED: SLACK_TOKEN]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "GITLAB_TOKEN",
                 r"\bglpat-[0-9A-Za-z_-]{20,}\b",
                 "[REDACTED: GITLAB_TOKEN]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "HUGGINGFACE_TOKEN",
                 r"\bhf_[A-Za-z0-9]{34,}\b",
                 "[REDACTED: HUGGINGFACE_TOKEN]",
-                false,
+                RuleAction::Simple,
             ),
             (
                 "NPM_TOKEN",
                 r"\bnpm_[A-Za-z0-9]{36}\b",
                 "[REDACTED: NPM_TOKEN]",
-                false,
+                RuleAction::Simple,
             ),
             // Three base64url segments, the first two starting with `eyJ` (JSON `{"`).
             (
                 "JWT_TOKEN",
                 r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
                 "[REDACTED: JWT_TOKEN]",
-                false,
+                RuleAction::Simple,
             ),
             // URL basic-auth credentials: scheme `://` user `:` password `@` host
             (
                 "URL_PASSWORD",
                 r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:)[^@\s\x22'`\[][^@\s\x22'`]*(@)",
                 "${1}[REDACTED: URL_PASSWORD]${2}",
-                false,
+                RuleAction::Simple,
             ),
             // Connection strings: `Password=x` as a `;`, brace, comma or whitespace delimited pair.
-            // Requires `=` directly after the key, so `password = hash(raw)` in code is left alone.
-            // The first value char cannot be `=` (protects `password==expected`), and the value
-            // also ends at backtick, `)`, `&` or `}` so Markdown and call syntax survive.
-            // `[` is excluded from the first char so `[REDACTED: ...]` stays idempotent.
             (
                 "PASSWORD",
                 r"(?i)((?:^|[\s;{,])(?:password|pwd)=)([^=;\s\x22'<>`)&}\[][^;\s\x22'<>`)&}]*)",
                 "${1}[REDACTED: PASSWORD]",
-                true,
+                RuleAction::PlaceholderAware,
             ),
             // .env / shell style: an UPPER_CASE `*_PASSWORD=` or `*_PWD=` assignment at line start.
             (
                 "PASSWORD",
                 r"(?m)^((?:export[ \t]+)?[A-Z][A-Z0-9_]*(?:PASSWORD|PWD)=)([^=;\s\x22'<>`)&}\[][^;\s\x22'<>`)&}]*)",
                 "${1}[REDACTED: PASSWORD]",
-                true,
+                RuleAction::PlaceholderAware,
             ),
             // Generic .env assignments for *_SECRET, *_TOKEN, *_API_KEY, *_PRIVATE_KEY at line start.
             (
                 "ENV_SECRET",
                 r"(?m)^((?:export[ \t]+)?[A-Z][A-Z0-9_]*_(?:SECRET|TOKEN|API_KEY|PRIVATE_KEY)=)([^\r\n#;]+)",
                 "${1}[REDACTED: ENV_SECRET]",
-                true,
+                RuleAction::PlaceholderAware,
+            ),
+            // Azure Storage Account Keys / Connection Strings
+            (
+                "AZURE_KEY",
+                r"(?i)(AccountKey=)[A-Za-z0-9+/=]{40,}",
+                "${1}[REDACTED: AZURE_KEY]",
+                RuleAction::Simple,
+            ),
+            // SendGrid API Keys
+            (
+                "SENDGRID_KEY",
+                r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b",
+                "[REDACTED: SENDGRID_KEY]",
+                RuleAction::Simple,
+            ),
+            // Discord Bot Tokens
+            (
+                "DISCORD_TOKEN",
+                r"\b[MN][A-Za-z0-9]{23,25}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}\b",
+                "[REDACTED: DISCORD_TOKEN]",
+                RuleAction::Simple,
+            ),
+            // High-entropy assignments (Shannon entropy H > 4.5 bits/char for literals >= 32 chars)
+            (
+                "HIGH_ENTROPY_SECRET",
+                r#"(?i)((?:^|[\s,;{(])(?:[a-zA-Z0-9_'"-]*?(?:key|auth|cred|bearer|cert)[a-zA-Z0-9_'"-]*)\s*[:=]\s*["']?)([^"'\s;,\r\n]{32,})(["']?)"#,
+                "[REDACTED: HIGH_ENTROPY_SECRET]",
+                RuleAction::HighEntropy,
             ),
         ];
         raw.iter()
-            .map(|(kind, pattern, replacement, placeholder_aware)| Rule {
+            .map(|(kind, pattern, replacement, action)| Rule {
                 kind,
                 pattern: Regex::new(pattern).expect("secret pattern must be valid"),
                 replacement,
-                placeholder_aware: *placeholder_aware,
+                action: *action,
             })
             .collect()
     })
+}
+
+fn rule_set() -> &'static regex::RegexSet {
+    static SET: OnceLock<regex::RegexSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        regex::RegexSet::new(rules().iter().map(|r| r.pattern.as_str())).expect("valid regex set")
+    })
+}
+
+/// Calculates Shannon entropy H in bits/char for byte distribution.
+pub fn shannon_entropy(s: &str) -> f64 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut freq = [0usize; 256];
+    for &b in s.as_bytes() {
+        freq[b as usize] += 1;
+    }
+    let len = s.len() as f64;
+    let mut h = 0.0;
+    for &count in &freq {
+        if count > 0 {
+            let p = count as f64 / len;
+            h -= p * p.log2();
+        }
+    }
+    h
 }
 
 fn is_env_placeholder(raw_val: &str) -> bool {
@@ -240,41 +297,70 @@ fn is_env_placeholder(raw_val: &str) -> bool {
 /// Returns `text` with every recognized credential replaced by `[REDACTED: <KIND>]`,
 /// along with a [`RedactionSummary`] detailing how many secrets were masked per kind.
 pub fn redact_secrets_with_report(text: &str) -> (Cow<'_, str>, RedactionSummary) {
-    let mut out = Cow::Borrowed(text);
     let mut summary = RedactionSummary::default();
+    let matches = rule_set().matches(text);
+    if !matches.matched_any() {
+        return (Cow::Borrowed(text), summary);
+    }
 
-    for rule in rules() {
-        if !rule.pattern.is_match(&out) {
-            continue;
-        }
-        if rule.placeholder_aware {
-            let mut count = 0usize;
-            let replaced = rule
-                .pattern
-                .replace_all(&out, |caps: &Captures<'_>| {
-                    let prefix = &caps[1];
-                    let val = &caps[2];
-                    if is_env_placeholder(val) {
-                        caps[0].to_string()
-                    } else {
-                        count += 1;
-                        format!("{prefix}[REDACTED: {}]", rule.kind)
-                    }
-                })
-                .into_owned();
-            if count > 0 {
-                out = Cow::Owned(replaced);
-                summary.record(rule.kind, count);
-            }
-        } else {
-            let count = rule.pattern.find_iter(&out).count();
-            if count > 0 {
+    let mut out = Cow::Borrowed(text);
+    let all_rules = rules();
+
+    for rule_idx in matches.iter() {
+        let rule = &all_rules[rule_idx];
+        match rule.action {
+            RuleAction::PlaceholderAware => {
+                let mut count = 0usize;
                 let replaced = rule
                     .pattern
-                    .replace_all(&out, rule.replacement)
+                    .replace_all(&out, |caps: &Captures<'_>| {
+                        let prefix = &caps[1];
+                        let val = &caps[2];
+                        if is_env_placeholder(val) {
+                            caps[0].to_string()
+                        } else {
+                            count += 1;
+                            format!("{prefix}[REDACTED: {}]", rule.kind)
+                        }
+                    })
                     .into_owned();
-                out = Cow::Owned(replaced);
-                summary.record(rule.kind, count);
+                if count > 0 {
+                    out = Cow::Owned(replaced);
+                    summary.record(rule.kind, count);
+                }
+            }
+            RuleAction::Simple => {
+                let count = rule.pattern.find_iter(&out).count();
+                if count > 0 {
+                    let replaced = rule
+                        .pattern
+                        .replace_all(&out, rule.replacement)
+                        .into_owned();
+                    out = Cow::Owned(replaced);
+                    summary.record(rule.kind, count);
+                }
+            }
+            RuleAction::HighEntropy => {
+                let mut count = 0usize;
+                let replaced = rule
+                    .pattern
+                    .replace_all(&out, |caps: &Captures<'_>| {
+                        let prefix = &caps[1];
+                        let val = &caps[2];
+                        let suffix = caps.get(3).map_or("", |m| m.as_str());
+                        if !is_env_placeholder(val) && val.len() >= 32 && shannon_entropy(val) > 4.5
+                        {
+                            count += 1;
+                            format!("{prefix}[REDACTED: {}]{suffix}", rule.kind)
+                        } else {
+                            caps[0].to_string()
+                        }
+                    })
+                    .into_owned();
+                if count > 0 {
+                    out = Cow::Owned(replaced);
+                    summary.record(rule.kind, count);
+                }
             }
         }
     }
@@ -498,5 +584,59 @@ mod tests {
             "adversarial redaction took {} ms",
             elapsed.as_millis()
         );
+    }
+
+    #[test]
+    fn masks_azure_storage_key() {
+        let key = concat!(
+            "AccountKey=",
+            "4kF7+s9ZbQ2mN8xL1vP0wR5tY6uI3oE8aBcDeFgHiJk="
+        );
+        let conn = format!(
+            "DefaultEndpointsProtocol=https;AccountName=test;{key};EndpointSuffix=core.windows.net"
+        );
+        let (redacted, summary) = redact_secrets_with_report(&conn);
+        assert_eq!(
+            redacted,
+            "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=[REDACTED: AZURE_KEY];EndpointSuffix=core.windows.net"
+        );
+        assert_eq!(summary.total_redactions, 1);
+        assert_eq!(summary.kinds, vec![("AZURE_KEY".to_string(), 1)]);
+    }
+
+    #[test]
+    fn masks_sendgrid_and_discord_tokens() {
+        let sendgrid = concat!(
+            "SG.",
+            "1234567890123456789012",
+            ".",
+            "1234567890123456789012345678901234567890123"
+        );
+        let discord = concat!(
+            "MTAw",
+            "MDAwMDAwMDAwMDAwMDAwMA.G12345.123456789012345678901234567"
+        );
+        let input = format!("sendgrid: {sendgrid}\ndiscord: {discord}\n");
+        let (redacted, summary) = redact_secrets_with_report(&input);
+        assert!(redacted.contains("sendgrid: [REDACTED: SENDGRID_KEY]"));
+        assert!(redacted.contains("discord: [REDACTED: DISCORD_TOKEN]"));
+        assert_eq!(summary.total_redactions, 2);
+    }
+
+    #[test]
+    fn masks_high_entropy_assignments_and_leaves_low_entropy() {
+        // High entropy key: 32 chars of random base64 (H > 4.5)
+        let high_entropy = concat!("api_key: \"", "4kF7+s9ZbQ2mN8xL1vP0wR5tY6uI3oE=", "\"");
+        // Low entropy assignment: 32 chars of repeated/predictable chars (H < 4.0)
+        let low_entropy = "auth_token: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+        let input = format!("{high_entropy}\n{low_entropy}\n");
+        let (redacted, summary) = redact_secrets_with_report(&input);
+        assert!(
+            redacted.contains("api_key: \"[REDACTED: HIGH_ENTROPY_SECRET]\""),
+            "{redacted}"
+        );
+        assert!(redacted.contains(low_entropy), "{redacted}");
+        assert_eq!(summary.total_redactions, 1);
+        assert_eq!(summary.kinds, vec![("HIGH_ENTROPY_SECRET".to_string(), 1)]);
     }
 }
