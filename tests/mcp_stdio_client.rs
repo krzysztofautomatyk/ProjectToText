@@ -161,7 +161,7 @@ fn every_advertised_tool_answers_over_stdio_with_a_clean_protocol_stream() {
         .contains("Project Map"));
     assert_eq!(
         reply_for(10)["result"]["prompts"].as_array().unwrap().len(),
-        3
+        5
     );
     assert!(reply_for(11)["result"]["messages"][0]["content"]["text"]
         .as_str()

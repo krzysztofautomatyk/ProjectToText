@@ -14,6 +14,7 @@ use ptt::core::git::{compute_git_diff, inspect_git_context, GitRepoContext};
 use ptt::core::output::{
     write_output_with_stats, OutputFormat, PreparedWorkspace, WriteOptions, DEFAULT_MAX_FILE_SIZE,
 };
+use ptt::core::task_presets::merge_prompt_and_preset;
 use ptt::core::tokenizer::TokenizerModel;
 use ptt::core::walker::{
     is_default_excluded_path, is_junk_dir_name, normalize_rel_path, walk, DirEntryMeta,
@@ -48,6 +49,8 @@ OPTIONS:
       --no-summary        Omit XML file summary (directory listing remains)
       --max-size <N>      Per-file size limit in bytes (default: 2097152)
       --prompt <TEXT>     Append <task_instructions> prompt at the end of the pack
+      --task-preset <ID>  Built-in playbook when --prompt is omitted
+                          (architecture_audit|bug_hunt|security_review|pr_diff_review|test_generation)
   -h, --help              Show this help
 
 EXAMPLES:
@@ -86,6 +89,7 @@ pub struct PackArgs {
     pub tokenizer_model: TokenizerModel,
     pub redact_secrets: bool,
     pub task_prompt: Option<String>,
+    pub task_preset: Option<String>,
 }
 
 impl Default for PackArgs {
@@ -110,6 +114,7 @@ impl Default for PackArgs {
             tokenizer_model: TokenizerModel::O200kBase,
             redact_secrets: true,
             task_prompt: None,
+            task_preset: None,
         }
     }
 }
@@ -311,6 +316,11 @@ pub fn parse_args(argv: &[String]) -> Result<PackArgs, String> {
                 let v = argv.get(i).ok_or("missing value for --prompt")?;
                 args.task_prompt = Some(v.clone());
             }
+            "--task-preset" => {
+                i += 1;
+                let v = argv.get(i).ok_or("missing value for --task-preset")?;
+                args.task_preset = Some(v.clone());
+            }
             s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
             s => {
                 if positional_dir {
@@ -322,6 +332,9 @@ pub fn parse_args(argv: &[String]) -> Result<PackArgs, String> {
         }
         i += 1;
     }
+
+    args.task_prompt =
+        merge_prompt_and_preset(args.task_prompt.take(), args.task_preset.as_deref())?;
 
     Ok(args)
 }

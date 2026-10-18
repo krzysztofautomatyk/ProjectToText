@@ -614,7 +614,28 @@ export function loadPromptStudioStore(): PromptStudioStore {
   return emptyPromptStudioStore();
 }
 
-export function savePromptStudioStore(store: PromptStudioStore): boolean {
+export const PROMPT_STUDIO_UPDATED_EVENT = 'ptt:prompt-studio-updated';
+
+export type PromptStudioUpdateDetail = {
+  reason?: 'save' | 'import' | 'delete' | 'default' | 'active';
+  deletedId?: string | null;
+};
+
+/** Broadcast so every UI surface refreshes without a full page reload. */
+export function notifyPromptStudioUpdated(detail: PromptStudioUpdateDetail = {}): void {
+  try {
+    window.dispatchEvent(
+      new CustomEvent<PromptStudioUpdateDetail>(PROMPT_STUDIO_UPDATED_EVENT, { detail }),
+    );
+  } catch {
+    /* non-DOM environments (unit tests) */
+  }
+}
+
+export function savePromptStudioStore(
+  store: PromptStudioStore,
+  detail: PromptStudioUpdateDetail = { reason: 'save' },
+): boolean {
   try {
     const payload: PromptStudioStore = {
       schemaVersion: 2,
@@ -626,6 +647,7 @@ export function savePromptStudioStore(store: PromptStudioStore): boolean {
       draftCustomText: store.draftCustomText,
     };
     localStorage.setItem(PROMPT_STUDIO_KEY, JSON.stringify(payload));
+    notifyPromptStudioUpdated(detail);
     return true;
   } catch (e) {
     if (e instanceof DOMException && e.name === 'QuotaExceededError') return false;
@@ -735,7 +757,7 @@ export function deleteCustomPrompt(id: string): void {
   if (next.length === store.customPrompts.length) return;
   store.customPrompts = next;
   clearPromptRefs(store, id);
-  savePromptStudioStore(store);
+  savePromptStudioStore(store, { reason: 'delete', deletedId: id });
 }
 
 export function setGlobalDefaultPrompt(id: string | null): void {

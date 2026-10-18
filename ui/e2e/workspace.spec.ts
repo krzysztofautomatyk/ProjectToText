@@ -282,4 +282,28 @@ test('docs footer and playbook load into Prompt Studio from workspace shell', as
   await expect(page.getByTestId('docs-howto-modal')).toBeHidden();
   await expect(page.getByTestId('prompt-studio-panel')).toBeVisible();
   await expect(page.getByTestId('prompt-studio-input')).not.toHaveValue('');
+  await expect(page.getByText(/Loaded playbook:/i).first()).toBeVisible();
+});
+
+test('deleting active default prompt clears dangling selector state', async ({ page }) => {
+  await page.goto('/');
+  await page.getByTestId('btn-prompt-studio').click();
+  await page.getByTestId('open-prompt-studio-btn').click();
+  await page.getByTestId('create-custom-prompt-btn').click();
+  await page.getByTestId('custom-prompt-name-input').fill('Do Usunięcia');
+  await page.getByTestId('custom-prompt-content-input').fill('Tymczasowy {{PROJECT_NAME}}');
+  await page.getByTestId('custom-prompt-set-default-checkbox').check();
+  await page.getByTestId('save-custom-prompt-btn').click();
+  await expect(page.getByTestId('prompt-studio-modal')).toBeHidden({ timeout: 5000 });
+  await expect(page.getByTestId('prompt-template-select')).toContainText('Do Usunięcia');
+
+  await page.getByTestId('open-prompt-studio-btn').click();
+  await page.getByTestId('delete-custom-prompt-btn').first().click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('prompt-studio-modal')).toBeHidden();
+
+  const selectValue = await page.getByTestId('prompt-template-select').inputValue();
+  expect(selectValue).not.toEqual('');
+  // Deleted custom id must not remain selected
+  await expect(page.getByTestId('prompt-template-select')).not.toContainText('Do Usunięcia');
 });

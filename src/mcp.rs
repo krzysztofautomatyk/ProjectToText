@@ -519,6 +519,17 @@ pub fn handle_jsonrpc_message(raw: &str, default_root: &Path) -> Option<Value> {
                         ]
                     },
                     {
+                        "name": "bug_hunt",
+                        "description": "Root-cause bug hunt with minimal patch and regression test guidance",
+                        "arguments": [
+                            {
+                                "name": "focus_path",
+                                "description": "Optional failing file to center the investigation on.",
+                                "required": false
+                            }
+                        ]
+                    },
+                    {
                         "name": "security_audit",
                         "description": "Security, path-sandbox, and secret-exposure audit of the codebase",
                         "arguments": [
@@ -533,6 +544,17 @@ pub fn handle_jsonrpc_message(raw: &str, default_root: &Path) -> Option<Value> {
                         "name": "git_diff_review",
                         "description": "Pre-merge code review of current working tree changes and git diff",
                         "arguments": []
+                    },
+                    {
+                        "name": "test_generation",
+                        "description": "Zero-hallucination unit/E2E test suite matching project helpers",
+                        "arguments": [
+                            {
+                                "name": "focus_path",
+                                "description": "Optional module path to generate tests for.",
+                                "required": false
+                            }
+                        ]
                     }
                 ]
             }
@@ -578,14 +600,20 @@ pub fn handle_jsonrpc_message(raw: &str, default_root: &Path) -> Option<Value> {
             };
 
             let description = match prompt_name {
-                "architecture_review" => {
+                "architecture_review" | "architecture_audit" => {
                     "Deep architectural, modularity, and dependency-graph review of the repository"
                 }
-                "security_audit" => {
+                "bug_hunt" => {
+                    "Root-cause bug hunt with minimal patch and regression test guidance"
+                }
+                "security_audit" | "security_review" => {
                     "Security, path-sandbox, and secret-exposure audit of the codebase"
                 }
-                "git_diff_review" => {
+                "git_diff_review" | "pr_diff_review" => {
                     "Pre-merge code review of current working tree changes and git diff"
+                }
+                "test_generation" => {
+                    "Zero-hallucination unit/E2E test suite matching project helpers"
                 }
                 other => {
                     return Some(json!({
@@ -664,7 +692,7 @@ fn generate_prompt_text(
     cancelled: Arc<AtomicBool>,
 ) -> Result<String, String> {
     match name {
-        "architecture_review" => {
+        "architecture_review" | "architecture_audit" => {
             let focus_path = args
                 .get("focus_path")
                 .and_then(Value::as_str)
@@ -701,7 +729,44 @@ fn generate_prompt_text(
             text.push_str(&map);
             Ok(text)
         }
-        "security_audit" => {
+        "bug_hunt" => {
+            let focus_path = args
+                .get("focus_path")
+                .and_then(Value::as_str)
+                .map(str::trim);
+            let map = dispatch_tool_cancellable(
+                "ptt_get_project_map",
+                &json!({ "include_skeletons": true }),
+                root,
+                Arc::clone(&cancelled),
+            )?;
+            let mut text = String::from(
+                "# Root-Cause Bug Hunt Request\n\n\
+                 You are a Principal Engineer performing a surgical bug investigation.\n\n\
+                 ## Goals\n\
+                 1. Trace data/control flow to the exact root cause (race, edge case, broken invariant).\n\
+                 2. Propose a minimal patch and a regression test that would have caught the bug.\n\
+                 3. List related modules that must stay consistent.\n\
+                 4. Do not invent APIs absent from the pack.\n\n",
+            );
+            if let Some(focus) = focus_path.filter(|s| !s.is_empty()) {
+                text.push_str(&format!("## Failing Focus\n`{focus}`\n\n"));
+                if let Ok(rel) = dispatch_tool_cancellable(
+                    "ptt_get_related_files",
+                    &json!({ "path": focus }),
+                    root,
+                    Arc::clone(&cancelled),
+                ) {
+                    text.push_str(&format!(
+                        "### Related Dependencies\n```json\n{rel}\n```\n\n"
+                    ));
+                }
+            }
+            text.push_str("## Repository Context\n\n");
+            text.push_str(&map);
+            Ok(text)
+        }
+        "security_audit" | "security_review" => {
             let directory = args.get("directory").and_then(Value::as_str).map(str::trim);
             let tool_args = if let Some(dir) = directory.filter(|s| !s.is_empty()) {
                 json!({ "directory": dir, "include_skeletons": true })
@@ -730,7 +795,7 @@ fn generate_prompt_text(
             text.push_str(&map);
             Ok(text)
         }
-        "git_diff_review" => {
+        "git_diff_review" | "pr_diff_review" => {
             let git_ctx = dispatch_tool_cancellable(
                 "ptt_get_git_context",
                 &json!({}),
@@ -748,6 +813,32 @@ fn generate_prompt_text(
                  ## Working Tree Git Context & Diff\n\n\
                  {git_ctx}"
             );
+            Ok(text)
+        }
+        "test_generation" => {
+            let focus_path = args
+                .get("focus_path")
+                .and_then(Value::as_str)
+                .map(str::trim);
+            let map = dispatch_tool_cancellable(
+                "ptt_get_project_map",
+                &json!({ "include_skeletons": true }),
+                root,
+                Arc::clone(&cancelled),
+            )?;
+            let mut text = String::from(
+                "# Zero-Hallucination Test Suite Request\n\n\
+                 You are a Principal Test Engineer writing unit/integration/E2E tests.\n\n\
+                 ## Goals\n\
+                 1. Mirror existing assertion libraries and helpers in this repository.\n\
+                 2. Cover happy paths and edge cases for the selected modules.\n\
+                 3. Do not invent APIs that are not present in the pack.\n\n",
+            );
+            if let Some(focus) = focus_path.filter(|s| !s.is_empty()) {
+                text.push_str(&format!("## Target Module\n`{focus}`\n\n"));
+            }
+            text.push_str("## Repository Context\n\n");
+            text.push_str(&map);
             Ok(text)
         }
         other => Err(format!("Prompt not found: {other}")),

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-18
+
+### Added
+
+- **MCP / CLI task presets:** shared playbook library (`architecture_audit`, `bug_hunt`, `security_review`, `pr_diff_review`, `test_generation`) via MCP `task_preset` on `ptt_pack_files`, MCP prompts, and CLI `--task-preset`.
+- Prompt Studio `ptt:prompt-studio-updated` event so import/merge/replace and CRUD refresh the bar and defaults without a page reload.
+
+### Fixed
+
+- Default prompt inheritance when opening or switching projects (project → global default → none).
+- Deleting the active or default custom prompt no longer leaves dangling IDs in storage or an empty selector.
+- Documentation playbooks apply content into Prompt Studio, close the modal, and show status feedback.
+- `Escape` closes only the topmost modal and no longer clears the file selection.
+- Docs footer remains visible and readable in dark and light themes on small window heights.
+- Template variables (`{{PROJECT_NAME}}`, `{{GIT_BRANCH}}`, `{{SELECTED_FILES_COUNT}}`, `{{TOKEN_BUDGET}}`) interpolated on generate, copy, and save.
+
 ## [0.10.0] - 2026-10-18
 
 ### Added

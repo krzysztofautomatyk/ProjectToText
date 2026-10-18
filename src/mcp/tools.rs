@@ -18,6 +18,7 @@ use ptt::core::output::{
 use ptt::core::preview::{read_verified_file_string, resolve_under_canonical_root};
 use ptt::core::secrets::redact_secrets;
 use ptt::core::skeleton::{extract_skeleton, find_symbols, language_for_path, SymbolMatch};
+use ptt::core::task_presets::{merge_prompt_and_preset, TASK_PRESET_IDS};
 use ptt::core::tokenizer::{count_tokens, estimate_tokens_from_bytes, TokenizerModel};
 use ptt::core::walker::{normalize_rel_path, SelectionMatcher};
 use ptt::core::workspace::{WorkspaceIndex, WorkspaceSnapshot};
@@ -149,7 +150,18 @@ pub(super) fn tool_definitions() -> Value {
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "Optional task instructions appended inside <task_instructions> at the end of the pack."
+                        "description": "Optional task instructions appended inside <task_instructions> at the end of the pack. Wins over task_preset when both are set."
+                    },
+                    "task_preset": {
+                        "type": "string",
+                        "enum": [
+                            "architecture_audit",
+                            "bug_hunt",
+                            "security_review",
+                            "pr_diff_review",
+                            "test_generation"
+                        ],
+                        "description": "Built-in playbook for <task_instructions> when prompt is omitted (architecture_audit, bug_hunt, security_review, pr_diff_review, test_generation)."
                     }
                 },
                 "additionalProperties": false
@@ -284,6 +296,7 @@ pub(super) fn validate_tool_arguments(tool_name: &str, args: &Value) -> Result<(
                 "git_diff",
                 "tokenizer",
                 "prompt",
+                "task_preset",
             ])?;
             check_opt_str("directory")?;
             check_opt_str_array("paths")?;
@@ -298,6 +311,7 @@ pub(super) fn validate_tool_arguments(tool_name: &str, args: &Value) -> Result<(
             check_opt_bool("git_diff")?;
             check_opt_str("tokenizer")?;
             check_opt_str("prompt")?;
+            check_opt_str("task_preset")?;
             if let Some(v) = obj.get("max_tokens") {
                 if !v.is_null() && v.as_u64().is_none_or(|n| n == 0) {
                     return Err("argument 'max_tokens' must be a positive integer".into());
@@ -305,6 +319,14 @@ pub(super) fn validate_tool_arguments(tool_name: &str, args: &Value) -> Result<(
             }
             if let Some(v) = obj.get("tokenizer").and_then(Value::as_str) {
                 TokenizerModel::try_parse(v)?;
+            }
+            if let Some(v) = obj.get("task_preset").and_then(Value::as_str) {
+                if !TASK_PRESET_IDS.contains(&v) {
+                    return Err(format!(
+                        "argument 'task_preset' must be one of {}",
+                        TASK_PRESET_IDS.join("|")
+                    ));
+                }
             }
         }
         "ptt_get_git_context" => {
@@ -553,11 +575,14 @@ pub(super) fn dispatch_tool_cancellable(
                 Some(s) => TokenizerModel::try_parse(s)?,
                 None => TokenizerModel::O200kBase,
             };
-            let task_prompt = args
-                .get("prompt")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .filter(|s| !s.trim().is_empty());
+            let task_prompt = merge_prompt_and_preset(
+                args
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty()),
+                args.get("task_preset").and_then(Value::as_str),
+            )?;
 
             // Same selection as `ptt pack`: preset and the heuristic budget pass first.
             let pack_args = PackArgs {

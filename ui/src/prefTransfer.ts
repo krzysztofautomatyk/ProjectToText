@@ -556,7 +556,7 @@ export function mergePrefSnapshot(
 
 /** Persist a merge/replace result's prompt studio section. */
 export function applyPromptStudioImport(store: PromptStudioStore): boolean {
-  return savePromptStudioStore(store);
+  return savePromptStudioStore(store, { reason: 'import' });
 }
 
 function mergeProject(a: ProjectPref, b: RawProjectPref): ProjectPref {

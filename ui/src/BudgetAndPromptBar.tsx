@@ -34,6 +34,7 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
     setPromptTemplateId,
     setShowTopConsumers,
     setTaskPrompt,
+    showPromptManager,
     showPromptStudio,
     showTopConsumers,
     skeletonSet,
@@ -41,14 +42,14 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
     targetBudgetTokens,
     taskPrompt,
     refreshPromptStudio,
+    setShowPromptManager,
   } = ws;
 
-  const [managerOpen, setManagerOpen] = useState(false);
   const [defaultScope, setDefaultScope] = useState<'global' | 'workspace'>('global');
 
   const store = useMemo(
     () => loadPromptStudioStore(),
-    [promptStudioRevision, showPromptStudio, managerOpen],
+    [promptStudioRevision, showPromptStudio, showPromptManager],
   );
   const allPrompts = useMemo(() => listAllPrompts(store), [store]);
   const defaultPrompt = useMemo(
@@ -169,7 +170,7 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
       skeletonEnabled: skeletonSet.size > 0,
     });
     setTaskPrompt(text);
-    setManagerOpen(false);
+    setShowPromptManager(false);
     if (currentPath && nodes.length > 0) {
       generate(nodes, currentPath, format, true, { prompt: text });
     }
@@ -463,7 +464,7 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
               className="btn btn-ghost"
               data-testid="open-prompt-studio-btn"
               aria-haspopup="dialog"
-              onClick={() => setManagerOpen(true)}
+              onClick={() => setShowPromptManager(true)}
             >
               <Sparkles size={13} aria-hidden /> Zarządzaj Promptami (+ Dodaj)
             </button>
@@ -492,8 +493,8 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
       )}
 
       <PromptStudioManager
-        open={managerOpen}
-        onClose={() => setManagerOpen(false)}
+        open={showPromptManager}
+        onClose={() => setShowPromptManager(false)}
         workspacePath={currentPath || null}
         onPromptsChanged={refreshPromptStudio}
         onSelectPrompt={onSelectFromManager}

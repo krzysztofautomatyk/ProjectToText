@@ -9,6 +9,7 @@ pub mod output;
 pub mod preview;
 pub mod secrets;
 pub mod skeleton;
+pub mod task_presets;
 pub mod text;
 pub mod tokenizer;
 pub mod walker;

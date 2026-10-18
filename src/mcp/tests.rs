@@ -470,11 +470,17 @@ fn mcp_prompts_list_and_get() {
     )
     .unwrap();
     let prompts = list_resp["result"]["prompts"].as_array().unwrap();
-    assert_eq!(prompts.len(), 3);
+    assert_eq!(prompts.len(), 5);
     let names: Vec<&str> = prompts.iter().filter_map(|p| p["name"].as_str()).collect();
     assert_eq!(
         names,
-        vec!["architecture_review", "security_audit", "git_diff_review"]
+        vec![
+            "architecture_review",
+            "bug_hunt",
+            "security_audit",
+            "git_diff_review",
+            "test_generation"
+        ]
     );
 
     // 3. Verify prompts/get for architecture_review (with and without focus_path)
@@ -608,6 +614,28 @@ fn mcp_pack_files_accepts_tokenizer_and_prompt() {
     assert!(text.contains("src/lib.rs"), "{text}");
     assert!(text.contains("<task_instructions>"), "{text}");
     assert!(text.contains("Review this module"), "{text}");
+
+    // task_preset playbook when prompt is omitted
+    let preset_req = json!({
+        "jsonrpc": "2.0",
+        "id": 115,
+        "method": "tools/call",
+        "params": {
+            "name": "ptt_pack_files",
+            "arguments": {
+                "paths": ["src/lib.rs"],
+                "task_preset": "bug_hunt"
+            }
+        }
+    })
+    .to_string();
+    let preset_resp = handle_jsonrpc_message(&preset_req, dir.path()).unwrap();
+    assert_eq!(preset_resp["result"]["isError"], false, "{preset_resp}");
+    let preset_text = preset_resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        preset_text.contains("<task_instructions>") && preset_text.contains("root cause"),
+        "{preset_text}"
+    );
 
     // Invalid tokenizer must be rejected
     let invalid_req = json!({

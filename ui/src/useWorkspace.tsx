@@ -11,6 +11,7 @@ import { readFolderHistory, rememberFolder, removeFolder, setFolderPinned, write
 import {
   interpolatePromptVariables,
   loadPromptStudioStore,
+  PROMPT_STUDIO_UPDATED_EVENT,
   projectPrefKey,
   readProjectPrefs,
   rememberProject,
@@ -23,6 +24,7 @@ import {
   type CustomPromptTemplate,
   type ProjectPref,
   type PromptPresetConfig,
+  type PromptStudioUpdateDetail,
 } from './projectPrefs';
 import {
   applyPromptStudioImport,
@@ -80,6 +82,7 @@ export function useWorkspace() {
   const [junkDirs, setJunkDirs] = useState<readonly string[]>(CANONICAL_JUNK_DIRS);
   const [gitContext, setGitContext] = useState<GitRepoContext | null>(null);
   const [showPromptStudio, setShowPromptStudio] = useState(false);
+  const [showPromptManager, setShowPromptManager] = useState(false);
   const [promptTemplateId, setPromptTemplateId] = useState('none');
   const [taskPrompt, setTaskPrompt] = useState('');
   const [promptStudioRevision, setPromptStudioRevision] = useState(0);
@@ -233,6 +236,103 @@ export function useWorkspace() {
     setPromptStudioRevision((n) => n + 1);
   }, []);
 
+  /** Apply workspace/global default prompt into the active Prompt Studio bar. */
+  const applyDefaultPromptForPath = useCallback(
+    (
+      pathLabel: string,
+      opts?: {
+        selectedCount?: number;
+        skeletonEnabled?: boolean;
+        /** Ignore autoApplyDefaultOnOpen and always sync from store defaults. */
+        force?: boolean;
+      },
+    ) => {
+      const studio = loadPromptStudioStore();
+      const def = resolveDefaultPromptForWorkspace(pathLabel || null);
+      if (!def) {
+        if (opts?.force) {
+          setPromptTemplateId('none');
+          setTaskPrompt('');
+          setActivePromptId(null);
+        }
+        return false;
+      }
+      const wsKey = pathLabel ? projectPrefKey(pathLabel) : '';
+      const hasWorkspaceDefault = Boolean(wsKey && studio.workspaceDefaultPromptMap[wsKey]);
+      if (!opts?.force && !hasWorkspaceDefault && !studio.autoApplyDefaultOnOpen) {
+        return false;
+      }
+      const projectName =
+        (pathLabel.split(/[/\\]/).filter(Boolean).pop() ?? pathLabel) || 'Workspace';
+      const text = interpolatePromptVariables(def.content, {
+        projectName,
+        gitBranch: gitContext?.currentBranch ?? undefined,
+        selectedFilesCount: opts?.selectedCount ?? 0,
+        tokenBudget: targetBudgetTokens,
+        skeletonEnabled: opts?.skeletonEnabled ?? false,
+      });
+      setPromptTemplateId(def.id);
+      setActivePromptId(def.id);
+      setTaskPrompt(text);
+      setShowPromptStudio(true);
+      refreshPromptStudio();
+      return true;
+    },
+    [gitContext, targetBudgetTokens, refreshPromptStudio],
+  );
+
+  // Cross-component sync without full reload (import / delete / default changes)
+  useEffect(() => {
+    const onUpdate = (ev: Event) => {
+      const detail = (ev as CustomEvent<PromptStudioUpdateDetail>).detail ?? {};
+      refreshPromptStudio();
+      if (detail.deletedId) {
+        const deleted = detail.deletedId;
+        setPromptTemplateId((curr) => {
+          if (curr === deleted) {
+            const fallback = resolveDefaultPromptForWorkspace(currentPath || null);
+            if (fallback) {
+              setTaskPrompt(
+                interpolatePromptVariables(fallback.content, {
+                  projectName:
+                    (currentPath.split(/[/\\]/).filter(Boolean).pop() ?? currentPath) ||
+                    'Workspace',
+                  gitBranch: gitContext?.currentBranch ?? undefined,
+                  selectedFilesCount: nodes.filter((n) => n.selected && !n.is_dir).length,
+                  tokenBudget: targetBudgetTokens,
+                  skeletonEnabled: skeletonSet.size > 0,
+                }),
+              );
+              setActivePromptId(fallback.id);
+              return fallback.id;
+            }
+            setTaskPrompt('');
+            setActivePromptId(null);
+            return 'none';
+          }
+          return curr;
+        });
+      }
+      if (detail.reason === 'import') {
+        applyDefaultPromptForPath(currentPath || '', {
+          selectedCount: nodes.filter((n) => n.selected && !n.is_dir).length,
+          skeletonEnabled: skeletonSet.size > 0,
+          force: true,
+        });
+      }
+    };
+    window.addEventListener(PROMPT_STUDIO_UPDATED_EVENT, onUpdate);
+    return () => window.removeEventListener(PROMPT_STUDIO_UPDATED_EVENT, onUpdate);
+  }, [
+    refreshPromptStudio,
+    currentPath,
+    gitContext,
+    nodes,
+    targetBudgetTokens,
+    skeletonSet,
+    applyDefaultPromptForPath,
+  ]);
+
   /* ─── Preferences export / import ──────────────────── */
 
   const exportPrefs = useCallback(() => {
@@ -372,7 +472,7 @@ export function useWorkspace() {
       }
       if (config?.includeGitDiff != null) setIncludeGitDiff(config.includeGitDiff);
       refreshPromptStudio();
-      pushToast('success', `Załadowano playbook: ${prompt.name}`);
+      pushToast('success', `Loaded playbook: ${prompt.name}`);
       if (currentPath && nodes.length > 0) {
         generate(nodes, currentPath, format, true, { prompt: text });
       }
@@ -476,29 +576,12 @@ export function useWorkspace() {
       hasLoadedOnce.current = false;
       if (!fromBrowser) rememberLoadedFolder(pathLabel);
 
-      // Auto-apply default Prompt Studio template when opening a workspace (not on refresh)
+      // Inherit default prompt on project open / switch (not on in-place refresh)
       if (!preserve) {
-        const studio = loadPromptStudioStore();
-        if (studio.autoApplyDefaultOnOpen) {
-          const def = resolveDefaultPromptForWorkspace(pathLabel);
-          if (def) {
-            setPromptTemplateId(def.id);
-            setActivePromptId(def.id);
-            const projectName =
-              pathLabel.split(/[/\\]/).filter(Boolean).pop() ?? pathLabel;
-            setTaskPrompt(
-              interpolatePromptVariables(def.content, {
-                projectName,
-                selectedFilesCount: withSelection.filter((n) => n.selected && !n.is_dir)
-                  .length,
-                tokenBudget: targetBudgetTokens,
-                skeletonEnabled: nextSkels.size > 0,
-              }),
-            );
-            setShowPromptStudio(true);
-            setPromptStudioRevision((n) => n + 1);
-          }
-        }
+        applyDefaultPromptForPath(pathLabel, {
+          selectedCount: withSelection.filter((n) => n.selected && !n.is_dir).length,
+          skeletonEnabled: nextSkels.size > 0,
+        });
       }
 
       const topDirs = withSelection
@@ -538,7 +621,16 @@ export function useWorkspace() {
       // Pack after tree is visible
       await generateNow(withSelection, pathLabel, format, { skeletons: nextSkels });
     },
-    [format, generateNow, pushToast, rememberLoadedFolder, customProjects, junkDirs, targetBudgetTokens],
+    [
+      format,
+      generateNow,
+      pushToast,
+      rememberLoadedFolder,
+      customProjects,
+      junkDirs,
+      targetBudgetTokens,
+      applyDefaultPromptForPath,
+    ],
   );
 
   const scan = useCallback(
@@ -835,27 +927,39 @@ export function useWorkspace() {
         return;
       }
       if (e.key === 'Escape') {
+        // Close only the topmost overlay — never clear file selection here.
         if (showDocs) {
+          e.preventDefault();
           setShowDocs(false);
           return;
         }
+        if (showPromptManager) {
+          e.preventDefault();
+          setShowPromptManager(false);
+          return;
+        }
         if (importPreview) {
+          e.preventDefault();
           cancelImportPrefs();
           return;
         }
         if (showHelp) {
+          e.preventDefault();
           setShowHelp(false);
           return;
         }
         if (showAbout) {
+          e.preventDefault();
           setShowAbout(false);
           return;
         }
         if (showHistory) {
+          e.preventDefault();
           setShowHistory(false);
           return;
         }
         if (showCustom) {
+          e.preventDefault();
           setShowCustom(false);
           return;
         }
@@ -894,6 +998,7 @@ export function useWorkspace() {
     showHistory,
     showCustom,
     showDocs,
+    showPromptManager,
     importPreview,
     cancelImportPrefs,
   ]);
@@ -1086,8 +1191,10 @@ export function useWorkspace() {
     showHelp,
     showHistory,
     showInitialLoading,
+    showPromptManager,
     showPromptStudio,
     showTopConsumers,
+    setShowPromptManager,
     skeletonSet,
     startRowIdx,
     stats,

@@ -32,6 +32,9 @@ pub use core::preview::{
     guess_language, load_preview, resolve_under_root, FilePreview, DEFAULT_PREVIEW_MAX,
 };
 pub use core::secrets::{redact_secrets, redact_secrets_with_report, RedactionSummary};
+pub use core::task_presets::{
+    merge_prompt_and_preset, resolve_task_preset, task_preset_description, TASK_PRESET_IDS,
+};
 pub use core::skeleton::{extract_skeleton, language_for_path};
 pub use core::tokenizer::{
     count_tokens, count_tokens_with_model, estimate_tokens_from_bytes, TokenizerModel,
