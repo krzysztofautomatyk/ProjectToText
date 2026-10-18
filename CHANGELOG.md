@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-18
+
+### Added
+
+- **UI internationalization:** typed `ui/src/i18n/` module with built-in English (`en`) and Polish (`pl`) dictionaries covering the desktop UI (header, budget/prompt bar, tree, panels, Prompt Studio, Documentation & How-To).
+- **Language Studio:** switch languages from the header; download a full translation template JSON; import, create, edit, export, and delete custom language packs; live coverage meter and in-app key editor.
+- **Custom language packs in preferences transfer:** optional `i18n` block in prefs snapshots (`activeLocale` + `customPacks`); Merge combines packs by language code; Replace swaps locale and packs; older snapshots without `i18n` remain compatible.
+- Playwright E2E coverage for locale switching, custom packs, hostile import rejection, and prefs merge/restore (`ui/e2e/i18n.spec.ts`).
+
+### Changed
+
+- Default UI locale is English when unset (deterministic Playwright / first-run behavior); Polish and custom packs activate immediately and persist in `localStorage` (`ptt.i18n.v1`).
+- Documentation modal EN/PL controls drive the global app language.
+- Prompt Studio and prefs import dialogs use the shared i18n dictionaries (English default, full Polish when `pl` is active).
+
+### Removed
+
+- Obsolete working docs (`EXPERT_REVIEW`, `BASELINE`, `PRODUCT_STRATEGY_LLM_BRIEF`, `STRATEGIC_PLAN`) after folding performance notes into `docs/ARCHITECTURE.md`.
+- Unused legacy screenshot assets (v0.1 SVG/JPG duplicates); README screenshots list updated.
+- Local `.freebuff/` tooling traces; `.freebuff/` ignored via `.gitignore` / `.pttignore`.
+
 ## [0.10.1] - 2026-10-18
 
 ### Added

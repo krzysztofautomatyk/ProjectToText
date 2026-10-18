@@ -1,7 +1,7 @@
 {
   "name": "project-to-text",
   "private": true,
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "ProjectToText workspace scripts for running the Tauri app",
   "scripts": {
     "dev": "cargo tauri dev",

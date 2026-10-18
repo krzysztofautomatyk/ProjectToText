@@ -6,7 +6,8 @@ import { projectPrefKey, type ProjectPref } from './projectPrefs';
 import APP_VERSION from './version';
 import './index.css';
 import { type VisibleTreeRow, type ToastItem, formatBytes, formatTokens, type SubtreeStats } from './treeModel';
-import { themeLabel, type ThemePref, type WorkspaceState } from './useWorkspace';
+import { type ThemePref, type WorkspaceState } from './useWorkspace';
+import { createTranslator, useI18n, type TranslateFn } from './i18n';
 
 export { DocumentationAndHowToModal } from './DocumentationModal';
 export { PromptStudioManager } from './PromptStudioManager';
@@ -68,6 +69,7 @@ export function AboutDialog({
   onClose: () => void;
   onOpenRepo: () => void;
 }) {
+  const { t, tRich } = useI18n();
   const libList = { display: 'flex', flexWrap: 'wrap', gap: 6, listStyle: 'none', padding: 0, margin: 0 } as const;
   return (
     <div className="help-overlay" role="presentation" onClick={onClose}>
@@ -79,34 +81,32 @@ export function AboutDialog({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="help-header">
-          <h2 id="about-title">About ptt</h2>
+          <h2 id="about-title">{t('about.title')}</h2>
           <button
             type="button"
             className="btn btn-ghost btn-icon"
             onClick={onClose}
-            aria-label="Close about"
+            aria-label={t('about.closeAria')}
           >
             <X size={14} />
           </button>
         </div>
         <p>
-          ProjectToText (ptt) · version {APP_VERSION}
+          {t('about.version', { version: APP_VERSION })}
         </p>
-        <p>
-          Author: <strong>{ABOUT_AUTHOR}</strong>
-        </p>
+        <p>{tRich('about.author', { author: ABOUT_AUTHOR })}</p>
         <p>
           <button type="button" className="panel-link" onClick={onOpenRepo}>
             <ExternalLink size={12} aria-hidden /> {ABOUT_REPO_URL}
           </button>
         </p>
-        <h3>Frontend libraries</h3>
+        <h3>{t('about.frontend')}</h3>
         <ul style={libList}>
           {ABOUT_FRONTEND_LIBS.map((lib) => (
             <li key={lib} className="kbd">{lib}</li>
           ))}
         </ul>
-        <h3>Backend libraries (Rust)</h3>
+        <h3>{t('about.backend')}</h3>
         <ul style={libList}>
           {ABOUT_BACKEND_LIBS.map((lib) => (
             <li key={lib} className="kbd">{lib}</li>
@@ -124,25 +124,26 @@ export function ToastViewport({
   toasts: ToastItem[];
   onDismiss: (id: number) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="toast-viewport" aria-live="polite" aria-relevant="additions">
-      {toasts.map((t) => (
-        <div key={t.id} className={`toast ${t.kind}`} role="status">
+      {toasts.map((toast) => (
+        <div key={toast.id} className={`toast ${toast.kind}`} role="status">
           <span className="toast-icon" aria-hidden>
-            {t.kind === 'success' ? (
+            {toast.kind === 'success' ? (
               <CheckCircle2 size={15} />
-            ) : t.kind === 'error' ? (
+            ) : toast.kind === 'error' ? (
               <AlertCircle size={15} />
             ) : (
               <Info size={15} />
             )}
           </span>
-          <span>{t.message}</span>
+          <span>{toast.message}</span>
           <button
             className="btn btn-ghost btn-icon"
             style={{ marginLeft: 'auto', height: 22, width: 22 }}
-            onClick={() => onDismiss(t.id)}
-            aria-label="Dismiss notification"
+            onClick={() => onDismiss(toast.id)}
+            aria-label={t('toast.dismiss')}
           >
             <X size={12} />
           </button>
@@ -152,13 +153,24 @@ export function ToastViewport({
   );
 }
 
-export function formatHistoryDate(timestamp: number): string {
-  if (!timestamp) return 'Previously opened';
-  return `Opened ${new Intl.DateTimeFormat(undefined, {
+export function formatHistoryDate(
+  timestamp: number,
+  t: TranslateFn = createTranslator('en'),
+  locale?: string,
+): string {
+  if (!timestamp) return t('history.previouslyOpened');
+  const options: Intl.DateTimeFormatOptions = {
     month: 'short',
     day: 'numeric',
     year: timestamp > Date.now() - 365 * 24 * 60 * 60 * 1000 ? undefined : 'numeric',
-  }).format(timestamp)}`;
+  };
+  let date: string;
+  try {
+    date = new Intl.DateTimeFormat(locale, options).format(timestamp);
+  } catch {
+    date = new Intl.DateTimeFormat(undefined, options).format(timestamp);
+  }
+  return t('history.opened', { date });
 }
 
 export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
@@ -171,9 +183,10 @@ export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
     setImportApplyDefault,
     setImportMode,
   } = ws;
+  const { t } = useI18n();
   if (!importPreview) return null;
   return (
-    <div className="help-overlay" role="presentation" onClick={cancelImportPrefs}>
+    <div className="help-overlay import-prefs-overlay" role="presentation" onClick={cancelImportPrefs}>
       <div
         className="help-card import-prefs-dialog"
         role="dialog"
@@ -186,33 +199,44 @@ export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
         }}
       >
         <div className="help-header">
-          <h2 id="import-prefs-title">Podgląd importu</h2>
+          <h2 id="import-prefs-title">{t('import.title')}</h2>
           <button
             type="button"
             className="btn btn-ghost btn-icon"
             onClick={cancelImportPrefs}
-            aria-label="Cancel import"
+            aria-label={t('import.cancelAria')}
           >
             <X size={14} />
           </button>
         </div>
         <ul className="import-preview-stats" data-testid="import-preview-stats">
           <li>
-            Projekty w paczce: <strong>{importPreview.projectsCount}</strong>
+            {t('import.projects')} <strong>{importPreview.projectsCount}</strong>
           </li>
           <li>
-            Historia: <strong>{importPreview.historyCount}</strong>
+            {t('import.history')} <strong>{importPreview.historyCount}</strong>
           </li>
           <li>
-            Prompty — nowe: <strong data-testid="import-prompts-new">{importPreview.promptsNew}</strong>,
-            zaktualizowane:{' '}
-            <strong data-testid="import-prompts-updated">{importPreview.promptsUpdated}</strong>,
-            duplikaty:{' '}
+            {t('import.promptsNew')} <strong data-testid="import-prompts-new">{importPreview.promptsNew}</strong>,{' '}
+            {t('import.promptsUpdated')}{' '}
+            <strong data-testid="import-prompts-updated">{importPreview.promptsUpdated}</strong>,{' '}
+            {t('import.promptsDupes')}{' '}
             <strong data-testid="import-prompts-dupes">{importPreview.promptsDuplicates}</strong>
           </li>
+          {importPreview.hasI18n && (
+            <li data-testid="import-i18n-packs">
+              {t('import.languages')} <strong>{importPreview.i18nPacksCount}</strong>
+              {importPreview.i18nActiveLocale && (
+                <>
+                  {' '}
+                  · {t('import.activeLanguage')} <strong>{importPreview.i18nActiveLocale}</strong>
+                </>
+              )}
+            </li>
+          )}
           {importPreview.defaultPromptName && (
             <li data-testid="import-default-prompt-name">
-              Domyślny prompt w pliku: <strong>{importPreview.defaultPromptName}</strong>
+              {t('import.defaultPrompt')} <strong>{importPreview.defaultPromptName}</strong>
             </li>
           )}
         </ul>
@@ -222,7 +246,7 @@ export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
             role="alert"
             data-testid="import-secret-warning"
           >
-            Ostrzeżenie: w importowanych promptach wykryto potencjalne sekrety / klucze API:
+            {t('import.secretWarning')}
             <ul>
               {importPreview.secretWarnings.map((w) => (
                 <li key={w.promptName}>
@@ -233,7 +257,7 @@ export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
           </div>
         )}
         <fieldset className="import-mode-fieldset">
-          <legend>Tryb importu</legend>
+          <legend>{t('import.modeLegend')}</legend>
           <label>
             <input
               type="radio"
@@ -242,7 +266,7 @@ export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
               checked={importMode === 'merge'}
               onChange={() => setImportMode('merge')}
             />{' '}
-            Merge — scal bez utraty lokalnych promptów
+            {t('import.modeMerge')}
           </label>
           <label>
             <input
@@ -252,7 +276,7 @@ export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
               checked={importMode === 'replace'}
               onChange={() => setImportMode('replace')}
             />{' '}
-            Replace — zastąp Prompt Studio stanem z pliku
+            {t('import.modeReplace')}
           </label>
         </fieldset>
         {importPreview.defaultPromptId && (
@@ -263,12 +287,12 @@ export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
               checked={importApplyDefault}
               onChange={(e) => setImportApplyDefault(e.target.checked)}
             />
-            Zastosuj domyślny prompt z importowanego pliku
+            {t('import.applyDefault')}
           </label>
         )}
         <div className="import-prefs-actions">
           <button type="button" className="btn btn-ghost" onClick={cancelImportPrefs}>
-            Anuluj
+            {t('import.cancel')}
           </button>
           <button
             type="button"
@@ -276,7 +300,7 @@ export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
             data-testid="confirm-import-btn"
             onClick={confirmImportPrefs}
           >
-            Zatwierdź import
+            {t('import.confirm')}
           </button>
         </div>
       </div>
@@ -311,6 +335,7 @@ export function CustomProjectsPanel({
   onImport: () => void;
   onExportPrompts?: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="history-overlay" role="presentation" onClick={onClose}>
       <section
@@ -322,17 +347,14 @@ export function CustomProjectsPanel({
       >
         <div className="history-header">
           <div>
-            <h2 id="custom-projects-title">Custom projects</h2>
-            <p>
-              Projects with saved selection exclusions, favorites first. Notes and
-              excluded files are kept on this device.
-            </p>
+            <h2 id="custom-projects-title">{t('custom.title')}</h2>
+            <p>{t('custom.desc')}</p>
           </div>
           <button
             type="button"
             className="btn btn-ghost btn-icon"
             onClick={onClose}
-            aria-label="Close custom projects"
+            aria-label={t('custom.closeAria')}
           >
             <X size={14} />
           </button>
@@ -340,7 +362,7 @@ export function CustomProjectsPanel({
 
         <div className="history-toolbar custom-transfer" data-testid="custom-transfer">
           <button type="button" className="panel-link" onClick={onExport} data-testid="export-prefs-btn">
-            <Download size={12} aria-hidden /> Export all
+            <Download size={12} aria-hidden /> {t('custom.exportAll')}
           </button>
           {onExportPrompts && (
             <button
@@ -349,13 +371,13 @@ export function CustomProjectsPanel({
               onClick={onExportPrompts}
               data-testid="export-prompts-only-btn"
             >
-              <Download size={12} aria-hidden /> Export Prompt Studio
+              <Download size={12} aria-hidden /> {t('custom.exportPrompts')}
             </button>
           )}
           <button type="button" className="panel-link" onClick={onImport} data-testid="import-prefs-btn">
-            <Upload size={12} aria-hidden /> Import…
+            <Upload size={12} aria-hidden /> {t('custom.import')}
           </button>
-          <span className="custom-transfer-hint">JSON · preview → Merge / Replace</span>
+          <span className="custom-transfer-hint">{t('custom.hint')}</span>
         </div>
 
         {entries.length > 0 ? (
@@ -382,21 +404,21 @@ export function CustomProjectsPanel({
                         <strong>{entry.name}</strong>
                         <span>{entry.path}</span>
                       </span>
-                      {isCurrent && <span className="history-current">Current</span>}
+                      {isCurrent && <span className="history-current">{t('common.current')}</span>}
                     </button>
 
                     {entry.deselectPaths.length > 0 && (
                       <div className="custom-deselect" data-testid="custom-deselect">
                         <span className="custom-deselect-label" aria-hidden>
-                          <X size={11} /> {entry.deselectPaths.length} deselected
+                          <X size={11} /> {t('custom.deselected', { count: entry.deselectPaths.length })}
                         </span>
                         <button
                           type="button"
                           className="panel-link"
                           onClick={() => onClearDeselect(entry)}
-                          aria-label={`Clear saved deselect list for ${entry.name}`}
+                          aria-label={t('custom.clearDeselectAria', { name: entry.name })}
                         >
-                          Clear deselections
+                          {t('custom.clearDeselect')}
                         </button>
                       </div>
                     )}
@@ -406,10 +428,10 @@ export function CustomProjectsPanel({
                       <textarea
                         className="custom-note-input"
                         rows={1}
-                        placeholder="Add a note… (e.g. why these files are excluded)"
+                        placeholder={t('custom.notePlaceholder')}
                         value={entry.note}
                         onChange={(e) => onNoteChange(entry, e.target.value)}
-                        aria-label={`Note for ${entry.name}`}
+                        aria-label={t('custom.noteAria', { name: entry.name })}
                       />
                     </div>
                   </div>
@@ -421,10 +443,10 @@ export function CustomProjectsPanel({
                       onClick={() => onToggleFavorite(entry)}
                       aria-label={
                         entry.favorite
-                          ? `Remove ${entry.name} from favorites`
-                          : `Add ${entry.name} to favorites`
+                          ? t('custom.unfavoriteAria', { name: entry.name })
+                          : t('custom.favoriteAria', { name: entry.name })
                       }
-                      title={entry.favorite ? 'Unfavorite project' : 'Favorite project'}
+                      title={entry.favorite ? t('custom.unfavoriteTitle') : t('custom.favoriteTitle')}
                     >
                       {entry.favorite ? (
                         <Star size={14} fill="currentColor" />
@@ -436,8 +458,8 @@ export function CustomProjectsPanel({
                       type="button"
                       className="btn btn-icon history-action danger"
                       onClick={() => onRemove(entry)}
-                      aria-label={`Remove ${entry.name} from custom projects`}
-                      title="Remove from custom projects"
+                      aria-label={t('custom.removeAria', { name: entry.name })}
+                      title={t('custom.removeTitle')}
                     >
                       <Trash2 size={14} />
                     </button>
@@ -449,10 +471,8 @@ export function CustomProjectsPanel({
         ) : (
           <div className="history-empty">
             <SlidersHorizontal size={22} aria-hidden />
-            <strong>No custom projects yet</strong>
-            <span>
-              Open a project and deselect some files — they will be remembered here.
-            </span>
+            <strong>{t('custom.emptyTitle')}</strong>
+            <span>{t('custom.emptyDesc')}</span>
           </div>
         )}
       </section>
@@ -479,6 +499,7 @@ export function FolderHistoryPanel({
   onRemove: (entry: FolderHistoryEntry) => void;
   onClear: () => void;
 }) {
+  const { t, locale } = useI18n();
   return (
     <div className="history-overlay" role="presentation" onClick={onClose}>
       <section
@@ -490,14 +511,14 @@ export function FolderHistoryPanel({
       >
         <div className="history-header">
           <div>
-            <h2 id="folder-history-title">Folder history</h2>
-            <p>Pin projects you open often. History is saved on this device.</p>
+            <h2 id="folder-history-title">{t('history.title')}</h2>
+            <p>{t('history.desc')}</p>
           </div>
           <button
             type="button"
             className="btn btn-ghost btn-icon"
             onClick={onClose}
-            aria-label="Close folder history"
+            aria-label={t('history.closeAria')}
           >
             <X size={14} />
           </button>
@@ -506,9 +527,13 @@ export function FolderHistoryPanel({
         {entries.length > 0 ? (
           <>
             <div className="history-toolbar">
-              <span>{entries.length} saved folder{entries.length === 1 ? '' : 's'}</span>
+              <span>
+                {t(entries.length === 1 ? 'history.savedOne' : 'history.savedMany', {
+                  count: entries.length,
+                })}
+              </span>
               <button type="button" className="panel-link" onClick={onClear}>
-                Clear history
+                {t('history.clear')}
               </button>
             </div>
             <div className="history-list">
@@ -531,17 +556,21 @@ export function FolderHistoryPanel({
                       <span className="history-entry-copy">
                         <strong>{entry.name}</strong>
                         <span>{entry.path}</span>
-                        <small>{formatHistoryDate(entry.lastOpenedAt)}</small>
+                        <small>{formatHistoryDate(entry.lastOpenedAt, t, locale)}</small>
                       </span>
-                      {isCurrent && <span className="history-current">Current</span>}
+                      {isCurrent && <span className="history-current">{t('common.current')}</span>}
                     </button>
                     <div className="history-item-actions">
                       <button
                         type="button"
                         className={`btn btn-icon history-action${entry.pinned ? ' is-pinned' : ''}`}
                         onClick={() => onTogglePin(entry)}
-                        aria-label={entry.pinned ? `Unpin ${entry.name}` : `Pin ${entry.name}`}
-                        title={entry.pinned ? 'Unpin folder' : 'Pin folder'}
+                        aria-label={
+                          entry.pinned
+                            ? t('history.unpinAria', { name: entry.name })
+                            : t('history.pinAria', { name: entry.name })
+                        }
+                        title={entry.pinned ? t('history.unpinTitle') : t('history.pinTitle')}
                       >
                         {entry.pinned ? <PinOff size={14} /> : <Pin size={14} />}
                       </button>
@@ -549,8 +578,8 @@ export function FolderHistoryPanel({
                         type="button"
                         className="btn btn-icon history-action danger"
                         onClick={() => onRemove(entry)}
-                        aria-label={`Remove ${entry.name} from history`}
-                        title="Remove from history"
+                        aria-label={t('history.removeAria', { name: entry.name })}
+                        title={t('history.removeTitle')}
                       >
                         <Trash2 size={14} />
                       </button>
@@ -563,8 +592,8 @@ export function FolderHistoryPanel({
         ) : (
           <div className="history-empty">
             <HistoryIcon size={22} aria-hidden />
-            <strong>No folders in history</strong>
-            <span>Open a project and it will appear here for quick access.</span>
+            <strong>{t('history.emptyTitle')}</strong>
+            <span>{t('history.emptyDesc')}</span>
           </div>
         )}
       </section>
@@ -602,6 +631,7 @@ export function TreeRow({
   subtreeStats: Map<string, SubtreeStats>;
 }) {
   const { node, depth, hasChildren, showChildren } = row;
+  const { t } = useI18n();
   const checkRef = useRef<HTMLInputElement>(null);
 
   const subtree = subtreeStats.get(node.path) ?? {
@@ -682,7 +712,7 @@ export function TreeRow({
             e.stopPropagation();
             onToggleExpand(node.path);
           }}
-          aria-label={showChildren ? 'Collapse folder' : 'Expand folder'}
+          aria-label={showChildren ? t('tree.collapseFolder') : t('tree.expandFolder')}
           tabIndex={-1}
         >
           <svg
@@ -722,7 +752,7 @@ export function TreeRow({
       {!node.isDir && node.gitStatus && (
         <span
           className={`tree-git-badge git-${node.gitStatus}`}
-          title={`Git status: ${node.gitStatus}`}
+          title={t('tree.gitStatus', { status: node.gitStatus })}
           data-testid={`git-badge-${node.path}`}
         >
           {node.gitStatus}
@@ -732,8 +762,8 @@ export function TreeRow({
       <button
         type="button"
         className={`tree-skel-btn${isSkeleton ? ' is-active' : ''}`}
-        title="Pack signatures only (~80% fewer tokens)"
-        aria-label={`Toggle skeleton mode for ${node.name}`}
+        title={t('tree.skeletonTitle')}
+        aria-label={t('tree.skeletonAria', { name: node.name })}
         aria-pressed={isSkeleton}
         onClick={(e) => {
           e.stopPropagation();
@@ -748,8 +778,8 @@ export function TreeRow({
       )}
 
       {subtree.tokens > 0 && (
-        <span className="tree-tokens" title="Approximate tokens (bytes ÷ 3.8)">
-          ~{formatTokens(subtree.tokens)} tok
+        <span className="tree-tokens" title={t('tree.tokensTitle')}>
+          {t('tree.tokens', { tokens: formatTokens(subtree.tokens) })}
         </span>
       )}
 
@@ -762,9 +792,9 @@ export function TreeRow({
           aria-label={
             node.isDir
               ? isPartial
-                ? `Partially selected folder ${node.name}`
-                : `Select folder ${node.name}`
-              : `Select file ${node.name}`
+                ? t('tree.selectPartial', { name: node.name })
+                : t('tree.selectFolder', { name: node.name })
+              : t('tree.selectFile', { name: node.name })
           }
         />
       </label>
@@ -774,6 +804,7 @@ export function TreeRow({
 
 export function ShortcutsHelpDialog({ ws }: { ws: WorkspaceState }) {
   const { setShowHelp, setThemePref, showHelp, themePref } = ws;
+  const { t } = useI18n();
   if (!showHelp) return null;
   return (
     <div
@@ -804,12 +835,12 @@ export function ShortcutsHelpDialog({ ws }: { ws: WorkspaceState }) {
     >
       <div className="help-card" onClick={(e) => e.stopPropagation()}>
         <div className="help-header">
-          <h2 id="help-title">Keyboard shortcuts</h2>
+          <h2 id="help-title">{t('help.title')}</h2>
           <button
             type="button"
             className="btn btn-ghost btn-icon"
             onClick={() => setShowHelp(false)}
-            aria-label="Close"
+            aria-label={t('help.close')}
           >
             <X size={14} />
           </button>
@@ -819,72 +850,72 @@ export function ShortcutsHelpDialog({ ws }: { ws: WorkspaceState }) {
             <dt>
               <span className="kbd">{formatShortcut('O')}</span>
             </dt>
-            <dd>Open folder</dd>
+            <dd>{t('help.open')}</dd>
           </div>
           <div>
             <dt>
               <span className="kbd">{formatShortcut('R')}</span>
             </dt>
-            <dd>Refresh project</dd>
+            <dd>{t('help.refresh')}</dd>
           </div>
           <div>
             <dt>
               <span className="kbd">{formatShortcut('F')}</span>
             </dt>
-            <dd>Focus filter</dd>
+            <dd>{t('help.focus')}</dd>
           </div>
           <div>
             <dt>
               <span className="kbd">{formatShortcut('C')}</span>
             </dt>
-            <dd>Copy packed output (or file list)</dd>
+            <dd>{t('help.copy')}</dd>
           </div>
           <div>
             <dt>
               <span className="kbd">{formatShortcut('S')}</span>
             </dt>
-            <dd>Save packed output</dd>
+            <dd>{t('help.save')}</dd>
           </div>
           <div>
             <dt>
               <span className="kbd">Esc</span>
             </dt>
-            <dd>Clear filter / close dialog</dd>
+            <dd>{t('help.esc')}</dd>
           </div>
           <div>
             <dt>
               <span className="kbd">?</span>
             </dt>
-            <dd>Toggle this help</dd>
+            <dd>{t('help.toggle')}</dd>
           </div>
           <div>
             <dt>
               <span className="kbd">F1</span> / <span className="kbd">{formatShortcut('/')}</span>
             </dt>
-            <dd>Documentation & How-To (7 examples)</dd>
+            <dd>{t('help.docs')}</dd>
           </div>
           <div>
             <dt>
               <span className="kbd">Space</span> / <span className="kbd">Enter</span>
             </dt>
-            <dd>Open file preview or expand folder</dd>
+            <dd>{t('help.spaceEnter')}</dd>
           </div>
           <div>
             <dt>
-              <span className="kbd">Right-click</span>
+              <span className="kbd">{t('help.rightClickKey')}</span>
             </dt>
-            <dd>Open with default app / VS Code / choose program</dd>
+            <dd>{t('help.rightClick')}</dd>
           </div>
           <div>
             <dt>
-              <span className="kbd">Checkbox</span>
+              <span className="kbd">{t('help.checkboxKey')}</span>
             </dt>
-            <dd>Include file in packed LLM output</dd>
+            <dd>{t('help.checkbox')}</dd>
           </div>
         </dl>
         <div className="help-theme">
-          <span className="help-theme-label">Appearance</span>
-          <div className="theme-segment" role="group" aria-label="Color theme">
+          <span className="help-theme-label">{t('help.appearance')}</span>
+          <div className="theme-segment" role="group" aria-label={t('help.colorTheme')}>
             {(['light', 'dark', 'system'] as ThemePref[]).map((opt) => (
               <button
                 key={opt}
@@ -894,13 +925,13 @@ export function ShortcutsHelpDialog({ ws }: { ws: WorkspaceState }) {
                 aria-pressed={themePref === opt}
               >
                 {opt === 'light' ? <Sun size={13} /> : opt === 'dark' ? <Moon size={13} /> : <Monitor size={13} />}
-                {themeLabel(opt)}
+                {t(`theme.${opt}`)}
               </button>
             ))}
           </div>
         </div>
         <p className="help-foot">
-          Tip: drop a folder onto the window to open it. Selection presets keep packs small for LLMs.
+          {t('help.foot')}
         </p>
       </div>
     </div>
@@ -920,6 +951,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
     toggleSelect,
     toggleSkeleton,
   } = ws;
+  const { t } = useI18n();
   if (!contextMenu) return null;
   return (
     <div
@@ -934,7 +966,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         className="ctx-item"
         onClick={() => void openFilePreview(contextMenu.path)}
       >
-        <FileCode2 size={14} /> Preview in app
+        <FileCode2 size={14} /> {t('ctx.preview')}
       </button>
       <button
         type="button"
@@ -942,7 +974,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         className="ctx-item"
         onClick={() => void openInDefaultApp(contextMenu.path)}
       >
-        <ExternalLink size={14} /> Open with default app
+        <ExternalLink size={14} /> {t('ctx.openDefault')}
       </button>
       <button
         type="button"
@@ -950,7 +982,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         className="ctx-item"
         onClick={() => void openWithApp('code', contextMenu.path)}
       >
-        Open with VS Code
+        {t('ctx.openVscode')}
       </button>
       <button
         type="button"
@@ -958,7 +990,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         className="ctx-item"
         onClick={() => void openWithApp('notepad++', contextMenu.path)}
       >
-        Open with Notepad++
+        {t('ctx.openNotepad')}
       </button>
       <button
         type="button"
@@ -966,7 +998,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         className="ctx-item"
         onClick={() => void pickAppAndOpen(contextMenu.path)}
       >
-        Choose program…
+        {t('ctx.chooseProgram')}
       </button>
       <div className="ctx-sep" />
       <button
@@ -978,7 +1010,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
           setContextMenu(null);
         }}
       >
-        Toggle pack selection
+        {t('ctx.togglePack')}
       </button>
       <button
         type="button"
@@ -989,7 +1021,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
           setContextMenu(null);
         }}
       >
-        Pack signatures only (Skeleton mode)
+        {t('ctx.skeleton')}
       </button>
       <div className="ctx-sep" />
       <button
@@ -999,7 +1031,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         style={{ fontWeight: 600 }}
         onClick={() => void selectRelatedFiles(contextMenu.path, 'all')}
       >
-        Select with Related Files (Imports + Tests)
+        {t('ctx.related')}
       </button>
       <button
         type="button"
@@ -1007,7 +1039,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         className="ctx-item"
         onClick={() => void selectRelatedFiles(contextMenu.path, 'imports')}
       >
-        Select file + direct imports (1-hop)
+        {t('ctx.imports')}
       </button>
       <button
         type="button"
@@ -1015,7 +1047,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         className="ctx-item"
         onClick={() => void selectRelatedFiles(contextMenu.path, 'importers')}
       >
-        Select file + importers (who uses this?)
+        {t('ctx.importers')}
       </button>
       <button
         type="button"
@@ -1023,7 +1055,7 @@ export function TreeContextMenu({ ws }: { ws: WorkspaceState }) {
         className="ctx-item"
         onClick={() => void selectRelatedFiles(contextMenu.path, 'tests')}
       >
-        Select file + matching tests
+        {t('ctx.tests')}
       </button>
     </div>
   );

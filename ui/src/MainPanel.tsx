@@ -4,35 +4,37 @@ import { formatShortcut } from './platform';
 import { type OutputFormat, type ListFormat, TOKEN_SOFT, TOKEN_HARD, normalizePath, formatBytes, formatTokens, estimateTokensFromBytes } from './treeModel';
 import { CustomProjectsPanel, FolderHistoryPanel, TreeContextMenu, TreeRow } from './Panels';
 import type { WorkspaceState } from './useWorkspace';
+import { useI18n } from './i18n';
 
 export function MainPanel({ ws }: { ws: WorkspaceState }) {
+  const { t, tRich } = useI18n();
   const { ROW_HEIGHT, changeCustomNote, changeFormat, clearCustomDeselect, clearFolderHistory, collapseAll, currentPath, customProjects, expandAll, exportPrefs, exportPromptStudioPack, fileListText, filePreview, fileTokens, fileTree, filterText, focusedPath, folderHistory, format, fullOutputPreview, fullOutputText, generating, handleCopyFileList, handleToggleFullPreview, handleTreeContextMenu, importPrefs, listFormat, nodes, openCustomProject, openFilePreview, openFolder, openHistoryFolder, openInDefaultApp, openWithApp, output, outputBytes, pickAppAndOpen, previewError, previewLoading, previewRelPath, readyBadge, removeCustomProject, removeFolderFromHistory, resizing, scanning, selectedCount, selectedSet, setFilterText, setFocusedPath, setListFormat, setResizing, setShowCustom, setShowHistory, setShowTopConsumers, setTokenSort, setTreeScrollTop, setTreeWidth, setView, showCustom, showHistory, showInitialLoading, showTopConsumers, skeletonSet, startRowIdx, stats, subtreeStats, toggleCustomFavorite, toggleExpand, toggleFolderPin, toggleSelect, toggleSkeleton, tokenSort, totalTreeHeight, treeScrollRef, treeWidth, truncatedPreview, view, virtualSlice, visibleTreeRows } = ws;
   return (
     <>
       {/* Main */}
       <div className="main-content">
-        <aside className="tree-panel" style={{ width: treeWidth }} aria-label="Project files">
+        <aside className="tree-panel" style={{ width: treeWidth }} aria-label={t('main.projectFilesAria')}>
           <div className="panel-header">
-            <span className="panel-title">Files</span>
+            <span className="panel-title">{t('main.files')}</span>
             {currentPath && (
               <div className="panel-meta">
-                <span title="Files and folders after .gitignore">
-                  {nodes.length} items
+                <span title={t('main.itemsTitle')}>
+                  {t('main.items', { count: nodes.length })}
                 </span>
                 <button type="button" className="panel-link" onClick={expandAll}>
-                  Expand
+                  {t('main.expand')}
                 </button>
                 <button type="button" className="panel-link" onClick={collapseAll}>
-                  Collapse
+                  {t('main.collapse')}
                 </button>
                 <button
                   type="button"
                   className="panel-link"
                   aria-pressed={tokenSort}
-                  title="Sort children by estimated token weight"
+                  title={t('main.sortTokensTitle')}
                   onClick={() => setTokenSort((v) => !v)}
                 >
-                  {tokenSort ? 'Sort: tokens' : 'Sort: name'}
+                  {tokenSort ? t('main.sortTokens') : t('main.sortName')}
                 </button>
               </div>
             )}
@@ -42,15 +44,15 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
             ref={treeScrollRef}
             className="file-tree"
             role="tree"
-            aria-label="File tree"
+            aria-label={t('main.fileTreeAria')}
             onScroll={(e) => setTreeScrollTop(e.currentTarget.scrollTop)}
           >
             {scanning && !fileTree.children.length ? (
               <div className="loading-center">
                 <div className="title">
-                  <Loader2 size={18} className="spin icon-accent" /> Scanning…
+                  <Loader2 size={18} className="spin icon-accent" /> {t('main.scanning')}
                 </div>
-                <div className="sub">Respecting .gitignore</div>
+                <div className="sub">{t('main.respectingGitignore')}</div>
               </div>
             ) : visibleTreeRows.length > 0 ? (
               <div
@@ -81,12 +83,12 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
               </div>
             ) : currentPath && filterText ? (
               <div className="empty-state">
-                <div className="empty-title">No matches</div>
+                <div className="empty-title">{t('main.noMatches')}</div>
                 <div className="empty-desc">
-                  Nothing matches “{filterText}”. Try a different filter.
+                  {t('main.noMatchesDesc', { filter: filterText })}
                 </div>
                 <button type="button" className="btn" onClick={() => setFilterText('')}>
-                  Clear filter
+                  {t('main.clearFilter')}
                 </button>
               </div>
             ) : !currentPath ? (
@@ -94,11 +96,15 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                 <div className="empty-icon">
                   <FolderOpen size={26} />
                 </div>
-                <div className="empty-title">Open a project</div>
+                <div className="empty-title">{t('main.openProject')}</div>
                 <div className="empty-desc">
-                  Drop a folder here or open one. We respect your{' '}
-                  <strong className="text-emphasis">.gitignore</strong> exactly
-                  like Git.
+                  {tRich('main.openProjectDesc', undefined, {
+                    strong: (children, key) => (
+                      <strong key={key} className="text-emphasis">
+                        {children}
+                      </strong>
+                    ),
+                  })}
                 </div>
                 <button
                   type="button"
@@ -106,24 +112,24 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                   onClick={() => void openFolder()}
                   data-testid="btn-open-folder-empty"
                 >
-                  <FolderOpen size={15} /> Open folder
+                  <FolderOpen size={15} /> {t('main.openFolder')}
                 </button>
                 <div className="empty-hints">
                   <span className="hint-chip">
-                    <span className="kbd">{formatShortcut('O')}</span> Open
+                    <span className="kbd">{formatShortcut('O')}</span> {t('main.hintOpen')}
                   </span>
                   <span className="hint-chip">
-                    <span className="kbd">{formatShortcut('F')}</span> Filter
+                    <span className="kbd">{formatShortcut('F')}</span> {t('main.hintFilter')}
                   </span>
                   <span className="hint-chip">
-                    <span className="kbd">{formatShortcut('C')}</span> Copy
+                    <span className="kbd">{formatShortcut('C')}</span> {t('main.hintCopy')}
                   </span>
                 </div>
               </div>
             ) : (
               <div className="empty-state">
-                <div className="empty-title">Empty project</div>
-                <div className="empty-desc">No files found after applying .gitignore.</div>
+                <div className="empty-title">{t('main.emptyProject')}</div>
+                <div className="empty-desc">{t('main.emptyProjectDesc')}</div>
               </div>
             )}
           </div>
@@ -134,7 +140,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
           onMouseDown={() => setResizing(true)}
           role="separator"
           aria-orientation="vertical"
-          aria-label="Resize file panel"
+          aria-label={t('main.resizeAria')}
           tabIndex={0}
           onKeyDown={(e) => {
             if (e.key === 'ArrowLeft') setTreeWidth((w) => Math.max(220, w - 16));
@@ -142,9 +148,9 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
           }}
         />
 
-        <section className="preview-panel" aria-label="Output preview">
+        <section className="preview-panel" aria-label={t('main.previewAria')}>
           <div className="preview-header">
-            <div className="tabs" role="tablist" aria-label="Preview mode">
+            <div className="tabs" role="tablist" aria-label={t('main.previewModeAria')}>
               <button
                 type="button"
                 role="tab"
@@ -155,7 +161,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                 className={`tab ${view === 'packed' ? 'active' : ''}`}
                 onClick={() => setView('packed')}
               >
-                <FileText size={14} /> Packed output
+                <FileText size={14} /> {t('main.tabPacked')}
               </button>
               <button
                 type="button"
@@ -167,7 +173,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                 className={`tab ${view === 'list' ? 'active' : ''}`}
                 onClick={() => setView('list')}
               >
-                <List size={14} /> File list
+                <List size={14} /> {t('main.tabList')}
               </button>
               <button
                 type="button"
@@ -178,9 +184,9 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                 tabIndex={view === 'file' ? 0 : -1}
                 className={`tab ${view === 'file' ? 'active' : ''}`}
                 onClick={() => setView('file')}
-                title="In-app file preview with syntax highlighting"
+                title={t('main.tabFileTitle')}
               >
-                <FileCode2 size={14} /> File
+                <FileCode2 size={14} /> {t('main.tabFile')}
                 {previewRelPath ? (
                   <span className="tab-file-name">
                     {previewRelPath.split(/[/\\]/).pop()}
@@ -193,7 +199,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
               {view !== 'file' && (
                 <>
                   <label className="sr-only" htmlFor="format-select">
-                    Output format
+                    {t('main.formatLabel')}
                   </label>
                   <select
                     id="format-select"
@@ -204,7 +210,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                     <option value="xml">XML</option>
                     <option value="markdown">Markdown</option>
                     <option value="json">JSON</option>
-                    <option value="plain">Plain</option>
+                    <option value="plain">{t('main.formatPlain')}</option>
                   </select>
                 </>
               )}
@@ -212,7 +218,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
               {view === 'list' && (
                 <>
                   <label className="sr-only" htmlFor="list-format-select">
-                    List format
+                    {t('main.listFormatLabel')}
                   </label>
                   <select
                     id="list-format-select"
@@ -220,8 +226,8 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                     value={listFormat}
                     onChange={(e) => setListFormat(e.target.value as ListFormat)}
                   >
-                    <option value="tree">Tree</option>
-                    <option value="paths">Paths</option>
+                    <option value="tree">{t('main.listTree')}</option>
+                    <option value="paths">{t('main.listPaths')}</option>
                   </select>
                 </>
               )}
@@ -233,13 +239,13 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
           {showTopConsumers && currentPath && (
             <div className="top-consumers-drawer" data-testid="top-consumers-drawer">
               <div className="top-consumers-header">
-                <span>Top Token Consumers (Top 10 Selected Files)</span>
+                <span>{t('main.topConsumers.title')}</span>
                 <button
                   type="button"
                   className="panel-link"
                   onClick={() => setShowTopConsumers(false)}
                 >
-                  Close
+                  {t('common.close')}
                 </button>
               </div>
               <div className="top-consumers-list">
@@ -262,7 +268,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                         {item.path}
                       </span>
                       <span className="top-consumer-tokens">
-                        ~{formatTokens(item.tokens)} tok
+                        {t('tree.tokens', { tokens: formatTokens(item.tokens) })}
                       </span>
                       <button
                         type="button"
@@ -270,7 +276,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                         style={{ height: 22, padding: '0 6px', fontSize: 11 }}
                         onClick={() => toggleSkeleton(item.path, false)}
                       >
-                        {item.isSkel ? 'Full' : 'Skeletonize'}
+                        {item.isSkel ? t('main.topConsumers.full') : t('main.topConsumers.skeletonize')}
                       </button>
                       <button
                         type="button"
@@ -278,7 +284,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                         style={{ height: 22, padding: '0 6px', fontSize: 11 }}
                         onClick={() => toggleSelect(item.path, false)}
                       >
-                        Exclude
+                        {t('main.topConsumers.exclude')}
                       </button>
                     </div>
                   ))}
@@ -294,8 +300,8 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
               <AlertCircle size={13} aria-hidden />
               <span>
                 {stats.tokens >= TOKEN_HARD
-                  ? `Very large pack (~${formatTokens(stats.tokens)} tokens). Many models will truncate this — deselect more files.`
-                  : `Large pack (~${formatTokens(stats.tokens)} tokens). May exceed smaller context windows.`}
+                  ? t('main.banner.veryLarge', { tokens: formatTokens(stats.tokens) })
+                  : t('main.banner.large', { tokens: formatTokens(stats.tokens) })}
               </span>
             </div>
           )}
@@ -323,12 +329,12 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
               <div className="loading-center">
                 <div className="title">
                   <Loader2 size={18} className="spin icon-accent" />
-                  {scanning ? 'Scanning project…' : 'Preparing packed output…'}
+                  {scanning ? t('main.loading.scanning') : t('main.loading.preparing')}
                 </div>
                 <div className="sub">
                   {selectedCount > 0
-                    ? `${selectedCount} files selected · estimating tokens`
-                    : 'Applying smart source selection'}
+                    ? t('main.loading.selected', { count: selectedCount })
+                    : t('main.loading.smartSelection')}
                 </div>
               </div>
             ) : view === 'file' ? (
@@ -347,10 +353,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                   {(truncatedPreview || output.length > 150_000) && (
                     <div className="preview-inline-actions">
                       <span>
-                        {fullOutputPreview
-                          ? 'Full preview'
-                          : 'Preview limited to 100,000 characters'}
-                        . Copy and Save use the complete output.
+                        {fullOutputPreview ? t('main.previewFull') : t('main.previewLimited')}
                       </span>
                       <button
                         type="button"
@@ -358,8 +361,8 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                         onClick={() => void handleToggleFullPreview()}
                       >
                         {fullOutputPreview
-                          ? 'Limit preview'
-                          : `Show full preview (${formatBytes(outputBytes)})`}
+                          ? t('main.limitPreview')
+                          : t('main.showFullPreview', { size: formatBytes(outputBytes) })}
                       </button>
                     </div>
                   )}
@@ -376,19 +379,22 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                   <div className="empty-icon">
                     <FileText size={24} />
                   </div>
-                  <div className="empty-title">Nothing packed yet</div>
+                  <div className="empty-title">{t('main.nothingPacked')}</div>
                   <div className="empty-desc">
-                    Select files in the tree (checkbox). Click a file name to{' '}
-                    <strong className="text-strong">preview</strong> it.
-                    <strong className="text-strong"> Copy packed</strong> is ready
-                    for your LLM.
+                    {tRich('main.nothingPackedDesc', undefined, {
+                      strong: (children, key) => (
+                        <strong key={key} className="text-strong">
+                          {children}
+                        </strong>
+                      ),
+                    })}
                   </div>
                 </div>
               )
             ) : (
               <div>
                 <pre className="output-text">
-                  {fileListText || 'No files selected.'}
+                  {fileListText || t('main.noFilesSelected')}
                 </pre>
                 {fileListText && (
                   <div className="preview-inline-actions">
@@ -397,7 +403,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
                       className="btn"
                       onClick={() => void handleCopyFileList()}
                     >
-                      <Copy size={14} /> Copy file list ({listFormat})
+                      <Copy size={14} /> {t('main.copyFileList', { format: listFormat })}
                     </button>
                   </div>
                 )}

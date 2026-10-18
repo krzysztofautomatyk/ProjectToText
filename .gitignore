@@ -51,3 +51,10 @@ ui/playwright/.cache/
 *.AppImage
 *.msi
 *.exe
+
+# External tooling
+.freebuff/
+
+# Tauri ACL schemas are auto-generated; committed copies keep builds reproducible.
+# Uncomment to stop tracking local regen noise:
+# gen/schemas/

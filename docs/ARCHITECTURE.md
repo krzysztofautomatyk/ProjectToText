@@ -99,7 +99,18 @@ On the Rust side, `WorkspaceIndex::refresh_paths` updates the current snapshot i
 - **Secret rules**: change `src/core/secrets.rs` and `ui/src/secrets.ts` together and add matching cases to both test suites.
 - **Skeleton languages**: add a grammar and a case in `core::skeleton::language_for_path`.
 
+## Performance notes (from engineering baseline)
+
+On a representative macOS arm64 release run (14 rayon threads), selection over 10,000 paths is about **1 ms** with the set-based matcher (legacy nested predicate was multi-second). Packing 800 synthetic files is about **1.8×** faster on the default rayon pool than on a one-thread pool. Exact `o200k_base` BPE over this repository's source is on the order of **5–6M tokens/s**. AST skeleton mode has cut exact token counts by about **75%** on ptt's own source.
+
+Secret scanning uses 21 rules (including Shannon-entropy gating at $H > 4.5$ bits/char for literals ≥ 32 chars). A fixture corpus of 21 true positives and 20 benign negatives scores 21/21 recall and 0/20 false positives for those shapes — not a rate measured on arbitrary real code.
+
+## UI internationalization
+
+The desktop UI ships a typed i18n module under `ui/src/i18n/` with built-in `en` / `pl` dictionaries, custom language packs (import/export/edit), and preference-snapshot transfer of `activeLocale` + `customPacks`. Default startup locale is `en` when unset (Playwright determinism).
+
 ## Related docs
 
 - [Screenshots](screenshots/): README assets
-- [Engineering review](EXPERT_REVIEW.md): measurements and known limits
+- [Security contract](SECURITY_CONTRACT.md): threat model and guarantees
+- [MCP ADR](ADR_MCP_COMPATIBILITY_AND_SDK.md): protocol compatibility decisions

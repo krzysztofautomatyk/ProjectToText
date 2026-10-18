@@ -28,3 +28,6 @@ context.txt
 # *.min.js
 # **/fixtures/large/**
 # **/*.snap
+
+# External tooling
+.freebuff/

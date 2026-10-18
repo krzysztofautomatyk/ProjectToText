@@ -174,7 +174,7 @@ Installing a desktop app does not necessarily add `ptt` to your `PATH`. See [dev
   - **Top Token Consumers** lists the heaviest selected files with one-click Skeleton or Exclude actions. **Auto-Fit** fits the selection within $\le 90\%$ of the budget.
 - **Prompt Caching (KV-Cache) optimization:** output generation separates files into a stable prefix of unmodified base files followed by Git-modified files at the end of `<files>` (marked with `status="modified"` in XML/JSON or `*(modified)*` in Markdown). This maximizes prompt cache hit rates in Anthropic Claude, OpenAI, and Google Gemini.
 - **Self-Packing protection:** the engine automatically detects and omits previously generated `ptt` context artifacts across all 4 formats (XML, Markdown, JSON, and Plain Text), replacing them with `[Generated ptt context artifact skipped to prevent recursive packing]` to prevent recursive expansion.
-- **AST skeletons:** a tree-sitter pass keeps signatures, types, imports, and doc comments while removing function bodies. It covers Rust, TypeScript/TSX, JavaScript, Python, Go, C#, Java, C, and C++; other files use a brace or indentation fallback. Mark a file or folder with `[S]`. On this repository's own source, skeleton mode cut the exact token count by about 75% (see [engineering review](docs/EXPERT_REVIEW.md)).
+- **AST skeletons:** a tree-sitter pass keeps signatures, types, imports, and doc comments while removing function bodies. It covers Rust, TypeScript/TSX, JavaScript, Python, Go, C#, Java, C, and C++; other files use a brace or indentation fallback. Mark a file or folder with `[S]`. On this repository's own source, skeleton mode cut the exact token count by about 75% (see [architecture guide](docs/ARCHITECTURE.md)).
 - **Dependency neighbors (desktop app):** from a file's context menu, select its imports, its importers, or its related tests.
 - **Git context:** tree badges mark modified, added, untracked, and deleted files. **Select Git Modified** and **Select Branch Changes** select them in one step, and **Include `<git_diff>`** adds the unified diff to the pack.
 - **Prompt templates:** a collapsible prompt bar offers tasks such as architecture and code review, bug investigation, security audit, and test writing. The task is appended as `<task_instructions>` at the end of the pack, after the files.
@@ -510,7 +510,7 @@ ProjectToText/
 
 The desktop and CLI share the Rust walker and output engine. Browser mode has a separate TypeScript implementation. Core modules are unit-tested without opening the GUI; browser smoke tests do not verify native installation or OS trust dialogs.
 
-Read the [architecture guide](docs/ARCHITECTURE.md) for data flow and extension points. The [engineering review](docs/EXPERT_REVIEW.md) records reproduced bugs, measured selection performance, and remaining limitations without unsupported quality scores.
+Read the [architecture guide](docs/ARCHITECTURE.md) for data flow, performance notes, extension points, and known limits.
 
 ## FAQ
 

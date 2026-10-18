@@ -27,6 +27,7 @@ import {
   type PromptStudioUpdateDetail,
 } from './projectPrefs';
 import {
+  applyI18nImport,
   applyPromptStudioImport,
   buildPrefSnapshot,
   exportPromptStudioOnly,
@@ -40,17 +41,19 @@ import {
 } from './prefTransfer';
 import { isTauriRuntime } from './tauriEnv';
 import { isModKey } from './platform';
-import { type FileNode, type GitRepoContext, type ScanResult, type OutputFormat, type ViewMode, type ListFormat, type SelectionPreset, type ToastKind, type BudgetPreset, BUDGET_LIMITS, type ToastItem, normalizePath, applySavedDeselects, formatTokens, TOKEN_ESTIMATE_HINT, isLowPriorityPath, applyPreset, generateFileList, generatePathsList, readStoredFormat, tokenBadgeClass } from './treeModel';
+import { type FileNode, type GitRepoContext, type ScanResult, type OutputFormat, type ViewMode, type ListFormat, type SelectionPreset, type ToastKind, type BudgetPreset, BUDGET_LIMITS, type ToastItem, normalizePath, applySavedDeselects, formatTokens, isLowPriorityPath, applyPreset, generateFileList, generatePathsList, readStoredFormat, tokenBadgeClass } from './treeModel';
 import { useThemeAndLayout } from './useThemeAndLayout';
 import { useGeneration } from './useGeneration';
 import { useSelection } from './useSelection';
 import { useFilePreviewAndMenu } from './useFilePreviewAndMenu';
+import { loadI18nState, useI18n } from './i18n';
 
 export const IN_TAURI = isTauriRuntime();
 
 export { readThemePref, resolveTheme, themeLabel, type ThemePref } from './useThemeAndLayout';
 
 export function useWorkspace() {
+  const { t } = useI18n();
   const [currentPath, setCurrentPath] = useState('');
   const [nodes, setNodes] = useState<FileNode[]>([]);
   const [format, setFormat] = useState<OutputFormat>(() => readStoredFormat());
@@ -336,20 +339,31 @@ export function useWorkspace() {
   /* ─── Preferences export / import ──────────────────── */
 
   const exportPrefs = useCallback(() => {
-    const snapshot = buildPrefSnapshot(customProjects, folderHistory, loadPromptStudioStore());
+    const snapshot = buildPrefSnapshot(
+      customProjects,
+      folderHistory,
+      loadPromptStudioStore(),
+      loadI18nState(),
+    );
     const text = JSON.stringify(snapshot, null, 2);
     downloadText(snapshotFileName(), text);
     const studio = snapshot.promptStudio;
+    const languageCount = snapshot.i18n?.customPacks.length ?? 0;
     pushToast(
       'success',
-      `Exported ${customProjects.length} projects · ${folderHistory.length} history · ${studio?.customPrompts.length ?? 0} prompts`,
+      t('toast.exported', {
+        projects: customProjects.length,
+        history: folderHistory.length,
+        prompts: studio?.customPrompts.length ?? 0,
+        languages: languageCount > 0 ? t('toast.exportedLanguages', { count: languageCount }) : '',
+      }),
     );
-  }, [customProjects, folderHistory, pushToast]);
+  }, [customProjects, folderHistory, pushToast, t]);
 
   const exportPromptStudioPack = useCallback(() => {
     downloadText(promptStudioFileName(), exportPromptStudioOnly());
-    pushToast('success', 'Exported Prompt Studio pack');
-  }, [pushToast]);
+    pushToast('success', t('toast.exportedPrompts'));
+  }, [pushToast, t]);
 
   const cancelImportPrefs = useCallback(() => {
     setImportPreview(null);
@@ -373,21 +387,33 @@ export function useWorkspace() {
         applyPromptStudioImport(result.promptStudio);
         refreshPromptStudio();
       }
+      if (result.i18n) applyI18nImport(result.i18n);
       const promptMsg = result.promptStats
-        ? ` · prompts +${result.promptStats.addedCount}/~${result.promptStats.updatedCount}`
+        ? t('toast.importedPrompts', {
+            added: result.promptStats.addedCount,
+            updated: result.promptStats.updatedCount,
+          })
+        : '';
+      const languageMsg = result.i18n
+        ? t('toast.importedLanguages', { count: result.i18n.customPacks.length })
         : '';
       const secretMsg =
         result.secretWarnings.length > 0
-          ? ` · ⚠ ${result.secretWarnings.length} prompt(s) with secret-like content`
+          ? t('toast.importedSecrets', { count: result.secretWarnings.length })
           : '';
       pushToast(
         'success',
-        `Imported ${result.projectsImported} projects · ${result.historyImported} history${promptMsg}` +
-          (result.skipped > 0 ? ` (${result.skipped} invalid skipped)` : '') +
-          secretMsg,
+        t('toast.imported', {
+          projects: result.projectsImported,
+          history: result.historyImported,
+          prompts: promptMsg,
+          languages: languageMsg,
+          skipped: result.skipped > 0 ? t('toast.importedSkipped', { count: result.skipped }) : '',
+          secrets: secretMsg,
+        }),
       );
     } catch (e) {
-      pushToast('error', e instanceof Error ? e.message : 'Import failed');
+      pushToast('error', e instanceof Error ? e.message : t('toast.importFailed'));
     } finally {
       cancelImportPrefs();
     }
@@ -400,6 +426,7 @@ export function useWorkspace() {
     pushToast,
     refreshPromptStudio,
     cancelImportPrefs,
+    t,
   ]);
 
   const importPrefs = useCallback(async () => {
@@ -435,9 +462,9 @@ export function useWorkspace() {
       setImportMode('merge');
       setImportApplyDefault(Boolean(preview.defaultPromptId));
     } catch (e) {
-      pushToast('error', e instanceof Error ? e.message : 'Import failed');
+      pushToast('error', e instanceof Error ? e.message : t('toast.importFailed'));
     }
-  }, [customProjects, folderHistory, pushToast]);
+  }, [customProjects, folderHistory, pushToast, t]);
 
   const applyPlaybook = useCallback(
     (prompt: CustomPromptTemplate, config?: PromptPresetConfig) => {
@@ -472,7 +499,7 @@ export function useWorkspace() {
       }
       if (config?.includeGitDiff != null) setIncludeGitDiff(config.includeGitDiff);
       refreshPromptStudio();
-      pushToast('success', `Loaded playbook: ${prompt.name}`);
+      pushToast('success', t('toast.loadedPlaybook', { name: prompt.name }));
       if (currentPath && nodes.length > 0) {
         generate(nodes, currentPath, format, true, { prompt: text });
       }
@@ -490,6 +517,7 @@ export function useWorkspace() {
       refreshPromptStudio,
       setFormat,
       setIncludeGitDiff,
+      t,
     ],
   );
 
@@ -530,8 +558,8 @@ export function useWorkspace() {
     setContextMenu(null);
     setFocusedPath(null);
     setShowHistory(false);
-    pushToast('info', 'Project cleared — choose another folder');
-  }, [currentPath, nodes.length, output, pushToast]);
+    pushToast('info', t('toast.projectCleared'));
+  }, [currentPath, nodes.length, output, pushToast, t]);
 
 
   const applyScanResult = useCallback(
@@ -866,16 +894,16 @@ export function useWorkspace() {
     if (!fileListText) return;
     try {
       await navigator.clipboard.writeText(fileListText);
-      pushToast('success', 'File list copied');
+      pushToast('success', t('toast.fileListCopied'));
     } catch {
       try {
         await invoke('copy_to_clipboard', { text: fileListText });
-        pushToast('success', 'File list copied');
+        pushToast('success', t('toast.fileListCopied'));
       } catch {
-        pushToast('error', 'Could not copy file list');
+        pushToast('error', t('toast.fileListCopyFailed'));
       }
     }
-  }, [fileListText, pushToast]);
+  }, [fileListText, pushToast, t]);
 
   /* ─── Keyboard shortcuts ───────────────────────────── */
 
@@ -1050,7 +1078,7 @@ export function useWorkspace() {
     if (generating) {
       return (
         <span className="badge badge-loading">
-          <Loader2 size={11} className="spin" /> updating…
+          <Loader2 size={11} className="spin" /> {t('badge.updating')}
         </span>
       );
     }
@@ -1058,15 +1086,19 @@ export function useWorkspace() {
       const isExact = stats.tokenizerExact === true;
       const breakdown =
         stats.contentTokens !== undefined
-          ? ` (Content: ${isExact ? '' : '~'}${formatTokens(stats.contentTokens)}, Overhead: ${isExact ? '' : '~'}${formatTokens(stats.overheadTokens ?? 0)})`
+          ? t('badge.breakdown', {
+              content: `${isExact ? '' : '~'}${formatTokens(stats.contentTokens)}`,
+              overhead: `${isExact ? '' : '~'}${formatTokens(stats.overheadTokens ?? 0)}`,
+            })
           : '';
-      const hint = isExact
-        ? `Exact BPE token count (o200k_base) on complete serialized artifact.${breakdown}`
-        : `${TOKEN_ESTIMATE_HINT}${breakdown}`;
+      const hint = `${isExact ? t('status.tokens.exactFull') : t('tokens.estimateHint')}${breakdown}`;
       return (
         <span className={tokenBadgeClass(stats.tokens)} title={hint} data-testid="ready-token-badge">
-          <Check size={11} /> ready · {isExact ? '' : '~'}
-          {formatTokens(stats.tokens)} tokens ({isExact ? 'exact BPE' : 'approx'})
+          <Check size={11} />{' '}
+          {t('badge.ready', {
+            tokens: `${isExact ? '' : '~'}${formatTokens(stats.tokens)}`,
+            kind: isExact ? t('tokens.kindExactBpe') : t('tokens.kindApprox'),
+          })}
         </span>
       );
     }

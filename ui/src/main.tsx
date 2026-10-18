@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
+import { I18nProvider } from './i18n'
 
 /** Apply theme before first paint to avoid flash (GitHub-style light/dark/system). */
 const THEME_KEY = 'ptt.theme'
@@ -31,6 +32,8 @@ document.documentElement.setAttribute('data-theme-pref', pref)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <I18nProvider>
+      <App />
+    </I18nProvider>
   </StrictMode>,
 )

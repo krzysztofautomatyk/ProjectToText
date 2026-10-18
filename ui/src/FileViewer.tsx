@@ -8,6 +8,7 @@ import {
   MoreHorizontal,
 } from 'lucide-react';
 import { highlightCode } from './syntax';
+import { useI18n, type TranslationKey } from './i18n';
 
 export interface FilePreviewData {
   path: string;
@@ -37,11 +38,11 @@ type Props = {
   onOpenWithCommand: (cmd: string) => void;
 };
 
-const QUICK_APPS: { label: string; cmd: string; title: string }[] = [
-  { label: 'VS Code', cmd: 'code', title: 'Open with Visual Studio Code (`code`)' },
-  { label: 'VS Code Insiders', cmd: 'code-insiders', title: 'Open with VS Code Insiders' },
-  { label: 'Cursor', cmd: 'cursor', title: 'Open with Cursor' },
-  { label: 'Notepad++', cmd: 'notepad++', title: 'Open with Notepad++ (if on PATH)' },
+const QUICK_APPS: { label: string; cmd: string; titleKey: TranslationKey }[] = [
+  { label: 'VS Code', cmd: 'code', titleKey: 'viewer.app.code' },
+  { label: 'VS Code Insiders', cmd: 'code-insiders', titleKey: 'viewer.app.codeInsiders' },
+  { label: 'Cursor', cmd: 'cursor', titleKey: 'viewer.app.cursor' },
+  { label: 'Notepad++', cmd: 'notepad++', titleKey: 'viewer.app.notepad' },
 ];
 
 export default function FileViewer({
@@ -53,6 +54,7 @@ export default function FileViewer({
   onOpenWithPicker,
   onOpenWithCommand,
 }: Props) {
+  const { t } = useI18n();
   const [highlightedHtml, setHighlightedHtml] = useState<string>('');
   const [isHighlighting, setIsHighlighting] = useState(false);
 
@@ -101,7 +103,7 @@ export default function FileViewer({
     return (
       <div className="loading-center">
         <div className="title">
-          <Loader2 size={18} className="spin icon-accent" /> Loading file…
+          <Loader2 size={18} className="spin icon-accent" /> {t('viewer.loading')}
         </div>
       </div>
     );
@@ -110,7 +112,7 @@ export default function FileViewer({
   if (error) {
     return (
       <div className="empty-state">
-        <div className="empty-title">Could not open file</div>
+        <div className="empty-title">{t('viewer.errorTitle')}</div>
         <div className="empty-desc">{error}</div>
       </div>
     );
@@ -122,11 +124,8 @@ export default function FileViewer({
         <div className="empty-icon">
           <FileCode2 size={24} />
         </div>
-        <div className="empty-title">No file selected</div>
-        <div className="empty-desc">
-          Click a file in the tree to preview it with syntax highlighting. Use the
-          checkbox to include files in the packed LLM output.
-        </div>
+        <div className="empty-title">{t('viewer.noneTitle')}</div>
+        <div className="empty-desc">{t('viewer.noneDesc')}</div>
       </div>
     );
   }
@@ -139,31 +138,31 @@ export default function FileViewer({
           <span className="file-viewer-path">{preview.relativePath}</span>
           <span className="file-viewer-chip">{preview.language}</span>
           <span className="file-viewer-chip">{formatBytes(preview.size)}</span>
-          {preview.truncated && <span className="file-viewer-chip warn">truncated</span>}
-          {preview.binary && <span className="file-viewer-chip warn">binary</span>}
-          {isHighlighting && <span className="file-viewer-chip">highlighting…</span>}
+          {preview.truncated && <span className="file-viewer-chip warn">{t('viewer.truncated')}</span>}
+          {preview.binary && <span className="file-viewer-chip warn">{t('viewer.binary')}</span>}
+          {isHighlighting && <span className="file-viewer-chip">{t('viewer.highlighting')}</span>}
         </div>
-        <div className="file-viewer-actions" role="group" aria-label="Open file">
+        <div className="file-viewer-actions" role="group" aria-label={t('viewer.openGroup')}>
           <button
             type="button"
             className="btn"
             onClick={onOpenDefault}
-            title="Open with the system default application"
+            title={t('viewer.defaultTitle')}
           >
-            <ExternalLink size={14} /> Default app
+            <ExternalLink size={14} /> {t('viewer.defaultApp')}
           </button>
           <button
             type="button"
             className="btn"
             onClick={onOpenWithCode}
-            title="Open with VS Code (`code` on PATH)"
+            title={t('viewer.codeTitle')}
           >
             <AppWindow size={14} /> VS Code
           </button>
           <div className="open-with-menu">
             <details className="open-with-details">
-              <summary className="btn" title="More open options">
-                <MoreHorizontal size={14} /> Open with…
+              <summary className="btn" title={t('viewer.moreTitle')}>
+                <MoreHorizontal size={14} /> {t('viewer.openWith')}
               </summary>
               <div className="open-with-dropdown" role="menu">
                 {QUICK_APPS.map((a) => (
@@ -172,7 +171,7 @@ export default function FileViewer({
                     type="button"
                     role="menuitem"
                     className="open-with-item"
-                    title={a.title}
+                    title={t(a.titleKey)}
                     onClick={() => onOpenWithCommand(a.cmd)}
                   >
                     {a.label}
@@ -184,7 +183,7 @@ export default function FileViewer({
                   className="open-with-item"
                   onClick={onOpenWithPicker}
                 >
-                  Choose program…
+                  {t('viewer.chooseProgram')}
                 </button>
               </div>
             </details>

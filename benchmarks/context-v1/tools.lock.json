@@ -5,7 +5,9 @@
     "tracked_patch_sha256": "9e5a880fba9240c6672830c86ba588234c663a3ea2570785eb4bafd6463c911b",
     "tracked_patch_bytes": 227867,
     "tree_id": "46bd9734d03df2d13d1bc1a5569cda34127a2bf4",
-    "untracked_exclusions": ["deny.toml", "docs/PRODUCT_STRATEGY_LLM_BRIEF.md"]
+    "untracked_exclusions": [
+      "deny.toml"
+    ]
   },
   "environment": {
     "os": "macOS 27.0.0 original benchmark run; 27.0.1 on resumed verification",
@@ -40,22 +42,37 @@
       "executed": false,
       "reason": "no local models installed"
     },
-    "code2prompt": {"executed": false},
-    "gitingest": {"executed": false},
-    "repoprompt_ce": {"executed": false}
+    "code2prompt": {
+      "executed": false
+    },
+    "gitingest": {
+      "executed": false
+    },
+    "repoprompt_ce": {
+      "executed": false
+    }
   },
   "corpus": {
     "benchmark_mode": "fixed relevant-file packs; not selection-quality evaluation",
     "tasks_file": "tasks.jsonl",
     "task_fixture_files_each": 3,
-    "source_corpus": {"files": 51, "bytes": 732042, "o200k_base_tokens": 175470},
+    "source_corpus": {
+      "files": 51,
+      "bytes": 732042,
+      "o200k_base_tokens": 175470
+    },
     "synthetic_context_fixture_tasks": 3,
-    "synthetic_context_fixture_budget_tokens": [3200, 3400]
+    "synthetic_context_fixture_budget_tokens": [
+      3200,
+      3400
+    ]
   },
   "constraints": {
     "remote_models": false,
     "source_uploaded_to_hosted_model": false,
-    "platforms_tested": ["macOS arm64"],
+    "platforms_tested": [
+      "macOS arm64"
+    ],
     "timing_protocol": "single-host local, no CPU isolation; timing samples descriptive only",
     "gold_file_labels_independently_reviewed": false,
     "line_span_gold": false,

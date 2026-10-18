@@ -17,6 +17,7 @@ import {
 } from './projectPrefs';
 import { redactSecrets, redactSecretsWithReport } from './secrets';
 import { estimateTokens, formatTokens } from './treeModel';
+import { useI18n, type TranslationKey } from './i18n';
 
 const CATEGORIES: PromptCategory[] = [
   'architecture',
@@ -29,10 +30,10 @@ const CATEGORIES: PromptCategory[] = [
   'custom',
 ];
 
-const PLACEMENTS: { id: PromptPlacement; label: string }[] = [
-  { id: 'prefix', label: 'Prefix — before code' },
-  { id: 'suffix', label: 'Suffix — after code' },
-  { id: 'wrap', label: 'Wrap — start + reminder' },
+const PLACEMENTS: { id: PromptPlacement; labelKey: TranslationKey }[] = [
+  { id: 'prefix', labelKey: 'ps.placement.prefix' },
+  { id: 'suffix', labelKey: 'ps.placement.suffix' },
+  { id: 'wrap', labelKey: 'ps.placement.wrap' },
 ];
 
 const VARIABLE_CHIPS = [
@@ -61,6 +62,7 @@ export function PromptStudioManager({
   onSelectPrompt,
   pushToast,
 }: PromptStudioManagerProps) {
+  const { t } = useI18n();
   const [tick, setTick] = useState(0);
   const store = useMemo(() => loadPromptStudioStore(), [tick, open]);
   const customPrompts = store.customPrompts;
@@ -77,7 +79,7 @@ export function PromptStudioManager({
   const contentRef = useRef<HTMLTextAreaElement>(null);
 
   const refresh = () => {
-    setTick((t) => t + 1);
+    setTick((n) => n + 1);
     onPromptsChanged();
   };
 
@@ -153,12 +155,12 @@ export function PromptStudioManager({
           setGlobalDefaultPrompt(saved.id);
         }
       }
-      pushToast('success', `Zapisano prompt „${saved.name}”`);
+      pushToast('success', t('ps.saved', { name: saved.name }));
       setEditingId(null);
       refresh();
       onSelectPrompt(saved);
     } catch (e) {
-      pushToast('error', e instanceof Error ? e.message : 'Save failed');
+      pushToast('error', e instanceof Error ? e.message : t('ps.saveFailed'));
     }
   };
 
@@ -184,14 +186,14 @@ export function PromptStudioManager({
       >
         <div className="prompt-studio-modal-header">
           <div>
-            <h2 id="prompt-studio-modal-title">Prompt Studio — Zarządzaj Promptami</h2>
-            <p className="meta-inline">Własne szablony, domyślne (global / projekt), zmienne dynamiczne.</p>
+            <h2 id="prompt-studio-modal-title">{t('ps.title')}</h2>
+            <p className="meta-inline">{t('ps.subtitle')}</p>
           </div>
           <button
             type="button"
             className="btn btn-ghost btn-icon"
             onClick={onClose}
-            aria-label="Close Prompt Studio manager"
+            aria-label={t('ps.closeAria')}
           >
             <X size={14} />
           </button>
@@ -204,9 +206,9 @@ export function PromptStudioManager({
             data-testid="create-custom-prompt-btn"
             onClick={startCreate}
           >
-            <Plus size={14} aria-hidden /> Dodaj
+            <Plus size={14} aria-hidden /> {t('ps.add')}
           </button>
-          <div className="prompt-default-scope" role="group" aria-label="Default prompt scope">
+          <div className="prompt-default-scope" role="group" aria-label={t('ps.scopeAria')}>
             <label>
               <input
                 type="radio"
@@ -214,7 +216,7 @@ export function PromptStudioManager({
                 checked={defaultScope === 'global'}
                 onChange={() => setDefaultScope('global')}
               />{' '}
-              Domyślny globalnie
+              {t('ps.scopeGlobal')}
             </label>
             <label>
               <input
@@ -224,16 +226,16 @@ export function PromptStudioManager({
                 onChange={() => setDefaultScope('workspace')}
                 disabled={!workspacePath}
               />{' '}
-              Domyślny dla tego projektu
+              {t('ps.scopeProject')}
             </label>
           </div>
         </div>
 
         <div className="prompt-studio-modal-layout">
           <div className="prompt-studio-list-col">
-            <h3>Moje Prompty</h3>
+            <h3>{t('ps.myPrompts')}</h3>
             {customPrompts.length === 0 ? (
-              <p className="meta-inline">Brak własnych promptów — kliknij Dodaj.</p>
+              <p className="meta-inline">{t('ps.noPrompts')}</p>
             ) : (
               <ul className="prompt-studio-card-list">
                 {customPrompts.map((p) => (
@@ -243,7 +245,7 @@ export function PromptStudioManager({
                       <span className="docs-tag">{p.category}</span>
                       {isDefault(p.id) && (
                         <span className="prompt-default-badge" data-testid="prompt-default-badge">
-                          DOMYŚLNY
+                          {t('ps.badge')}
                         </span>
                       )}
                     </button>
@@ -252,8 +254,8 @@ export function PromptStudioManager({
                         type="button"
                         className={`btn btn-icon btn-star-default${isDefault(p.id) ? ' active' : ''}`}
                         data-testid="toggle-default-prompt-btn"
-                        aria-label={isDefault(p.id) ? 'Clear default' : 'Set as default'}
-                        title={isDefault(p.id) ? '★ Domyślny' : '☆ Ustaw jako domyślny'}
+                        aria-label={isDefault(p.id) ? t('ps.clearDefault') : t('ps.setDefault')}
+                        title={isDefault(p.id) ? t('ps.defaultOn') : t('ps.defaultOff')}
                         onClick={() => {
                           try {
                             if (isDefault(p.id)) {
@@ -278,12 +280,12 @@ export function PromptStudioManager({
                       <button
                         type="button"
                         className="btn btn-icon"
-                        aria-label={`Duplicate ${p.name}`}
+                        aria-label={t('ps.duplicateAria', { name: p.name })}
                         onClick={() => {
                           try {
                             duplicatePromptTemplate(p.id);
                             refresh();
-                            pushToast('success', 'Zduplikowano prompt');
+                            pushToast('success', t('ps.duplicated'));
                           } catch (err) {
                             pushToast('error', String(err));
                           }
@@ -295,12 +297,12 @@ export function PromptStudioManager({
                         type="button"
                         className="btn btn-icon danger"
                         data-testid="delete-custom-prompt-btn"
-                        aria-label={`Delete ${p.name}`}
+                        aria-label={t('ps.deleteAria', { name: p.name })}
                         onClick={() => {
                           deleteCustomPrompt(p.id);
                           if (editingId === p.id) setEditingId(null);
                           refresh();
-                          pushToast('info', `Usunięto „${p.name}”`);
+                          pushToast('info', t('ps.deleted', { name: p.name }));
                         }}
                       >
                         <Trash2 size={13} />
@@ -311,7 +313,7 @@ export function PromptStudioManager({
               </ul>
             )}
 
-            <h3>Wbudowane Playbooki</h3>
+            <h3>{t('ps.builtIn')}</h3>
             <ul className="prompt-studio-card-list built-in">
               {BUILT_IN_PROMPTS.map((p) => (
                 <li key={p.id} className="prompt-studio-card">
@@ -322,14 +324,14 @@ export function PromptStudioManager({
                   >
                     <strong>{p.name}</strong>
                     <span className="docs-tag">{p.category}</span>
-                    {isDefault(p.id) && <span className="prompt-default-badge">DOMYŚLNY</span>}
+                    {isDefault(p.id) && <span className="prompt-default-badge">{t('ps.badge')}</span>}
                   </button>
                   <div className="prompt-studio-card-actions">
                     <button
                       type="button"
                       className={`btn btn-icon btn-star-default${isDefault(p.id) ? ' active' : ''}`}
                       data-testid="toggle-default-prompt-btn"
-                      aria-label={isDefault(p.id) ? 'Clear default' : 'Set as default'}
+                      aria-label={isDefault(p.id) ? t('ps.clearDefault') : t('ps.setDefault')}
                       onClick={() => {
                         try {
                           if (isDefault(p.id)) {
@@ -350,14 +352,14 @@ export function PromptStudioManager({
                     <button
                       type="button"
                       className="btn btn-icon"
-                      aria-label={`Duplicate ${p.name}`}
-                      title="Duplikuj jako własny"
+                      aria-label={t('ps.duplicateAria', { name: p.name })}
+                      title={t('ps.duplicateAsCustom')}
                       onClick={() => {
                         try {
                           const copy = duplicatePromptTemplate(p.id);
                           refresh();
                           startEdit(copy);
-                          pushToast('success', `Utworzono kopię „${copy.name}”`);
+                          pushToast('success', t('ps.copyCreated', { name: copy.name }));
                         } catch (err) {
                           pushToast('error', String(err));
                         }
@@ -374,9 +376,9 @@ export function PromptStudioManager({
           <div className="prompt-studio-editor-col">
             {editingId ? (
               <>
-                <h3>{editingId === 'new' ? 'Nowy prompt' : 'Edycja promptu'}</h3>
+                <h3>{editingId === 'new' ? t('ps.newPrompt') : t('ps.editPrompt')}</h3>
                 <label className="prompt-field-label" htmlFor="custom-prompt-name-input">
-                  Nazwa
+                  {t('ps.name')}
                 </label>
                 <input
                   id="custom-prompt-name-input"
@@ -385,11 +387,11 @@ export function PromptStudioManager({
                   value={name}
                   maxLength={MAX_PROMPT_NAME_LEN}
                   onChange={(e) => setName(e.target.value)}
-                  aria-label="Prompt name"
+                  aria-label={t('ps.nameAria')}
                 />
 
                 <label className="prompt-field-label" htmlFor="custom-prompt-category">
-                  Kategoria
+                  {t('ps.category')}
                 </label>
                 <select
                   id="custom-prompt-category"
@@ -397,7 +399,7 @@ export function PromptStudioManager({
                   data-testid="custom-prompt-category-select"
                   value={category}
                   onChange={(e) => setCategory(e.target.value as PromptCategory)}
-                  aria-label="Prompt category"
+                  aria-label={t('ps.categoryAria')}
                 >
                   {CATEGORIES.map((c) => (
                     <option key={c} value={c}>
@@ -407,7 +409,7 @@ export function PromptStudioManager({
                 </select>
 
                 <label className="prompt-field-label" htmlFor="custom-prompt-placement">
-                  Pozycja w kontekście
+                  {t('ps.placement')}
                 </label>
                 <select
                   id="custom-prompt-placement"
@@ -415,27 +417,27 @@ export function PromptStudioManager({
                   data-testid="custom-prompt-placement-select"
                   value={placement}
                   onChange={(e) => setPlacement(e.target.value as PromptPlacement)}
-                  aria-label="Prompt placement"
+                  aria-label={t('ps.placementAria')}
                 >
                   {PLACEMENTS.map((p) => (
                     <option key={p.id} value={p.id}>
-                      {p.label}
+                      {t(p.labelKey)}
                     </option>
                   ))}
                 </select>
 
                 <label className="prompt-field-label" htmlFor="custom-prompt-desc">
-                  Opis
+                  {t('ps.description')}
                 </label>
                 <input
                   id="custom-prompt-desc"
                   className="select"
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
-                  aria-label="Prompt description"
+                  aria-label={t('ps.descriptionAria')}
                 />
 
-                <div className="variable-chips-bar" data-testid="variable-chips-bar" role="group" aria-label="Insert variables">
+                <div className="variable-chips-bar" data-testid="variable-chips-bar" role="group" aria-label={t('ps.variablesAria')}>
                   {VARIABLE_CHIPS.map((key) => (
                     <button
                       key={key}
@@ -450,7 +452,7 @@ export function PromptStudioManager({
                 </div>
 
                 <label className="prompt-field-label" htmlFor="custom-prompt-content-input">
-                  Treść promptu
+                  {t('ps.content')}
                 </label>
                 <textarea
                   id="custom-prompt-content-input"
@@ -460,21 +462,23 @@ export function PromptStudioManager({
                   value={content}
                   maxLength={MAX_PROMPT_CONTENT_LEN}
                   onChange={(e) => setContent(e.target.value)}
-                  aria-label="Prompt content"
+                  aria-label={t('ps.contentAria')}
                   rows={12}
                 />
                 <div className="prompt-content-meta">
                   <span>
-                    {content.length.toLocaleString()} / {MAX_PROMPT_CONTENT_LEN.toLocaleString()} znaków
+                    {t('ps.chars', {
+                      count: content.length.toLocaleString(),
+                      max: MAX_PROMPT_CONTENT_LEN.toLocaleString(),
+                    })}
                   </span>
-                  <span>~{formatTokens(tokenEst)} tokens</span>
+                  <span>{t('ps.tokens', { tokens: formatTokens(tokenEst) })}</span>
                 </div>
 
                 {secretReport.summary.totalRedactions > 0 && (
                   <div className="prompt-secret-warning" role="status" data-testid="prompt-secret-warning">
                     <span>
-                      Wykryto potencjalne sekrety ({secretReport.summary.totalRedactions}). Nie zapisuj
-                      kluczy API w promptach.
+                      {t('ps.secretWarning', { count: secretReport.summary.totalRedactions })}
                     </span>
                     <button
                       type="button"
@@ -482,7 +486,7 @@ export function PromptStudioManager({
                       data-testid="redact-prompt-secret-btn"
                       onClick={() => setContent(redactSecrets(content))}
                     >
-                      Zredaguj sekret [REDACTED]
+                      {t('ps.redactSecret')}
                     </button>
                   </div>
                 )}
@@ -494,12 +498,12 @@ export function PromptStudioManager({
                     checked={setAsDefault}
                     onChange={(e) => setSetAsDefault(e.target.checked)}
                   />
-                  Ustaw ten prompt jako domyślny od razu po zapisaniu
+                  {t('ps.setDefaultOnSave')}
                 </label>
 
                 <div className="prompt-studio-editor-actions">
                   <button type="button" className="btn btn-ghost" onClick={() => setEditingId(null)}>
-                    Anuluj
+                    {t('ps.cancel')}
                   </button>
                   <button
                     type="button"
@@ -507,14 +511,14 @@ export function PromptStudioManager({
                     data-testid="save-custom-prompt-btn"
                     onClick={saveForm}
                   >
-                    Zapisz
+                    {t('ps.save')}
                   </button>
                 </div>
               </>
             ) : (
               <div className="prompt-studio-editor-empty">
                 <Star size={22} aria-hidden />
-                <p>Wybierz prompt z listy lub utwórz nowy, aby edytować treść i zmienne.</p>
+                <p>{t('ps.emptyEditor')}</p>
               </div>
             )}
           </div>

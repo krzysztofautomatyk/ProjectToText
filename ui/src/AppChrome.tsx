@@ -1,14 +1,19 @@
-import { type ChangeEvent } from 'react';
+import { useState, type ChangeEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { BookOpen, Copy, FolderOpen, GitBranch, History as HistoryIcon, Info, List, Loader2, Monitor, Moon, RefreshCw, Save, Search, Shield, SlidersHorizontal, Sparkles, Download, Sun, X } from 'lucide-react';
+import { BookOpen, Copy, FolderOpen, GitBranch, History as HistoryIcon, Info, Languages, List, Loader2, Monitor, Moon, RefreshCw, Save, Search, Shield, SlidersHorizontal, Sparkles, Download, Sun, X } from 'lucide-react';
 import APP_VERSION from './version';
 import { formatShortcut } from './platform';
-import { TOKEN_SOFT, TOKEN_HARD, formatTokens, TOKEN_ESTIMATE_HINT } from './treeModel';
+import { TOKEN_SOFT, TOKEN_HARD, formatTokens } from './treeModel';
 import { ABOUT_REPO_URL, AboutDialog, ImportPrefsDialog, ShortcutsHelpDialog } from './Panels';
 import { DocumentationAndHowToModal } from './DocumentationModal';
-import { IN_TAURI, themeLabel, type WorkspaceState } from './useWorkspace';
+import { IN_TAURI, type ThemePref, type WorkspaceState } from './useWorkspace';
+import { LanguageManagerModal } from './LanguageManagerModal';
+import { useI18n } from './i18n';
 
 export function AppHeader({ ws }: { ws: WorkspaceState }) {
+  const { t, tRich, locale, locales, setLocale } = useI18n();
+  const [showLanguageStudio, setShowLanguageStudio] = useState(false);
+  const themeName = (pref: ThemePref) => t(`theme.${pref}`);
   const { availableUpdate, browserMode, clearCurrentProject, currentPath, customProjects, cycleTheme, folderHistory, generating, handleCopy, handleCopyFileList, handleSave, installUpdate, nodes, openFolder, output, resolvedTheme, scan, scanning, selectedCount, setShowCustom, setShowHistory, showCustom, showHistory, themePref, updateBusy, updateError } = ws;
   return (
     <>
@@ -23,7 +28,7 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
               <span className="brand-name">ProjectToText</span>
               <span
                 className="brand-version"
-                title="Application version"
+                title={t('header.versionTitle')}
                 data-testid="app-version"
               >
                 v{APP_VERSION}
@@ -48,18 +53,18 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
               disabled={updateBusy}
               title={
                 updateError
-                  ? `Update failed: ${updateError}. Click to retry.`
-                  : `Version ${availableUpdate.version} is available. Click to install and restart.`
+                  ? t('header.update.failedTitle', { error: updateError })
+                  : t('header.update.availableTitle', { version: availableUpdate.version })
               }
               data-testid="update-button"
             >
               {updateBusy ? <Loader2 size={14} className="spin" /> : <Download size={14} />}
               <span>
                 {updateBusy
-                  ? 'Installing…'
+                  ? t('header.update.installing')
                   : updateError
-                    ? 'Update failed, retry'
-                    : `Update to v${availableUpdate.version}`}
+                    ? t('header.update.retry')
+                    : t('header.update.to', { version: availableUpdate.version })}
               </span>
             </button>
           )}
@@ -67,8 +72,8 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
             type="button"
             className="btn btn-icon theme-toggle"
             onClick={cycleTheme}
-            title={`Theme: ${themeLabel(themePref)} (${resolvedTheme}). Click to cycle Light → Dark → System`}
-            aria-label={`Theme ${themeLabel(themePref)}. Click to change.`}
+            title={t('header.theme.title', { theme: themeName(themePref), resolved: themeName(resolvedTheme) })}
+            aria-label={t('header.theme.aria', { theme: themeName(themePref) })}
           >
             {themePref === 'light' ? (
               <Sun size={15} />
@@ -79,19 +84,51 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
             )}
           </button>
 
+          <div className="language-switcher">
+            <select
+              className="select language-switcher-select"
+              value={locale}
+              onChange={(e) => setLocale(e.target.value)}
+              aria-label={t('lang.switcher.aria')}
+              title={t('lang.switcher.title', {
+                name: locales.find((l) => l.code === locale)?.nativeName ?? locale,
+              })}
+              data-testid="language-switcher-select"
+            >
+              {locales
+                .filter((l, i) => locales.findIndex((o) => o.code === l.code) === i)
+                .map((l) => (
+                  <option key={l.code} value={l.code} title={l.nativeName}>
+                    {`🌐 ${l.code.toUpperCase()}`}
+                  </option>
+                ))}
+            </select>
+            <button
+              type="button"
+              className="btn btn-icon"
+              onClick={() => setShowLanguageStudio(true)}
+              title={t('lang.open.title')}
+              aria-label={t('lang.open.aria')}
+              aria-haspopup="dialog"
+              data-testid="open-language-studio-btn"
+            >
+              <Languages size={15} />
+            </button>
+          </div>
+
           <button
             type="button"
             className={`btn history-toggle${showCustom ? ' is-active' : ''}`}
             onClick={() => setShowCustom((visible) => !visible)}
-            title="Custom projects — saved exclusions, favorites, notes"
-            aria-label="Open custom projects"
+            title={t('header.custom.title')}
+            aria-label={t('header.custom.aria')}
             aria-expanded={showCustom}
             data-testid="btn-custom-projects"
           >
             <SlidersHorizontal size={15} />
-            <span className="btn-label">Custom</span>
+            <span className="btn-label">{t('header.custom.label')}</span>
             {customProjects.length > 0 && (
-              <span className="history-count" aria-label={`${customProjects.length} custom projects`}>
+              <span className="history-count" aria-label={t('header.custom.count', { count: customProjects.length })}>
                 {customProjects.length}
               </span>
             )}
@@ -101,15 +138,15 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
             type="button"
             className={`btn history-toggle${showHistory ? ' is-active' : ''}`}
             onClick={() => setShowHistory((visible) => !visible)}
-            title="Open folder history"
-            aria-label="Open folder history"
+            title={t('header.history.title')}
+            aria-label={t('header.history.aria')}
             aria-expanded={showHistory}
             data-testid="btn-folder-history"
           >
             <HistoryIcon size={15} />
-            <span className="btn-label">History</span>
+            <span className="btn-label">{t('header.history.label')}</span>
             {folderHistory.length > 0 && (
-              <span className="history-count" aria-label={`${folderHistory.length} folders`}>
+              <span className="history-count" aria-label={t('header.history.count', { count: folderHistory.length })}>
                 {folderHistory.length}
               </span>
             )}
@@ -121,10 +158,10 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
             type="button"
             onClick={() => void openFolder()}
             className="btn"
-            title={`Open folder (${formatShortcut('O')})`}
+            title={t('header.open.title', { shortcut: formatShortcut('O') })}
             data-testid="btn-open-folder"
           >
-            <FolderOpen size={15} /> Open
+            <FolderOpen size={15} /> {t('header.open.label')}
             <span className="kbd">{formatShortcut('O')}</span>
           </button>
 
@@ -133,9 +170,9 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
             onClick={() => currentPath && void scan(currentPath)}
             className="btn"
             disabled={!currentPath || scanning}
-            title={`Refresh (${formatShortcut('R')})`}
+            title={t('header.refresh.title', { shortcut: formatShortcut('R') })}
           >
-            <RefreshCw size={15} className={scanning ? 'spin' : ''} /> Refresh
+            <RefreshCw size={15} className={scanning ? 'spin' : ''} /> {t('header.refresh.label')}
           </button>
 
           <button
@@ -143,22 +180,22 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
             onClick={clearCurrentProject}
             className="btn"
             disabled={scanning || (!currentPath && nodes.length === 0 && !output)}
-            title="Clear current project and choose another folder"
+            title={t('header.clear.title')}
             data-testid="btn-clear-project"
           >
-            <X size={15} /> Clear
+            <X size={15} /> {t('header.clear.label')}
           </button>
 
           <div className="toolbar-sep" />
 
-          <div className="action-cluster" role="group" aria-label="Output actions">
+          <div className="action-cluster" role="group" aria-label={t('header.actions.group')}>
             <button
               type="button"
               onClick={() => void handleCopyFileList()}
               className="btn btn-icon"
               disabled={selectedCount === 0}
-              title="Copy selected files as tree or paths"
-              aria-label="Copy file list"
+              title={t('header.copyList.title')}
+              aria-label={t('header.copyList.aria')}
             >
               <List size={15} />
             </button>
@@ -170,18 +207,18 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
               disabled={!output}
               title={
                 generating && !output
-                  ? 'Preparing packed output…'
-                  : `Copy packed content (${formatShortcut('C')})`
+                  ? t('header.copy.preparingTitle')
+                  : t('header.copy.title', { shortcut: formatShortcut('C') })
               }
             >
               {generating && !output ? (
                 <>
-                  <Loader2 size={15} className="spin" /> Preparing…
+                  <Loader2 size={15} className="spin" /> {t('header.copy.preparing')}
                 </>
               ) : (
                 <>
                   <Copy size={15} />
-                  <span className="btn-label">Copy packed</span>
+                  <span className="btn-label">{t('header.copy.label')}</span>
                 </>
               )}
             </button>
@@ -191,8 +228,8 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
               onClick={() => void handleSave()}
               className="btn btn-icon"
               disabled={!output}
-              title={`Save (${formatShortcut('S')})`}
-              aria-label="Save packed output"
+              title={t('header.save.title', { shortcut: formatShortcut('S') })}
+              aria-label={t('header.save.aria')}
             >
               <Save size={15} />
             </button>
@@ -203,22 +240,21 @@ export function AppHeader({ ws }: { ws: WorkspaceState }) {
       {browserMode && (
         <div className="browser-mode-banner" role="status" data-testid="browser-mode-banner">
           <Info size={13} aria-hidden />
-          <span>
-            <strong>Browser mode</strong> — evaluates in-folder <code>.gitignore</code> and{' '}
-            <code>.pttignore</code> rules, caps packs at 400 files, and uses approximate token
-            estimates (<code>chars ÷ 3.8</code>). It does not run Git (tracked-file state, global
-            ignores, or <code>git diff</code>) or native editor launchers; run{' '}
-            <code>cargo tauri dev</code> or <code>ptt pack</code> when full Git/BPE fidelity is
-            required.
-          </span>
+          <span>{tRich('header.browserBanner')}</span>
         </div>
       )}
 
+      <LanguageManagerModal
+        open={showLanguageStudio}
+        onClose={() => setShowLanguageStudio(false)}
+        pushToast={ws.pushToast}
+      />
     </>
   );
 }
 
 export function AppToolbar({ ws }: { ws: WorkspaceState }) {
+  const { t } = useI18n();
   const { applySelectionPreset, currentPath, deselectAll, filterRef, filterText, filteredTree, gitContext, includeGitDiff, preset, redactSecretsEnabled, redactionSummary, scan, selectAll, selectGitFiles, selectedCount, setFilterText, setShowPromptStudio, showPromptStudio, toggleIncludeGitDiff, toggleRedactSecrets, totalFiles, workspaceChangedOnDisk } = ws;
   return (
     <>
@@ -229,18 +265,18 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
           <input
             ref={filterRef}
             type="search"
-            placeholder="Filter files…"
+            placeholder={t('toolbar.filter.placeholder')}
             value={filterText}
             onChange={(e: ChangeEvent<HTMLInputElement>) => setFilterText(e.target.value)}
-            aria-label="Filter files"
+            aria-label={t('toolbar.filter.aria')}
           />
           {filterText && (
             <button
               type="button"
               className="search-clear"
               onClick={() => setFilterText('')}
-              title="Clear filter (Esc)"
-              aria-label="Clear filter"
+              title={t('toolbar.filter.clearTitle')}
+              aria-label={t('toolbar.filter.clearAria')}
             >
               <X size={12} />
             </button>
@@ -255,11 +291,11 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
             disabled={!currentPath}
             title={
               filterText.trim()
-                ? 'Select all files matching the current filter'
-                : 'Select all files'
+                ? t('toolbar.selectAll.matchesTitle')
+                : t('toolbar.selectAll.title')
             }
           >
-            {filterText.trim() ? 'Select matches' : 'Select all'}
+            {filterText.trim() ? t('toolbar.selectAll.matches') : t('toolbar.selectAll.label')}
           </button>
           <button
             type="button"
@@ -268,58 +304,58 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
             disabled={!currentPath || selectedCount === 0}
             title={
               filterText.trim()
-                ? 'Deselect files matching the current filter'
-                : 'Deselect all files'
+                ? t('toolbar.deselect.matchesTitle')
+                : t('toolbar.deselect.title')
             }
           >
-            {filterText.trim() ? 'Deselect matches' : 'Deselect'}
+            {filterText.trim() ? t('toolbar.deselect.matches') : t('toolbar.deselect.label')}
           </button>
         </div>
 
         <div className="toolbar-sep" />
 
-        <div className="toolbar-group" role="group" aria-label="Selection presets">
+        <div className="toolbar-group" role="group" aria-label={t('toolbar.presets.group')}>
           <button
             type="button"
             className={`btn btn-ghost ${preset === 'source' ? 'is-active' : ''}`}
             onClick={() => applySelectionPreset('source')}
             disabled={!currentPath}
-            title="Select source code & config files only"
+            title={t('toolbar.preset.source.title')}
           >
-            Source
+            {t('toolbar.preset.source.label')}
           </button>
           <button
             type="button"
             className={`btn btn-ghost ${preset === 'docs' ? 'is-active' : ''}`}
             onClick={() => applySelectionPreset('docs')}
             disabled={!currentPath}
-            title="Source + documentation"
+            title={t('toolbar.preset.docs.title')}
           >
-            + Docs
+            {t('toolbar.preset.docs.label')}
           </button>
           <button
             type="button"
             className={`btn btn-ghost ${preset === 'all' ? 'is-active' : ''}`}
             onClick={() => applySelectionPreset('all')}
             disabled={!currentPath}
-            title="All files except common junk (node_modules, dist, target…)"
+            title={t('toolbar.preset.all.title')}
           >
-            All clean
+            {t('toolbar.preset.all.label')}
           </button>
           <button
             type="button"
             className={`btn btn-ghost ${preset === 'core_skeleton' ? 'is-active' : ''}`}
             onClick={() => applySelectionPreset('core_skeleton')}
             disabled={!currentPath}
-            title="Core files full + tests/docs as AST skeletons"
+            title={t('toolbar.preset.core.title')}
           >
-            Core Full + Rest Skeleton
+            {t('toolbar.preset.core.label')}
           </button>
         </div>
 
         <div className="toolbar-sep" />
 
-        <div className="toolbar-group" role="group" aria-label="Security and Git">
+        <div className="toolbar-group" role="group" aria-label={t('toolbar.security.group')}>
           <button
             type="button"
             className={`btn btn-ghost ${redactSecretsEnabled ? 'is-active' : ''}`}
@@ -328,12 +364,12 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
             data-testid="btn-toggle-redact"
             title={
               redactSecretsEnabled
-                ? 'Secret redaction is ON (click to disable)'
-                : 'Secret redaction is OFF (click to enable)'
+                ? t('toolbar.redact.onTitle')
+                : t('toolbar.redact.offTitle')
             }
           >
             <Shield size={13} />
-            <span>Redact</span>
+            <span>{t('toolbar.redact.label')}</span>
           </button>
           {redactSecretsEnabled &&
             (redactionSummary.totalRedactions > 0 || redactionSummary.filesScanned != null) && (
@@ -343,25 +379,30 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
               title={[
                 redactionSummary.kinds.map(([k, c]) => `${k}: ${c}`).join(', '),
                 redactionSummary.filesScanned != null
-                  ? `(${redactionSummary.filesScanned} scanned, ${redactionSummary.filesSkipped ?? 0} skipped — pattern-based only; custom secret formats may remain)`
-                  : 'Pattern-based masking only; custom secret formats may remain',
+                  ? t('toolbar.redact.tooltipScanned', {
+                      scanned: redactionSummary.filesScanned,
+                      skipped: redactionSummary.filesSkipped ?? 0,
+                    })
+                  : t('toolbar.redact.tooltipPlain'),
               ]
                 .filter(Boolean)
                 .join(' ')}
             >
-              🛡️ {redactionSummary.totalRedactions} secrets masked
-              {redactionSummary.filesScanned != null && (
-                <> · {redactionSummary.filesScanned} scanned · {redactionSummary.filesSkipped ?? 0} skipped</>
-              )}
+              {t('toolbar.redact.badge', { count: redactionSummary.totalRedactions })}
+              {redactionSummary.filesScanned != null &&
+                t('toolbar.redact.badgeScanned', {
+                  scanned: redactionSummary.filesScanned,
+                  skipped: redactionSummary.filesSkipped ?? 0,
+                })}
             </span>
           )}
           {!redactSecretsEnabled && currentPath && (
             <span
               className="redact-badge"
               data-testid="redaction-disabled-badge"
-              title="Secret masking is turned OFF. Credentials in selected files or diffs will be exported unmasked."
+              title={t('toolbar.redact.offBadgeTitle')}
             >
-              ⚠️ Redaction OFF
+              {t('toolbar.redact.offBadge')}
             </span>
           )}
 
@@ -371,10 +412,10 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
                 type="button"
                 className="btn btn-ghost"
                 onClick={() => selectGitFiles('modified')}
-                title="Select Git modified, staged, and untracked files"
+                title={t('toolbar.git.modifiedTitle')}
                 data-testid="btn-git-modified"
               >
-                <GitBranch size={13} /> Select Git Modified
+                <GitBranch size={13} /> {t('toolbar.git.modifiedLabel')}
                 {gitContext.modifiedFiles.length > 0 && (
                   <span className="history-count">
                     {gitContext.modifiedFiles.length}
@@ -385,17 +426,17 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
                 type="button"
                 className="btn btn-ghost"
                 onClick={() => selectGitFiles('branch')}
-                title="Select files changed on current branch vs base branch"
+                title={t('toolbar.git.branchTitle')}
                 data-testid="btn-git-branch"
               >
-                Select Branch Changes
+                {t('toolbar.git.branchLabel')}
               </button>
               <button
                 type="button"
                 className={`btn btn-ghost ${includeGitDiff ? 'is-active' : ''}`}
                 onClick={toggleIncludeGitDiff}
                 aria-pressed={includeGitDiff}
-                title="Include unified <git_diff> block in packed output"
+                title={t('toolbar.git.diffTitle')}
                 data-testid="btn-include-git-diff"
               >
                 + &lt;git_diff&gt;
@@ -409,9 +450,9 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
             onClick={() => setShowPromptStudio((v) => !v)}
             aria-expanded={showPromptStudio}
             data-testid="btn-prompt-studio"
-            title="Prompt Studio — append <task_instructions> at the end of the pack"
+            title={t('toolbar.promptStudio.title')}
           >
-            <Sparkles size={13} /> Prompt Studio
+            <Sparkles size={13} /> {t('toolbar.promptStudio.label')}
           </button>
         </div>
 
@@ -424,7 +465,7 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
             onClick={() => void scan(currentPath)}
             data-testid="disk-changed-pill"
           >
-            <RefreshCw size={11} /> Files changed on disk — Refresh
+            <RefreshCw size={11} /> {t('toolbar.diskChanged')}
           </button>
         )}
 
@@ -432,9 +473,9 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
           <span className="meta-inline">
             <span className="count">{selectedCount}</span>
             {' / '}
-            {totalFiles} files
+            {t('toolbar.files', { count: totalFiles })}
             {filterText && filteredTree && (
-              <span className="meta-filter">· filtered</span>
+              <span className="meta-filter">{t('toolbar.filtered')}</span>
             )}
           </span>
         )}
@@ -445,6 +486,7 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
 }
 
 export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
+  const { t } = useI18n();
   const {
     applyPlaybook,
     currentPath,
@@ -476,7 +518,7 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
               {currentPath}
             </>
           ) : (
-            'No folder opened — drop a project or press Open'
+            t('status.noFolder')
           )}
         </div>
         <div className="status-right">
@@ -486,35 +528,39 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
             data-testid="footer-docs-howto-btn"
             aria-haspopup="dialog"
             aria-expanded={showDocs}
-            title="Documentation & How-To (F1)"
+            title={t('footer.docsTitle')}
             onClick={() => setShowDocs(true)}
           >
             <BookOpen size={13} aria-hidden />
-            <span>📖 Documentation & How-To</span>
+            <span>{t('footer.docs')}</span>
             <span className="footer-docs-badge" aria-hidden>
-              7 Examples
+              {t('footer.docsBadge')}
             </span>
             <span className="kbd">F1</span>
           </button>
           <span className="sep">|</span>
           <span>
-            Selected: <span className="status-value">{stats.files}</span>
+            {t('status.selected')} <span className="status-value">{stats.files}</span>
           </span>
           <span className="sep">|</span>
           {generating ? (
             <span className="status-busy">
-              <Loader2 size={11} className="spin" /> preparing…
+              <Loader2 size={11} className="spin" /> {t('status.preparing')}
             </span>
           ) : (
             <span
               title={
                 stats.tokens >= TOKEN_HARD
-                  ? 'Very large context — consider deselecting files'
+                  ? t('status.tokens.veryLarge')
                   : stats.tokens >= TOKEN_SOFT
-                    ? `Large pack — may exceed smaller model windows. ${stats.tokenizerExact ? 'Exact BPE count (o200k_base).' : TOKEN_ESTIMATE_HINT}`
+                    ? t('status.tokens.large', {
+                        hint: stats.tokenizerExact
+                          ? t('status.tokens.exactShort')
+                          : t('tokens.estimateHint'),
+                      })
                     : stats.tokenizerExact
-                      ? 'Exact BPE token count (o200k_base) on complete serialized artifact.'
-                      : TOKEN_ESTIMATE_HINT
+                      ? t('status.tokens.exactFull')
+                      : t('tokens.estimateHint')
               }
             >
               {stats.tokenizerExact ? '' : '~'}
@@ -532,7 +578,9 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
               >
                 {formatTokens(stats.tokens)}
               </span>{' '}
-              tokens ({stats.tokenizerExact ? 'exact' : 'approx'})
+              {t('status.tokensWithKind', {
+                kind: stats.tokenizerExact ? t('tokens.kindExact') : t('tokens.kindApprox'),
+              })}
             </span>
           )}
           <span className="sep">|</span>
@@ -542,18 +590,18 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
             type="button"
             className="panel-link"
             onClick={() => setShowHelp(true)}
-            title="Keyboard shortcuts (?)"
+            title={t('status.shortcutsTitle')}
           >
-            Shortcuts <span className="kbd">?</span>
+            {t('status.shortcuts')} <span className="kbd">?</span>
           </button>
           <span className="sep">|</span>
           <button
             type="button"
             className="panel-link"
             onClick={() => setShowAbout(true)}
-            title="About ptt"
+            title={t('status.aboutTitle')}
           >
-            About
+            {t('status.about')}
           </button>
         </div>
       </footer>
@@ -579,7 +627,7 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
           onOpenRepo={() => {
             if (IN_TAURI) {
               invoke('open_url', { url: ABOUT_REPO_URL }).catch((err) =>
-                pushToast('error', `Could not open link: ${String(err)}`),
+                pushToast('error', t('status.openLinkFailed', { error: String(err) })),
               );
             } else {
               window.open(ABOUT_REPO_URL, '_blank', 'noopener,noreferrer');

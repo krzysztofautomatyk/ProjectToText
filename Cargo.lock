@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "ptt"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "arboard",
  "content_inspector",

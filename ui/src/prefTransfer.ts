@@ -3,7 +3,8 @@
  * `ptt.projectPrefs` + folder history `ptt.folderHistory` + Prompt Studio
  * `ptt.promptStudio.v2`) as a single JSON snapshot file. Import merges
  * defensively: unknown fields are dropped and entries are keyed by stable
- * path keys (Windows/Unix path separator aware).
+ * path keys (Windows/Unix path separator aware). The optional `i18n` block
+ * carries the active UI language and custom language packs (`ptt.i18n.v1`).
  */
 
 import {
@@ -18,6 +19,16 @@ import {
 } from './projectPrefs';
 import { folderHistoryKey, type FolderHistoryEntry } from './folderHistory';
 import { redactSecretsWithReport } from './secrets';
+import {
+  isLocaleAvailable,
+  loadI18nState,
+  mergeLanguagePacks,
+  sanitizeI18nState,
+  saveI18nState,
+  validateAndSanitizeLanguagePack,
+  type I18nState,
+  type LanguagePack,
+} from './i18n';
 
 export const PREF_SNAPSHOT_VERSION = 2;
 
@@ -29,6 +40,11 @@ export interface PromptStudioExport {
   autoApplyDefaultOnOpen: boolean;
 }
 
+export interface I18nExport {
+  activeLocale: string;
+  customPacks: LanguagePack[];
+}
+
 export interface PrefSnapshot {
   app: 'ptt';
   version: number;
@@ -36,6 +52,7 @@ export interface PrefSnapshot {
   projects: unknown[];
   history: unknown[];
   promptStudio?: PromptStudioExport;
+  i18n?: I18nExport;
 }
 
 export interface PromptSecretWarning {
@@ -58,6 +75,8 @@ export interface PrefMergeResult {
   skipped: number;
   promptStudio?: PromptStudioStore;
   promptStats?: PromptStudioMergeStats;
+  /** Resulting i18n state to persist (only when the snapshot carried an `i18n` block). */
+  i18n?: I18nState;
   secretWarnings: PromptSecretWarning[];
   importedDefaultPromptId: string | null;
   importedDefaultPromptName: string | null;
@@ -69,6 +88,8 @@ export interface PrefImportOptions {
   mode?: PrefImportMode;
   /** When true, apply imported globalDefaultPromptId if it resolves. */
   applyImportedDefault?: boolean;
+  /** Local i18n state to merge into (defaults to the persisted one). */
+  currentI18n?: I18nState;
 }
 
 export interface PrefImportPreview {
@@ -81,6 +102,9 @@ export interface PrefImportPreview {
   defaultPromptId: string | null;
   secretWarnings: PromptSecretWarning[];
   hasPromptStudio: boolean;
+  hasI18n: boolean;
+  i18nPacksCount: number;
+  i18nActiveLocale: string | null;
 }
 
 /* ─── raw item validators (mirror the parsers in the owning modules) ── */
@@ -166,6 +190,22 @@ function parsePromptStudioExport(raw: unknown): PromptStudioExport | undefined {
     workspaceDefaultPromptMap: map,
     autoApplyDefaultOnOpen: obj.autoApplyDefaultOnOpen !== false,
   };
+}
+
+function parseI18nExport(raw: unknown): I18nExport | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  if (!Array.isArray(obj.customPacks) && typeof obj.activeLocale !== 'string') return undefined;
+  const customPacks: LanguagePack[] = [];
+  if (Array.isArray(obj.customPacks)) {
+    for (const candidate of obj.customPacks) {
+      const result = validateAndSanitizeLanguagePack(candidate);
+      if (result.ok && result.pack) customPacks.push(result.pack);
+    }
+  }
+  const requested =
+    typeof obj.activeLocale === 'string' ? obj.activeLocale.trim().toLowerCase() : 'en';
+  return { activeLocale: requested, customPacks };
 }
 
 function scanPromptSecrets(prompts: CustomPromptTemplate[]): PromptSecretWarning[] {
@@ -317,10 +357,18 @@ export function buildPromptStudioExport(
   };
 }
 
+export function buildI18nExport(state: I18nState = loadI18nState()): I18nExport {
+  return {
+    activeLocale: state.activeLocale,
+    customPacks: state.customPacks.map((p) => ({ ...p, translations: { ...p.translations } })),
+  };
+}
+
 export function buildPrefSnapshot(
   projects: ProjectPref[],
   history: FolderHistoryEntry[],
   promptStudio?: PromptStudioStore,
+  i18n?: I18nState,
 ): PrefSnapshot {
   const studio = promptStudio ?? loadPromptStudioStore();
   return {
@@ -342,6 +390,7 @@ export function buildPrefSnapshot(
       lastOpenedAt,
     })),
     promptStudio: buildPromptStudioExport(studio),
+    i18n: buildI18nExport(i18n ?? loadI18nState()),
   };
 }
 
@@ -392,6 +441,7 @@ export function parsePrefSnapshot(text: string): PrefSnapshot {
     projects: Array.isArray(obj.projects) ? obj.projects : [],
     history: Array.isArray(obj.history) ? obj.history : [],
     promptStudio: parsePromptStudioExport(obj.promptStudio),
+    i18n: parseI18nExport(obj.i18n),
   };
 }
 
@@ -417,6 +467,9 @@ export function previewPrefImport(
     defaultPromptId: def.id,
     secretWarnings: dry.secretWarnings,
     hasPromptStudio: Boolean(snapshot.promptStudio),
+    hasI18n: Boolean(snapshot.i18n),
+    i18nPacksCount: snapshot.i18n?.customPacks.length ?? 0,
+    i18nActiveLocale: snapshot.i18n?.activeLocale ?? null,
   };
 }
 
@@ -540,6 +593,25 @@ export function mergePrefSnapshot(
     }
   }
 
+  let i18n: I18nState | undefined;
+  if (snapshot.i18n) {
+    const currentI18n = options.currentI18n ?? loadI18nState();
+    if (mode === 'replace') {
+      i18n = sanitizeI18nState({
+        activeLocale: snapshot.i18n.activeLocale,
+        customPacks: snapshot.i18n.customPacks,
+      });
+    } else {
+      const customPacks = mergeLanguagePacks(currentI18n.customPacks, snapshot.i18n.customPacks);
+      i18n = {
+        activeLocale: isLocaleAvailable(currentI18n.activeLocale, customPacks)
+          ? currentI18n.activeLocale
+          : 'en',
+        customPacks,
+      };
+    }
+  }
+
   return {
     projects: [...projects.values()],
     history: [...history.values()],
@@ -548,10 +620,16 @@ export function mergePrefSnapshot(
     skipped,
     promptStudio,
     promptStats,
+    i18n,
     secretWarnings,
     importedDefaultPromptId: defMeta.id,
     importedDefaultPromptName: defMeta.name,
   };
+}
+
+/** Persist a merge/replace result's i18n section (the I18nProvider picks it up via the update event). */
+export function applyI18nImport(state: I18nState): boolean {
+  return saveI18nState(state);
 }
 
 /** Persist a merge/replace result's prompt studio section. */

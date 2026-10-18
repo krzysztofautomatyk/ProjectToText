@@ -5,9 +5,11 @@ import { useWorkspace } from './useWorkspace';
 import { AppHeader, AppStatusBar, AppToolbar } from './AppChrome';
 import { BudgetAndPromptBar } from './BudgetAndPromptBar';
 import { MainPanel } from './MainPanel';
+import { useI18n } from './i18n';
 
 function App() {
   const ws = useWorkspace();
+  const { t } = useI18n();
   const { dismissToast, dragOver, generating, output, stats, toasts, treeWidth } = ws;
   return (
     <div
@@ -24,9 +26,9 @@ function App() {
 
       <div className="sr-only" aria-live="polite" aria-atomic="true">
         {generating
-          ? 'Updating packed output'
+          ? t('app.sr.updating')
           : output
-            ? `Ready. ${stats.files} files, about ${formatTokens(stats.tokens)} tokens.`
+            ? t('app.sr.ready', { files: stats.files, tokens: formatTokens(stats.tokens) })
             : ''}
       </div>
     </div>
