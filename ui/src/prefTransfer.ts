@@ -1,14 +1,33 @@
 /**
  * Export / import of all persistent ptt preferences (custom projects
- * `ptt.projectPrefs` + folder history `ptt.folderHistory`) as a single JSON
- * snapshot file. Import merges defensively: unknown fields are dropped and
- * entries are keyed by stable path keys (Windows/Unix path separator aware).
+ * `ptt.projectPrefs` + folder history `ptt.folderHistory` + Prompt Studio
+ * `ptt.promptStudio.v2`) as a single JSON snapshot file. Import merges
+ * defensively: unknown fields are dropped and entries are keyed by stable
+ * path keys (Windows/Unix path separator aware).
  */
 
-import { projectPrefKey, type ProjectPref } from './projectPrefs';
+import {
+  computePromptHash,
+  loadPromptStudioStore,
+  parseCustomPromptTemplate,
+  savePromptStudioStore,
+  type CustomPromptTemplate,
+  type PromptStudioStore,
+  type ProjectPref,
+  projectPrefKey,
+} from './projectPrefs';
 import { folderHistoryKey, type FolderHistoryEntry } from './folderHistory';
+import { redactSecretsWithReport } from './secrets';
 
-export const PREF_SNAPSHOT_VERSION = 1;
+export const PREF_SNAPSHOT_VERSION = 2;
+
+export interface PromptStudioExport {
+  schemaVersion: 2;
+  customPrompts: CustomPromptTemplate[];
+  globalDefaultPromptId: string | null;
+  workspaceDefaultPromptMap: Record<string, string>;
+  autoApplyDefaultOnOpen: boolean;
+}
 
 export interface PrefSnapshot {
   app: 'ptt';
@@ -16,6 +35,19 @@ export interface PrefSnapshot {
   exportedAt: string;
   projects: unknown[];
   history: unknown[];
+  promptStudio?: PromptStudioExport;
+}
+
+export interface PromptSecretWarning {
+  promptName: string;
+  findingsCount: number;
+}
+
+export interface PromptStudioMergeStats {
+  addedCount: number;
+  updatedCount: number;
+  skippedDuplicates: number;
+  backedUpCount: number;
 }
 
 export interface PrefMergeResult {
@@ -24,6 +56,31 @@ export interface PrefMergeResult {
   projectsImported: number;
   historyImported: number;
   skipped: number;
+  promptStudio?: PromptStudioStore;
+  promptStats?: PromptStudioMergeStats;
+  secretWarnings: PromptSecretWarning[];
+  importedDefaultPromptId: string | null;
+  importedDefaultPromptName: string | null;
+}
+
+export type PrefImportMode = 'merge' | 'replace';
+
+export interface PrefImportOptions {
+  mode?: PrefImportMode;
+  /** When true, apply imported globalDefaultPromptId if it resolves. */
+  applyImportedDefault?: boolean;
+}
+
+export interface PrefImportPreview {
+  projectsCount: number;
+  historyCount: number;
+  promptsNew: number;
+  promptsUpdated: number;
+  promptsDuplicates: number;
+  defaultPromptName: string | null;
+  defaultPromptId: string | null;
+  secretWarnings: PromptSecretWarning[];
+  hasPromptStudio: boolean;
 }
 
 /* ─── raw item validators (mirror the parsers in the owning modules) ── */
@@ -85,12 +142,187 @@ function parseRawHistoryEntry(raw: unknown): RawHistoryEntry | null {
   };
 }
 
+function parsePromptStudioExport(raw: unknown): PromptStudioExport | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, unknown>;
+  const customPrompts = Array.isArray(obj.customPrompts)
+    ? obj.customPrompts
+        .map((p) => parseCustomPromptTemplate(p))
+        .filter((p): p is CustomPromptTemplate => p !== null && !p.isBuiltIn)
+    : [];
+  const map: Record<string, string> = {};
+  if (obj.workspaceDefaultPromptMap && typeof obj.workspaceDefaultPromptMap === 'object') {
+    for (const [k, v] of Object.entries(obj.workspaceDefaultPromptMap as Record<string, unknown>)) {
+      if (typeof k === 'string' && typeof v === 'string' && k.trim() && v.trim()) {
+        map[k] = v;
+      }
+    }
+  }
+  return {
+    schemaVersion: 2,
+    customPrompts,
+    globalDefaultPromptId:
+      typeof obj.globalDefaultPromptId === 'string' ? obj.globalDefaultPromptId : null,
+    workspaceDefaultPromptMap: map,
+    autoApplyDefaultOnOpen: obj.autoApplyDefaultOnOpen !== false,
+  };
+}
+
+function scanPromptSecrets(prompts: CustomPromptTemplate[]): PromptSecretWarning[] {
+  const warnings: PromptSecretWarning[] = [];
+  for (const p of prompts) {
+    const { summary } = redactSecretsWithReport(p.content);
+    if (summary.totalRedactions > 0) {
+      warnings.push({ promptName: p.name, findingsCount: summary.totalRedactions });
+    }
+  }
+  return warnings;
+}
+
+function uniqueBackupName(base: string, existing: Set<string>, suffix: string): string {
+  const cleaned = base.replace(/\s*\((Lokalna kopia|Import|Kopia)(?:\s+\d+)?\)\s*$/i, '').trim();
+  let name = `${cleaned} (${suffix})`;
+  let n = 2;
+  while (existing.has(name.trim().toLowerCase())) {
+    name = `${cleaned} (${suffix} ${n})`;
+    n += 1;
+  }
+  return name;
+}
+
+function newImportId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `custom-${crypto.randomUUID()}`;
+  }
+  return `custom-imp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Merge imported custom prompts into local list without data loss.
+ * Identical contentHash → skip; same id/name with different hash → keep both
+ * (newer wins as primary, older kept as backup copy).
+ */
+export function mergeCustomPrompts(
+  local: CustomPromptTemplate[],
+  imported: CustomPromptTemplate[],
+): { prompts: CustomPromptTemplate[]; stats: PromptStudioMergeStats } {
+  const prompts = local.map((p) => ({ ...p }));
+  const stats: PromptStudioMergeStats = {
+    addedCount: 0,
+    updatedCount: 0,
+    skippedDuplicates: 0,
+    backedUpCount: 0,
+  };
+  const byHash = new Map(prompts.map((p) => [p.contentHash, p]));
+  const byId = new Map(prompts.map((p) => [p.id, p]));
+  const byName = new Map(prompts.map((p) => [p.name.trim().toLowerCase(), p]));
+  const nameSet = new Set(prompts.map((p) => p.name.trim().toLowerCase()));
+
+  for (const incoming of imported) {
+    if (byHash.has(incoming.contentHash)) {
+      stats.skippedDuplicates += 1;
+      continue;
+    }
+    const sameId = byId.get(incoming.id);
+    const sameName = byName.get(incoming.name.trim().toLowerCase());
+    const conflict = sameId ?? sameName;
+    if (conflict && conflict.contentHash !== incoming.contentHash) {
+      const incomingNewer =
+        Date.parse(incoming.updatedAt) >= Date.parse(conflict.updatedAt);
+      if (incomingNewer) {
+        const backupName = uniqueBackupName(conflict.name, nameSet, 'Lokalna kopia');
+        const backup: CustomPromptTemplate = {
+          ...conflict,
+          id: newImportId(),
+          name: backupName,
+          contentHash: computePromptHash(backupName, conflict.content, conflict.placement),
+          updatedAt: new Date().toISOString(),
+          isBuiltIn: false,
+        };
+        prompts.push(backup);
+        byHash.set(backup.contentHash, backup);
+        byId.set(backup.id, backup);
+        nameSet.add(backup.name.trim().toLowerCase());
+        stats.backedUpCount += 1;
+
+        const updated: CustomPromptTemplate = {
+          ...incoming,
+          id: conflict.id,
+          isBuiltIn: false,
+          createdAt: conflict.createdAt,
+        };
+        const idx = prompts.findIndex((p) => p.id === conflict.id);
+        if (idx >= 0) prompts[idx] = updated;
+        byHash.set(updated.contentHash, updated);
+        byId.set(updated.id, updated);
+        byName.set(updated.name.trim().toLowerCase(), updated);
+        nameSet.add(updated.name.trim().toLowerCase());
+        stats.updatedCount += 1;
+      } else {
+        const importName = uniqueBackupName(incoming.name, nameSet, 'Import');
+        const copy: CustomPromptTemplate = {
+          ...incoming,
+          id: newImportId(),
+          name: importName,
+          contentHash: computePromptHash(importName, incoming.content, incoming.placement),
+          isBuiltIn: false,
+        };
+        prompts.push(copy);
+        byHash.set(copy.contentHash, copy);
+        byId.set(copy.id, copy);
+        byName.set(copy.name.trim().toLowerCase(), copy);
+        nameSet.add(copy.name.trim().toLowerCase());
+        stats.addedCount += 1;
+      }
+      continue;
+    }
+
+    const toAdd: CustomPromptTemplate = {
+      ...incoming,
+      id: byId.has(incoming.id) ? newImportId() : incoming.id,
+      isBuiltIn: false,
+    };
+    prompts.push(toAdd);
+    byHash.set(toAdd.contentHash, toAdd);
+    byId.set(toAdd.id, toAdd);
+    byName.set(toAdd.name.trim().toLowerCase(), toAdd);
+    nameSet.add(toAdd.name.trim().toLowerCase());
+    stats.addedCount += 1;
+  }
+
+  return { prompts, stats };
+}
+
+function resolveImportedDefaultName(
+  exportBlock: PromptStudioExport | undefined,
+): { id: string | null; name: string | null } {
+  if (!exportBlock?.globalDefaultPromptId) return { id: null, name: null };
+  const id = exportBlock.globalDefaultPromptId;
+  const fromCustom = exportBlock.customPrompts.find((p) => p.id === id);
+  if (fromCustom) return { id, name: fromCustom.name };
+  return { id, name: id };
+}
+
 /* ─── export ─────────────────────────────────────────── */
+
+export function buildPromptStudioExport(
+  store: PromptStudioStore = loadPromptStudioStore(),
+): PromptStudioExport {
+  return {
+    schemaVersion: 2,
+    customPrompts: store.customPrompts.filter((p) => !p.isBuiltIn),
+    globalDefaultPromptId: store.globalDefaultPromptId,
+    workspaceDefaultPromptMap: { ...store.workspaceDefaultPromptMap },
+    autoApplyDefaultOnOpen: store.autoApplyDefaultOnOpen,
+  };
+}
 
 export function buildPrefSnapshot(
   projects: ProjectPref[],
   history: FolderHistoryEntry[],
+  promptStudio?: PromptStudioStore,
 ): PrefSnapshot {
+  const studio = promptStudio ?? loadPromptStudioStore();
   return {
     app: 'ptt',
     version: PREF_SNAPSHOT_VERSION,
@@ -109,7 +341,27 @@ export function buildPrefSnapshot(
       pinned,
       lastOpenedAt,
     })),
+    promptStudio: buildPromptStudioExport(studio),
   };
+}
+
+/** Export only Prompt Studio pack (shareable prompts JSON). */
+export function exportPromptStudioOnly(
+  store: PromptStudioStore = loadPromptStudioStore(),
+): string {
+  return JSON.stringify(
+    {
+      app: 'ptt',
+      version: PREF_SNAPSHOT_VERSION,
+      exportedAt: new Date().toISOString(),
+      kind: 'promptStudio',
+      promptStudio: buildPromptStudioExport(store),
+      projects: [],
+      history: [],
+    },
+    null,
+    2,
+  );
 }
 
 /** Parse a snapshot file's text. Throws with a short user-facing reason. */
@@ -124,15 +376,47 @@ export function parsePrefSnapshot(text: string): PrefSnapshot {
     throw new Error('File does not contain a ptt snapshot');
   }
   const obj = value as Record<string, unknown>;
-  if (obj.app !== 'ptt' || !Array.isArray(obj.projects)) {
+  const isPromptOnly =
+    obj.kind === 'promptStudio' ||
+    (obj.app === 'ptt' && obj.promptStudio && !Array.isArray(obj.projects));
+  if (obj.app !== 'ptt') {
+    throw new Error('File is not a ptt preferences snapshot');
+  }
+  if (!isPromptOnly && !Array.isArray(obj.projects)) {
     throw new Error('File is not a ptt preferences snapshot');
   }
   return {
     app: 'ptt',
     version: typeof obj.version === 'number' ? obj.version : 1,
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : '',
-    projects: obj.projects,
+    projects: Array.isArray(obj.projects) ? obj.projects : [],
     history: Array.isArray(obj.history) ? obj.history : [],
+    promptStudio: parsePromptStudioExport(obj.promptStudio),
+  };
+}
+
+/** Preview import impact without writing. */
+export function previewPrefImport(
+  snapshot: PrefSnapshot,
+  currentProjects: ProjectPref[],
+  currentHistory: FolderHistoryEntry[],
+  currentStudio: PromptStudioStore = loadPromptStudioStore(),
+): PrefImportPreview {
+  const dry = mergePrefSnapshot(snapshot, currentProjects, currentHistory, currentStudio, {
+    mode: 'merge',
+    applyImportedDefault: false,
+  });
+  const def = resolveImportedDefaultName(snapshot.promptStudio);
+  return {
+    projectsCount: snapshot.projects.length,
+    historyCount: snapshot.history.length,
+    promptsNew: dry.promptStats?.addedCount ?? 0,
+    promptsUpdated: dry.promptStats?.updatedCount ?? 0,
+    promptsDuplicates: dry.promptStats?.skippedDuplicates ?? 0,
+    defaultPromptName: def.name,
+    defaultPromptId: def.id,
+    secretWarnings: dry.secretWarnings,
+    hasPromptStudio: Boolean(snapshot.promptStudio),
   };
 }
 
@@ -140,14 +424,18 @@ export function parsePrefSnapshot(text: string): PrefSnapshot {
 
 /**
  * Merge snapshot entries into the current state.
- * Import never deletes existing local entries; for the same project key the
- * fresher timestamps win, and boolean flags are OR-ed (favorite/pinned stick).
+ * Import never deletes existing local entries when mode=merge; for the same
+ * project key the fresher timestamps win, and boolean flags are OR-ed.
+ * Older snapshots without promptStudio leave local prompts untouched.
  */
 export function mergePrefSnapshot(
   snapshot: PrefSnapshot,
   currentProjects: ProjectPref[],
   currentHistory: FolderHistoryEntry[],
+  currentStudio: PromptStudioStore = loadPromptStudioStore(),
+  options: PrefImportOptions = {},
 ): PrefMergeResult {
+  const mode: PrefImportMode = options.mode ?? 'merge';
   let skipped = 0;
 
   const projects = new Map(currentProjects.map((p) => [projectPrefKey(p.path), p]));
@@ -190,13 +478,85 @@ export function mergePrefSnapshot(
     }
   }
 
+  const secretWarnings = snapshot.promptStudio
+    ? scanPromptSecrets(snapshot.promptStudio.customPrompts)
+    : [];
+  const defMeta = resolveImportedDefaultName(snapshot.promptStudio);
+
+  let promptStudio: PromptStudioStore | undefined;
+  let promptStats: PromptStudioMergeStats | undefined;
+
+  if (snapshot.promptStudio) {
+    if (mode === 'replace') {
+      promptStudio = {
+        schemaVersion: 2,
+        customPrompts: snapshot.promptStudio.customPrompts.map((p) => ({
+          ...p,
+          isBuiltIn: false,
+        })),
+        globalDefaultPromptId: snapshot.promptStudio.globalDefaultPromptId,
+        workspaceDefaultPromptMap: {
+          ...snapshot.promptStudio.workspaceDefaultPromptMap,
+        },
+        autoApplyDefaultOnOpen: snapshot.promptStudio.autoApplyDefaultOnOpen,
+        activePromptId: currentStudio.activePromptId,
+        draftCustomText: currentStudio.draftCustomText,
+      };
+      promptStats = {
+        addedCount: promptStudio.customPrompts.length,
+        updatedCount: 0,
+        skippedDuplicates: 0,
+        backedUpCount: 0,
+      };
+    } else {
+      const merged = mergeCustomPrompts(
+        currentStudio.customPrompts,
+        snapshot.promptStudio.customPrompts,
+      );
+      promptStats = merged.stats;
+      const nextMap = {
+        ...currentStudio.workspaceDefaultPromptMap,
+        ...snapshot.promptStudio.workspaceDefaultPromptMap,
+      };
+      let globalDefault = currentStudio.globalDefaultPromptId;
+      if (options.applyImportedDefault && snapshot.promptStudio.globalDefaultPromptId) {
+        globalDefault = snapshot.promptStudio.globalDefaultPromptId;
+      } else if (
+        globalDefault == null &&
+        snapshot.promptStudio.globalDefaultPromptId
+      ) {
+        globalDefault = snapshot.promptStudio.globalDefaultPromptId;
+      }
+      promptStudio = {
+        ...currentStudio,
+        schemaVersion: 2,
+        customPrompts: merged.prompts,
+        globalDefaultPromptId: globalDefault,
+        workspaceDefaultPromptMap: nextMap,
+        autoApplyDefaultOnOpen:
+          currentStudio.autoApplyDefaultOnOpen ||
+          snapshot.promptStudio.autoApplyDefaultOnOpen,
+      };
+    }
+  }
+
   return {
     projects: [...projects.values()],
     history: [...history.values()],
     projectsImported,
     historyImported,
     skipped,
+    promptStudio,
+    promptStats,
+    secretWarnings,
+    importedDefaultPromptId: defMeta.id,
+    importedDefaultPromptName: defMeta.name,
   };
+}
+
+/** Persist a merge/replace result's prompt studio section. */
+export function applyPromptStudioImport(store: PromptStudioStore): boolean {
+  return savePromptStudioStore(store);
 }
 
 function mergeProject(a: ProjectPref, b: RawProjectPref): ProjectPref {
@@ -225,4 +585,9 @@ function mergeHistory(a: FolderHistoryEntry, b: RawHistoryEntry): FolderHistoryE
 export function snapshotFileName(now = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   return `ptt-prefs-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.json`;
+}
+
+export function promptStudioFileName(now = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `ptt-prompts-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.json`;
 }

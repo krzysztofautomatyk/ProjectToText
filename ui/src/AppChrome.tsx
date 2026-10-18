@@ -1,10 +1,11 @@
 import { type ChangeEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Copy, FolderOpen, GitBranch, History as HistoryIcon, Info, List, Loader2, Monitor, Moon, RefreshCw, Save, Search, Shield, SlidersHorizontal, Sparkles, Download, Sun, X } from 'lucide-react';
+import { BookOpen, Copy, FolderOpen, GitBranch, History as HistoryIcon, Info, List, Loader2, Monitor, Moon, RefreshCw, Save, Search, Shield, SlidersHorizontal, Sparkles, Download, Sun, X } from 'lucide-react';
 import APP_VERSION from './version';
 import { formatShortcut } from './platform';
 import { TOKEN_SOFT, TOKEN_HARD, formatTokens, TOKEN_ESTIMATE_HINT } from './treeModel';
-import { ABOUT_REPO_URL, AboutDialog, ShortcutsHelpDialog } from './Panels';
+import { ABOUT_REPO_URL, AboutDialog, ImportPrefsDialog, ShortcutsHelpDialog } from './Panels';
+import { DocumentationAndHowToModal } from './DocumentationModal';
 import { IN_TAURI, themeLabel, type WorkspaceState } from './useWorkspace';
 
 export function AppHeader({ ws }: { ws: WorkspaceState }) {
@@ -444,7 +445,25 @@ export function AppToolbar({ ws }: { ws: WorkspaceState }) {
 }
 
 export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
-  const { currentPath, folderName, format, generating, pushToast, setShowAbout, setShowHelp, showAbout, stats } = ws;
+  const {
+    applyPlaybook,
+    currentPath,
+    folderName,
+    format,
+    generating,
+    gitContext,
+    importPreview,
+    pushToast,
+    selectedCount,
+    setShowAbout,
+    setShowDocs,
+    setShowHelp,
+    showAbout,
+    showDocs,
+    skeletonSet,
+    stats,
+    targetBudgetTokens,
+  } = ws;
   return (
     <>
       {/* Status bar */}
@@ -461,6 +480,23 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
           )}
         </div>
         <div className="status-right">
+          <button
+            type="button"
+            className="btn footer-docs-btn"
+            data-testid="footer-docs-howto-btn"
+            aria-haspopup="dialog"
+            aria-expanded={showDocs}
+            title="Documentation & How-To (F1)"
+            onClick={() => setShowDocs(true)}
+          >
+            <BookOpen size={13} aria-hidden />
+            <span>📖 Documentation & How-To</span>
+            <span className="footer-docs-badge" aria-hidden>
+              7 Examples
+            </span>
+            <span className="kbd">F1</span>
+          </button>
+          <span className="sep">|</span>
           <span>
             Selected: <span className="status-value">{stats.files}</span>
           </span>
@@ -523,6 +559,19 @@ export function AppStatusBar({ ws }: { ws: WorkspaceState }) {
       </footer>
 
       <ShortcutsHelpDialog ws={ws} />
+
+      <DocumentationAndHowToModal
+        open={showDocs}
+        onClose={() => setShowDocs(false)}
+        onApplyPlaybook={applyPlaybook}
+        projectName={folderName || undefined}
+        gitBranch={gitContext?.currentBranch ?? undefined}
+        selectedFilesCount={selectedCount}
+        tokenBudget={targetBudgetTokens}
+        skeletonEnabled={skeletonSet.size > 0}
+      />
+
+      {importPreview && <ImportPrefsDialog ws={ws} />}
 
       {showAbout && (
         <AboutDialog

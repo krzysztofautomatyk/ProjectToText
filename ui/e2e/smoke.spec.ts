@@ -299,4 +299,39 @@ test.describe('ProjectToText browser shell', () => {
       rmSync(dirty, { recursive: true, force: true });
     }
   });
+
+  test('footer docs button opens How-To modal with examples and applies a playbook', async ({
+    page,
+  }) => {
+    await page.goto('/');
+    await page.getByTestId('footer-docs-howto-btn').click();
+    const modal = page.getByTestId('docs-howto-modal');
+    await expect(modal).toBeVisible();
+    await expect(page.getByTestId('docs-howto-section')).toBeVisible();
+
+    await page.getByTestId('docs-tab-examples').click();
+    const cards = page.getByTestId('docs-example-card');
+    await expect(cards).toHaveCount(7);
+    await expect(cards.first()).toBeVisible();
+
+    // Apply closes the docs modal and opens Prompt Studio with the playbook loaded
+    await page.getByTestId('apply-example-playbook-btn').first().click();
+    await expect(modal).toBeHidden();
+    await expect(page.getByTestId('prompt-studio-panel')).toBeVisible();
+    await expect(page.getByTestId('prompt-studio-input')).not.toHaveValue('');
+    await expect(page.getByTestId('prompt-template-select')).not.toHaveValue('none');
+  });
+
+  test('F1 toggles documentation modal', async ({ page }) => {
+    await page.goto('/');
+    // Chromium steals real F1 for browser help — dispatch on window like our app listens.
+    await page.evaluate(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'F1', bubbles: true, cancelable: true }));
+    });
+    await expect(page.getByTestId('docs-howto-modal')).toBeVisible();
+    await page.evaluate(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'F1', bubbles: true, cancelable: true }));
+    });
+    await expect(page.getByTestId('docs-howto-modal')).toBeHidden();
+  });
 });

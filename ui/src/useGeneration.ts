@@ -3,7 +3,20 @@ import { invoke } from '@tauri-apps/api/core';
 import { downloadText, generateBrowserOutputWithStats, type BrowserProject } from './browserFs';
 import { redactSecretsWithReport, type RedactionSummary } from './secrets';
 import { isTauriRuntime } from './tauriEnv';
-import { type FileNode, type PackOptions, type FileTokenStat, type PackTokenStats, type GenerateOutputResponse, type OutputFormat, type ToastKind, normalizePath, formatTokens, estimateTokens } from './treeModel';
+import { interpolatePromptVariables } from './projectPrefs';
+import {
+  type FileNode,
+  type GitRepoContext,
+  type PackOptions,
+  type FileTokenStat,
+  type PackTokenStats,
+  type GenerateOutputResponse,
+  type OutputFormat,
+  type ToastKind,
+  normalizePath,
+  formatTokens,
+  estimateTokens,
+} from './treeModel';
 import type { MutableRefObject } from 'react';
 
 const IN_TAURI = isTauriRuntime();
@@ -16,9 +29,23 @@ interface GenerationParams {
   pushToast: (kind: ToastKind, message: string) => void;
   browserProjectRef: MutableRefObject<BrowserProject | null>;
   workspaceRevision: MutableRefObject<number>;
+  gitContext?: GitRepoContext | null;
+  targetBudgetTokens?: number;
+  skeletonCount?: number;
 }
 
-export function useGeneration({ currentPath, nodes, format, taskPrompt, pushToast, browserProjectRef, workspaceRevision }: GenerationParams) {
+export function useGeneration({
+  currentPath,
+  nodes,
+  format,
+  taskPrompt,
+  pushToast,
+  browserProjectRef,
+  workspaceRevision,
+  gitContext = null,
+  targetBudgetTokens = 128_000,
+  skeletonCount = 0,
+}: GenerationParams) {
   const [output, setOutput] = useState('');
   const [generating, setGenerating] = useState(false);
   const [stats, setStats] = useState<PackTokenStats>({ files: 0, tokens: 0 });
@@ -73,7 +100,16 @@ export function useGeneration({ currentPath, nodes, format, taskPrompt, pushToas
       const activeRedact = overrides.redact ?? redactSecretsEnabled;
       const activeSkeletons = overrides.skeletons ?? skeletonSet;
       const activeGitDiff = overrides.gitDiff ?? includeGitDiff;
-      const activePrompt = overrides.prompt ?? taskPrompt;
+      const rawPrompt = overrides.prompt ?? taskPrompt;
+      const projectName =
+        (currentPath.split(/[/\\]/).filter(Boolean).pop() ?? currentPath) || 'Workspace';
+      const activePrompt = interpolatePromptVariables(rawPrompt, {
+        projectName,
+        gitBranch: gitContext?.currentBranch ?? undefined,
+        selectedFilesCount: sel.length,
+        tokenBudget: targetBudgetTokens,
+        skeletonEnabled: (overrides.skeletons ?? skeletonSet).size > 0 || skeletonCount > 0,
+      });
       const wantFullPreview = overrides.fullPreview ?? false;
 
       setGenerating(true);
@@ -178,6 +214,10 @@ export function useGeneration({ currentPath, nodes, format, taskPrompt, pushToas
       skeletonSet,
       includeGitDiff,
       taskPrompt,
+      currentPath,
+      gitContext,
+      targetBudgetTokens,
+      skeletonCount,
     ],
   );
 

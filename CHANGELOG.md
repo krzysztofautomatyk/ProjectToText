@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-18
+
+### Added
+
+- **Prompt Studio Pro:** custom prompt templates with categories, placement (`prefix` / `suffix` / `wrap`), dynamic variables (`{{PROJECT_NAME}}`, `{{GIT_BRANCH}}`, `{{TOKEN_BUDGET}}`, …), live secret scanning, and FNV-1a content hashing for import deduplication.
+- **Default prompts:** set a global or per-workspace default template; auto-apply on project open; star toggle and DOMYŚLNY / Default badge in the Prompt Studio bar.
+- **Built-in playbooks:** architecture review, bug hunt, AppSec, pre-PR, feature blueprint, test suite, and onboarding templates with recommended budget/format presets.
+- **Preferences export/import 2.0:** snapshot includes `promptStudio` (schema v2); Merge vs Replace modes; secret warnings on import; Prompt Studio–only export pack; import preview dialog.
+- **Documentation & How-To modal (F1 / Cmd+Ctrl+/):** How-To steps, 7 interactive playbook examples, Context Engineering notes, CLI & MCP setup; English default with PL locale toggle.
+- **Budget sync:** interpolated active-prompt tokens counted in the context budget meter (fixes over-limit surprise from large task prompts).
+
+### Changed
+
+- Prompt template selector groups Default / Custom / Built-in playbooks.
+- Custom projects transfer UI supports full prefs export plus Prompt Studio–only export.
+
 ## [0.9.0] - 2026-10-17
 
 ### Added

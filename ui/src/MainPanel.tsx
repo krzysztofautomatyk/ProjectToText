@@ -6,7 +6,7 @@ import { CustomProjectsPanel, FolderHistoryPanel, TreeContextMenu, TreeRow } fro
 import type { WorkspaceState } from './useWorkspace';
 
 export function MainPanel({ ws }: { ws: WorkspaceState }) {
-  const { ROW_HEIGHT, changeCustomNote, changeFormat, clearCustomDeselect, clearFolderHistory, collapseAll, currentPath, customProjects, expandAll, exportPrefs, fileListText, filePreview, fileTokens, fileTree, filterText, focusedPath, folderHistory, format, fullOutputPreview, fullOutputText, generating, handleCopyFileList, handleToggleFullPreview, handleTreeContextMenu, importPrefs, listFormat, nodes, openCustomProject, openFilePreview, openFolder, openHistoryFolder, openInDefaultApp, openWithApp, output, outputBytes, pickAppAndOpen, previewError, previewLoading, previewRelPath, readyBadge, removeCustomProject, removeFolderFromHistory, resizing, scanning, selectedCount, selectedSet, setFilterText, setFocusedPath, setListFormat, setResizing, setShowCustom, setShowHistory, setShowTopConsumers, setTokenSort, setTreeScrollTop, setTreeWidth, setView, showCustom, showHistory, showInitialLoading, showTopConsumers, skeletonSet, startRowIdx, stats, subtreeStats, toggleCustomFavorite, toggleExpand, toggleFolderPin, toggleSelect, toggleSkeleton, tokenSort, totalTreeHeight, treeScrollRef, treeWidth, truncatedPreview, view, virtualSlice, visibleTreeRows } = ws;
+  const { ROW_HEIGHT, changeCustomNote, changeFormat, clearCustomDeselect, clearFolderHistory, collapseAll, currentPath, customProjects, expandAll, exportPrefs, exportPromptStudioPack, fileListText, filePreview, fileTokens, fileTree, filterText, focusedPath, folderHistory, format, fullOutputPreview, fullOutputText, generating, handleCopyFileList, handleToggleFullPreview, handleTreeContextMenu, importPrefs, listFormat, nodes, openCustomProject, openFilePreview, openFolder, openHistoryFolder, openInDefaultApp, openWithApp, output, outputBytes, pickAppAndOpen, previewError, previewLoading, previewRelPath, readyBadge, removeCustomProject, removeFolderFromHistory, resizing, scanning, selectedCount, selectedSet, setFilterText, setFocusedPath, setListFormat, setResizing, setShowCustom, setShowHistory, setShowTopConsumers, setTokenSort, setTreeScrollTop, setTreeWidth, setView, showCustom, showHistory, showInitialLoading, showTopConsumers, skeletonSet, startRowIdx, stats, subtreeStats, toggleCustomFavorite, toggleExpand, toggleFolderPin, toggleSelect, toggleSkeleton, tokenSort, totalTreeHeight, treeScrollRef, treeWidth, truncatedPreview, view, virtualSlice, visibleTreeRows } = ws;
   return (
     <>
       {/* Main */}
@@ -432,6 +432,7 @@ export function MainPanel({ ws }: { ws: WorkspaceState }) {
           onClearDeselect={clearCustomDeselect}
           onRemove={removeCustomProject}
           onExport={exportPrefs}
+          onExportPrompts={exportPromptStudioPack}
           onImport={importPrefs}
         />
       )}

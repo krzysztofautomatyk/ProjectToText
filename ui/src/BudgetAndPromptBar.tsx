@@ -1,8 +1,183 @@
-import { type BudgetPreset, PROMPT_TEMPLATES, formatTokens } from './treeModel';
+import { useMemo, useState } from 'react';
+import { Sparkles, Star } from 'lucide-react';
+import { type BudgetPreset, estimateTokens, formatTokens, PROMPT_TEMPLATES } from './treeModel';
 import type { WorkspaceState } from './useWorkspace';
+import {
+  BUILT_IN_PROMPTS,
+  findPromptById,
+  interpolatePromptVariables,
+  listAllPrompts,
+  loadPromptStudioStore,
+  resolveDefaultPromptForWorkspace,
+  setGlobalDefaultPrompt,
+  setWorkspaceDefaultPrompt,
+  type CustomPromptTemplate,
+} from './projectPrefs';
+import { PromptStudioManager } from './PromptStudioManager';
 
 export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
-  const { autoFitToBudget, budgetPreset, currentPath, customBudget, format, generate, nodes, promptTemplateId, selectedCount, setBudgetPreset, setCustomBudget, setPromptTemplateId, setShowTopConsumers, setTaskPrompt, showPromptStudio, showTopConsumers, stats, targetBudgetTokens, taskPrompt } = ws;
+  const {
+    autoFitToBudget,
+    budgetPreset,
+    currentPath,
+    customBudget,
+    format,
+    generate,
+    gitContext,
+    nodes,
+    promptStudioRevision,
+    promptTemplateId,
+    pushToast,
+    selectedCount,
+    setBudgetPreset,
+    setCustomBudget,
+    setPromptTemplateId,
+    setShowTopConsumers,
+    setTaskPrompt,
+    showPromptStudio,
+    showTopConsumers,
+    skeletonSet,
+    stats,
+    targetBudgetTokens,
+    taskPrompt,
+    refreshPromptStudio,
+  } = ws;
+
+  const [managerOpen, setManagerOpen] = useState(false);
+  const [defaultScope, setDefaultScope] = useState<'global' | 'workspace'>('global');
+
+  const store = useMemo(
+    () => loadPromptStudioStore(),
+    [promptStudioRevision, showPromptStudio, managerOpen],
+  );
+  const allPrompts = useMemo(() => listAllPrompts(store), [store]);
+  const defaultPrompt = useMemo(
+    () => resolveDefaultPromptForWorkspace(currentPath || null),
+    [currentPath, promptStudioRevision, store],
+  );
+
+  const folderName = currentPath
+    ? currentPath.split(/[/\\]/).filter(Boolean).pop() ?? currentPath
+    : 'Workspace';
+
+  const interpolatedPrompt = useMemo(
+    () =>
+      interpolatePromptVariables(taskPrompt, {
+        projectName: folderName,
+        gitBranch: gitContext?.currentBranch ?? undefined,
+        selectedFilesCount: selectedCount,
+        tokenBudget: targetBudgetTokens,
+        skeletonEnabled: skeletonSet.size > 0,
+      }),
+    [
+      taskPrompt,
+      folderName,
+      gitContext?.currentBranch,
+      selectedCount,
+      targetBudgetTokens,
+      skeletonSet,
+    ],
+  );
+
+  const promptTokens = estimateTokens(interpolatedPrompt);
+  const defaultInterpolated = defaultPrompt
+    ? interpolatePromptVariables(defaultPrompt.content, {
+        projectName: folderName,
+        gitBranch: gitContext?.currentBranch ?? undefined,
+        selectedFilesCount: selectedCount,
+        tokenBudget: targetBudgetTokens,
+        skeletonEnabled: skeletonSet.size > 0,
+      })
+    : '';
+  const isCurrentDefault = Boolean(
+    defaultPrompt &&
+      promptTemplateId !== 'none' &&
+      (defaultPrompt.id === promptTemplateId ||
+        (promptTemplateId === 'custom' &&
+          (taskPrompt === defaultPrompt.content || taskPrompt === defaultInterpolated))),
+  );
+
+  const applyTemplate = (id: string) => {
+    setPromptTemplateId(id);
+    if (id === 'none') {
+      setTaskPrompt('');
+      if (currentPath && nodes.length > 0) {
+        generate(nodes, currentPath, format, true, { prompt: '' });
+      }
+      return;
+    }
+    if (id === 'custom') return;
+    const tpl =
+      findPromptById(id) ??
+      PROMPT_TEMPLATES.find((t) => t.id === id);
+    if (!tpl) return;
+    const content = 'content' in tpl ? tpl.content : tpl.prompt;
+    const text = interpolatePromptVariables(content, {
+      projectName: folderName,
+      gitBranch: gitContext?.currentBranch ?? undefined,
+      selectedFilesCount: selectedCount,
+      tokenBudget: targetBudgetTokens,
+      skeletonEnabled: skeletonSet.size > 0,
+    });
+    setTaskPrompt(text);
+    if (currentPath && nodes.length > 0) {
+      generate(nodes, currentPath, format, true, { prompt: text });
+    }
+  };
+
+  const toggleDefault = () => {
+    const id =
+      promptTemplateId === 'custom' || promptTemplateId === 'none'
+        ? defaultPrompt?.id ?? null
+        : promptTemplateId;
+    const targetId =
+      promptTemplateId !== 'none' && promptTemplateId !== 'custom'
+        ? promptTemplateId
+        : id;
+    if (!targetId || targetId === 'none' || targetId === 'custom') {
+      pushToast('info', 'Wybierz szablon promptu, aby ustawić domyślny');
+      return;
+    }
+    try {
+      if (defaultPrompt?.id === targetId) {
+        if (defaultScope === 'workspace' && currentPath) {
+          setWorkspaceDefaultPrompt(currentPath, null);
+        } else {
+          setGlobalDefaultPrompt(null);
+        }
+        pushToast('info', 'Usunięto domyślny prompt');
+      } else if (defaultScope === 'workspace' && currentPath) {
+        setWorkspaceDefaultPrompt(currentPath, targetId);
+        pushToast('success', 'Ustawiono domyślny prompt dla projektu');
+      } else {
+        setGlobalDefaultPrompt(targetId);
+        pushToast('success', 'Ustawiono domyślny prompt globalnie');
+      }
+      refreshPromptStudio();
+    } catch (e) {
+      pushToast('error', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onSelectFromManager = (prompt: CustomPromptTemplate) => {
+    setPromptTemplateId(prompt.id);
+    const text = interpolatePromptVariables(prompt.content, {
+      projectName: folderName,
+      gitBranch: gitContext?.currentBranch ?? undefined,
+      selectedFilesCount: selectedCount,
+      tokenBudget: targetBudgetTokens,
+      skeletonEnabled: skeletonSet.size > 0,
+    });
+    setTaskPrompt(text);
+    setManagerOpen(false);
+    if (currentPath && nodes.length > 0) {
+      generate(nodes, currentPath, format, true, { prompt: text });
+    }
+  };
+
+  const customGroup = allPrompts.filter((p) => !p.isBuiltIn);
+  const builtInGroup = BUILT_IN_PROMPTS;
+
   return (
     <>
       {/* Context Budget Bar */}
@@ -42,28 +217,43 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
             const skeletonTokens = ws.fileTokens
               .filter((f) => f.mode === 'skeleton')
               .reduce((sum, f) => sum + f.tokens, 0);
-            const totalContentTokens = ws.stats.contentTokens ?? (fullTokens + skeletonTokens);
-            const overheadTokens = ws.stats.overheadTokens ?? Math.max(0, ws.stats.tokens - totalContentTokens);
+            const totalContentTokens =
+              ws.stats.contentTokens ?? fullTokens + skeletonTokens;
+            const reportedOverhead =
+              ws.stats.overheadTokens ??
+              Math.max(0, ws.stats.tokens - totalContentTokens);
+            // BUG-01: ensure live prompt tokens are visible in the budget meter
+            const overheadTokens = Math.max(reportedOverhead, promptTokens);
+            const displayTokens = Math.max(
+              stats.tokens,
+              totalContentTokens + promptTokens,
+            );
 
             const budgetMax = Math.max(1, targetBudgetTokens);
             const fullPct = Math.min(100, (fullTokens / budgetMax) * 100);
-            const skeletonPct = Math.min(100 - fullPct, (skeletonTokens / budgetMax) * 100);
-            const overheadPct = Math.min(100 - fullPct - skeletonPct, (overheadTokens / budgetMax) * 100);
-            const totalPct = Math.min(100, Math.round((stats.tokens / budgetMax) * 100));
+            const skeletonPct = Math.min(
+              100 - fullPct,
+              (skeletonTokens / budgetMax) * 100,
+            );
+            const overheadPct = Math.min(
+              100 - fullPct - skeletonPct,
+              (overheadTokens / budgetMax) * 100,
+            );
+            const totalPct = Math.min(100, Math.round((displayTokens / budgetMax) * 100));
 
             return (
               <div className="budget-meter-wrap">
                 <div
                   className="budget-track"
                   role="progressbar"
-                  aria-valuenow={stats.tokens}
+                  aria-valuenow={displayTokens}
                   aria-valuemax={targetBudgetTokens}
                   style={{ display: 'flex', overflow: 'hidden' }}
                 >
                   {fullTokens > 0 && (
                     <div
                       className="budget-segment budget-segment-full"
-                      title={`Full Content: ${formatTokens(fullTokens)} tokens (${Math.round((fullTokens / Math.max(1, stats.tokens)) * 100)}%)`}
+                      title={`Full Content: ${formatTokens(fullTokens)} tokens`}
                       style={{
                         width: `${fullPct}%`,
                         height: '100%',
@@ -75,7 +265,7 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
                   {skeletonTokens > 0 && (
                     <div
                       className="budget-segment budget-segment-skeleton"
-                      title={`AST Skeletons: ${formatTokens(skeletonTokens)} tokens (${Math.round((skeletonTokens / Math.max(1, stats.tokens)) * 100)}%)`}
+                      title={`AST Skeletons: ${formatTokens(skeletonTokens)} tokens`}
                       style={{
                         width: `${skeletonPct}%`,
                         height: '100%',
@@ -87,7 +277,7 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
                   {overheadTokens > 0 && (
                     <div
                       className="budget-segment budget-segment-overhead"
-                      title={`Wrapper/Diff/Prompt Overhead: ${formatTokens(overheadTokens)} tokens (${Math.round((overheadTokens / Math.max(1, stats.tokens)) * 100)}%)`}
+                      title={`Wrapper/Diff/Prompt Overhead: ${formatTokens(overheadTokens)} tokens (prompt ≈ ${formatTokens(promptTokens)})`}
                       style={{
                         width: `${overheadPct}%`,
                         height: '100%',
@@ -96,13 +286,13 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
                       }}
                     />
                   )}
-                  {fullTokens === 0 && skeletonTokens === 0 && stats.tokens > 0 && (
+                  {fullTokens === 0 && skeletonTokens === 0 && displayTokens > 0 && (
                     <div
                       className={[
                         'budget-fill',
-                        stats.tokens > targetBudgetTokens
+                        displayTokens > targetBudgetTokens
                           ? 'is-over'
-                          : stats.tokens > targetBudgetTokens * 0.85
+                          : displayTokens > targetBudgetTokens * 0.85
                             ? 'is-warn'
                             : '',
                       ]
@@ -112,18 +302,44 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
                     />
                   )}
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '8px',
+                  }}
+                >
                   <span className="budget-label" data-testid="budget-progress-label">
-                    {stats.tokenizerExact === false ? '~' : ''}{formatTokens(stats.tokens)} / {formatTokens(targetBudgetTokens)} tokens ({totalPct}%)
+                    {stats.tokenizerExact === false ? '~' : ''}
+                    {formatTokens(displayTokens)} / {formatTokens(targetBudgetTokens)} tokens (
+                    {totalPct}%)
                   </span>
-                  {stats.tokens > 0 && (
-                    <span className="budget-breakdown-chips" data-testid="budget-breakdown-chips" style={{ fontSize: '10px', opacity: 0.75, display: 'flex', gap: '6px' }}>
-                      <span data-testid="budget-chip-content" title={`Content tokens (full + skeletons)${stats.tokenizerExact === false ? ' (approximate)' : ''}`}>
-                        Content: {stats.tokenizerExact === false ? '~' : ''}{formatTokens(totalContentTokens)}
+                  {displayTokens > 0 && (
+                    <span
+                      className="budget-breakdown-chips"
+                      data-testid="budget-breakdown-chips"
+                      style={{ fontSize: '10px', opacity: 0.75, display: 'flex', gap: '6px' }}
+                    >
+                      <span
+                        data-testid="budget-chip-content"
+                        title="Content tokens (full + skeletons)"
+                      >
+                        Content: {stats.tokenizerExact === false ? '~' : ''}
+                        {formatTokens(totalContentTokens)}
                       </span>
-                      {overheadTokens > 0 && (
-                        <span data-testid="budget-chip-overhead" title={`Wrapper, Diff & Task Prompt overhead tokens${stats.tokenizerExact === false ? ' (approximate)' : ''}`}>
-                          Overhead: {stats.tokenizerExact === false ? '~' : ''}{formatTokens(overheadTokens)}
+                      {(overheadTokens > 0 || promptTokens > 0) && (
+                        <span
+                          data-testid="budget-chip-overhead"
+                          title={`Wrapper, Diff & Task Prompt (~${formatTokens(promptTokens)} prompt)`}
+                        >
+                          Overhead: {stats.tokenizerExact === false ? '~' : ''}
+                          {formatTokens(overheadTokens)}
+                        </span>
+                      )}
+                      {promptTokens > 0 && (
+                        <span data-testid="budget-chip-prompt" title="Active prompt tokens (interpolated)">
+                          Prompt: ~{formatTokens(promptTokens)}
                         </span>
                       )}
                     </span>
@@ -166,26 +382,95 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
               aria-label="Prompt template"
               data-testid="prompt-template-select"
               value={promptTemplateId}
-              onChange={(e) => {
-                const id = e.target.value;
-                setPromptTemplateId(id);
-                const tpl = PROMPT_TEMPLATES.find((t) => t.id === id);
-                if (tpl && id !== 'custom') {
-                  setTaskPrompt(tpl.prompt);
-                  if (currentPath && nodes.length > 0) {
-                    generate(nodes, currentPath, format, true, { prompt: tpl.prompt });
-                  }
-                }
-              }}
+              onChange={(e) => applyTemplate(e.target.value)}
             >
-              {PROMPT_TEMPLATES.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.label}
-                </option>
-              ))}
+              <option value="none">No task prompt</option>
+              {defaultPrompt && (
+                <optgroup label="★ Domyślny (Aktywny Default)">
+                  <option value={defaultPrompt.id}>
+                    ★ {defaultPrompt.name}
+                  </option>
+                </optgroup>
+              )}
+              {customGroup.length > 0 && (
+                <optgroup label="Moje Prompty (Custom)">
+                  {customGroup.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              <optgroup label="Wbudowane Playbooki (Built-in)">
+                {builtInGroup.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </optgroup>
+              <option value="custom">Custom Task Prompt…</option>
             </select>
+
+            <button
+              type="button"
+              className={`btn btn-ghost btn-star-default${isCurrentDefault ? ' active is-default-prompt' : ''}`}
+              data-testid="toggle-default-prompt-btn"
+              aria-pressed={Boolean(isCurrentDefault)}
+              aria-label={isCurrentDefault ? 'Default prompt' : 'Set as default prompt'}
+              title={isCurrentDefault ? '★ Domyślny' : '☆ Ustaw jako domyślny'}
+              onClick={toggleDefault}
+            >
+              {isCurrentDefault ? (
+                <>
+                  <Star size={13} fill="currentColor" aria-hidden /> ★ Domyślny
+                </>
+              ) : (
+                <>
+                  <Star size={13} aria-hidden /> ☆ Ustaw jako domyślny
+                </>
+              )}
+            </button>
+            {isCurrentDefault && (
+              <span className="prompt-default-badge" data-testid="prompt-default-badge">
+                DOMYŚLNY
+              </span>
+            )}
+
+            <div className="prompt-default-scope" role="group" aria-label="Default scope">
+              <label>
+                <input
+                  type="radio"
+                  name="bar-default-scope"
+                  checked={defaultScope === 'global'}
+                  onChange={() => setDefaultScope('global')}
+                />{' '}
+                Globalnie
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="bar-default-scope"
+                  checked={defaultScope === 'workspace'}
+                  onChange={() => setDefaultScope('workspace')}
+                  disabled={!currentPath}
+                />{' '}
+                Ten projekt
+              </label>
+            </div>
+
+            <button
+              type="button"
+              className="btn btn-ghost"
+              data-testid="open-prompt-studio-btn"
+              aria-haspopup="dialog"
+              onClick={() => setManagerOpen(true)}
+            >
+              <Sparkles size={13} aria-hidden /> Zarządzaj Promptami (+ Dodaj)
+            </button>
+
             <span className="meta-inline">
-              Appended at the very end inside <code>&lt;task_instructions&gt;</code> for optimal long-context LLM reasoning.
+              Appended at the very end inside <code>&lt;task_instructions&gt;</code> · prompt ~{' '}
+              {formatTokens(promptTokens)} tok
             </span>
           </div>
           <textarea
@@ -201,10 +486,19 @@ export function BudgetAndPromptBar({ ws }: { ws: WorkspaceState }) {
                 generate(nodes, currentPath, format, false, { prompt: val });
               }
             }}
+            aria-label="Task prompt content"
           />
         </div>
       )}
 
+      <PromptStudioManager
+        open={managerOpen}
+        onClose={() => setManagerOpen(false)}
+        workspacePath={currentPath || null}
+        onPromptsChanged={refreshPromptStudio}
+        onSelectPrompt={onSelectFromManager}
+        pushToast={pushToast}
+      />
     </>
   );
 }

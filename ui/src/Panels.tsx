@@ -8,6 +8,9 @@ import './index.css';
 import { type VisibleTreeRow, type ToastItem, formatBytes, formatTokens, type SubtreeStats } from './treeModel';
 import { themeLabel, type ThemePref, type WorkspaceState } from './useWorkspace';
 
+export { DocumentationAndHowToModal } from './DocumentationModal';
+export { PromptStudioManager } from './PromptStudioManager';
+
 export function highlightMatch(text: string, query: string): ReactNode {
   if (!query.trim()) return text;
   const q = query.trim();
@@ -158,6 +161,129 @@ export function formatHistoryDate(timestamp: number): string {
   }).format(timestamp)}`;
 }
 
+export function ImportPrefsDialog({ ws }: { ws: WorkspaceState }) {
+  const {
+    cancelImportPrefs,
+    confirmImportPrefs,
+    importApplyDefault,
+    importMode,
+    importPreview,
+    setImportApplyDefault,
+    setImportMode,
+  } = ws;
+  if (!importPreview) return null;
+  return (
+    <div className="help-overlay" role="presentation" onClick={cancelImportPrefs}>
+      <div
+        className="help-card import-prefs-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="import-prefs-title"
+        data-testid="import-prefs-dialog"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') cancelImportPrefs();
+        }}
+      >
+        <div className="help-header">
+          <h2 id="import-prefs-title">Podgląd importu</h2>
+          <button
+            type="button"
+            className="btn btn-ghost btn-icon"
+            onClick={cancelImportPrefs}
+            aria-label="Cancel import"
+          >
+            <X size={14} />
+          </button>
+        </div>
+        <ul className="import-preview-stats" data-testid="import-preview-stats">
+          <li>
+            Projekty w paczce: <strong>{importPreview.projectsCount}</strong>
+          </li>
+          <li>
+            Historia: <strong>{importPreview.historyCount}</strong>
+          </li>
+          <li>
+            Prompty — nowe: <strong data-testid="import-prompts-new">{importPreview.promptsNew}</strong>,
+            zaktualizowane:{' '}
+            <strong data-testid="import-prompts-updated">{importPreview.promptsUpdated}</strong>,
+            duplikaty:{' '}
+            <strong data-testid="import-prompts-dupes">{importPreview.promptsDuplicates}</strong>
+          </li>
+          {importPreview.defaultPromptName && (
+            <li data-testid="import-default-prompt-name">
+              Domyślny prompt w pliku: <strong>{importPreview.defaultPromptName}</strong>
+            </li>
+          )}
+        </ul>
+        {importPreview.secretWarnings.length > 0 && (
+          <div
+            className="import-secret-banner"
+            role="alert"
+            data-testid="import-secret-warning"
+          >
+            Ostrzeżenie: w importowanych promptach wykryto potencjalne sekrety / klucze API:
+            <ul>
+              {importPreview.secretWarnings.map((w) => (
+                <li key={w.promptName}>
+                  {w.promptName} ({w.findingsCount})
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <fieldset className="import-mode-fieldset">
+          <legend>Tryb importu</legend>
+          <label>
+            <input
+              type="radio"
+              name="import-mode"
+              data-testid="import-mode-merge"
+              checked={importMode === 'merge'}
+              onChange={() => setImportMode('merge')}
+            />{' '}
+            Merge — scal bez utraty lokalnych promptów
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="import-mode"
+              data-testid="import-mode-replace"
+              checked={importMode === 'replace'}
+              onChange={() => setImportMode('replace')}
+            />{' '}
+            Replace — zastąp Prompt Studio stanem z pliku
+          </label>
+        </fieldset>
+        {importPreview.defaultPromptId && (
+          <label className="prompt-checkbox-row">
+            <input
+              type="checkbox"
+              data-testid="import-apply-default-checkbox"
+              checked={importApplyDefault}
+              onChange={(e) => setImportApplyDefault(e.target.checked)}
+            />
+            Zastosuj domyślny prompt z importowanego pliku
+          </label>
+        )}
+        <div className="import-prefs-actions">
+          <button type="button" className="btn btn-ghost" onClick={cancelImportPrefs}>
+            Anuluj
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            data-testid="confirm-import-btn"
+            onClick={confirmImportPrefs}
+          >
+            Zatwierdź import
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function CustomProjectsPanel({
   entries,
   currentPath,
@@ -170,6 +296,7 @@ export function CustomProjectsPanel({
   onRemove,
   onExport,
   onImport,
+  onExportPrompts,
 }: {
   entries: ProjectPref[];
   currentPath: string;
@@ -182,6 +309,7 @@ export function CustomProjectsPanel({
   onRemove: (entry: ProjectPref) => void;
   onExport: () => void;
   onImport: () => void;
+  onExportPrompts?: () => void;
 }) {
   return (
     <div className="history-overlay" role="presentation" onClick={onClose}>
@@ -211,13 +339,23 @@ export function CustomProjectsPanel({
         </div>
 
         <div className="history-toolbar custom-transfer" data-testid="custom-transfer">
-          <button type="button" className="panel-link" onClick={onExport}>
+          <button type="button" className="panel-link" onClick={onExport} data-testid="export-prefs-btn">
             <Download size={12} aria-hidden /> Export all
           </button>
-          <button type="button" className="panel-link" onClick={onImport}>
+          {onExportPrompts && (
+            <button
+              type="button"
+              className="panel-link"
+              onClick={onExportPrompts}
+              data-testid="export-prompts-only-btn"
+            >
+              <Download size={12} aria-hidden /> Export Prompt Studio
+            </button>
+          )}
+          <button type="button" className="panel-link" onClick={onImport} data-testid="import-prefs-btn">
             <Upload size={12} aria-hidden /> Import…
           </button>
-          <span className="custom-transfer-hint">JSON · merges into existing entries</span>
+          <span className="custom-transfer-hint">JSON · preview → Merge / Replace</span>
         </div>
 
         {entries.length > 0 ? (
@@ -718,6 +856,12 @@ export function ShortcutsHelpDialog({ ws }: { ws: WorkspaceState }) {
               <span className="kbd">?</span>
             </dt>
             <dd>Toggle this help</dd>
+          </div>
+          <div>
+            <dt>
+              <span className="kbd">F1</span> / <span className="kbd">{formatShortcut('/')}</span>
+            </dt>
+            <dd>Documentation & How-To (7 examples)</dd>
           </div>
           <div>
             <dt>

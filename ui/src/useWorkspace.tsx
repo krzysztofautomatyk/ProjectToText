@@ -8,8 +8,34 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { Check, Loader2 } from 'lucide-react';
 import { CANONICAL_JUNK_DIRS, downloadText, isCancelledError, pickDirectoryWithInput, pickDirectoryWithPicker, scanDirectoryHandle, scanFileList, UserCancelledError, type BrowserProject } from './browserFs';
 import { readFolderHistory, rememberFolder, removeFolder, setFolderPinned, writeFolderHistory, type FolderHistoryEntry } from './folderHistory';
-import { projectPrefKey, readProjectPrefs, rememberProject, removeProject, setProjectFavorite, setProjectNote, writeProjectPrefs, type ProjectPref } from './projectPrefs';
-import { buildPrefSnapshot, mergePrefSnapshot, parsePrefSnapshot, snapshotFileName } from './prefTransfer';
+import {
+  interpolatePromptVariables,
+  loadPromptStudioStore,
+  projectPrefKey,
+  readProjectPrefs,
+  rememberProject,
+  removeProject,
+  resolveDefaultPromptForWorkspace,
+  setActivePromptId,
+  setProjectFavorite,
+  setProjectNote,
+  writeProjectPrefs,
+  type CustomPromptTemplate,
+  type ProjectPref,
+  type PromptPresetConfig,
+} from './projectPrefs';
+import {
+  applyPromptStudioImport,
+  buildPrefSnapshot,
+  exportPromptStudioOnly,
+  mergePrefSnapshot,
+  parsePrefSnapshot,
+  previewPrefImport,
+  promptStudioFileName,
+  snapshotFileName,
+  type PrefImportMode,
+  type PrefImportPreview,
+} from './prefTransfer';
 import { isTauriRuntime } from './tauriEnv';
 import { isModKey } from './platform';
 import { type FileNode, type GitRepoContext, type ScanResult, type OutputFormat, type ViewMode, type ListFormat, type SelectionPreset, type ToastKind, type BudgetPreset, BUDGET_LIMITS, type ToastItem, normalizePath, applySavedDeselects, formatTokens, TOKEN_ESTIMATE_HINT, isLowPriorityPath, applyPreset, generateFileList, generatePathsList, readStoredFormat, tokenBadgeClass } from './treeModel';
@@ -56,6 +82,12 @@ export function useWorkspace() {
   const [showPromptStudio, setShowPromptStudio] = useState(false);
   const [promptTemplateId, setPromptTemplateId] = useState('none');
   const [taskPrompt, setTaskPrompt] = useState('');
+  const [promptStudioRevision, setPromptStudioRevision] = useState(0);
+  const [showDocs, setShowDocs] = useState(false);
+  const [importPreview, setImportPreview] = useState<PrefImportPreview | null>(null);
+  const [pendingImportText, setPendingImportText] = useState<string | null>(null);
+  const [importMode, setImportMode] = useState<PrefImportMode>('merge');
+  const [importApplyDefault, setImportApplyDefault] = useState(true);
   const [workspaceChangedOnDisk, setWorkspaceChangedOnDisk] = useState(false);
   const refreshTimer = useRef<number | null>(null);
   const refreshFromDiskRef = useRef<() => void>(() => {});
@@ -132,7 +164,17 @@ export function useWorkspace() {
 
 
   const { themePref, setThemePref, resolvedTheme, cycleTheme, treeWidth, setTreeWidth, resizing, setResizing, treeScrollTop, setTreeScrollTop, treeViewportHeight, treeScrollRef } = useThemeAndLayout({ currentPath, pushToast });
-  const { output, setOutput, generating, setGenerating, stats, setStats, fullOutputPreview, fullOutputText, setFullOutputText, truncatedPreview, setTruncatedPreview, totalBytes, setTotalBytes, redactSecretsEnabled, setRedactSecretsEnabled, redactionSummary, setRedactionSummary, skeletonSet, setSkeletonSet, fileTokens, setFileTokens, includeGitDiff, setIncludeGitDiff, genSeq, hasLoadedOnce, generateTimer, generate, generateNow, handleToggleFullPreview, handleCopy, handleSave } = useGeneration({ currentPath, nodes, format, taskPrompt, pushToast, browserProjectRef, workspaceRevision });
+  const { output, setOutput, generating, setGenerating, stats, setStats, fullOutputPreview, fullOutputText, setFullOutputText, truncatedPreview, setTruncatedPreview, totalBytes, setTotalBytes, redactSecretsEnabled, setRedactSecretsEnabled, redactionSummary, setRedactionSummary, skeletonSet, setSkeletonSet, fileTokens, setFileTokens, includeGitDiff, setIncludeGitDiff, genSeq, hasLoadedOnce, generateTimer, generate, generateNow, handleToggleFullPreview, handleCopy, handleSave } = useGeneration({
+    currentPath,
+    nodes,
+    format,
+    taskPrompt,
+    pushToast,
+    browserProjectRef,
+    workspaceRevision,
+    gitContext,
+    targetBudgetTokens,
+  });
   const { filterText, setFilterText, expanded, setExpanded, preset, setPreset, selectedSet, selectedCount, fileTree, filteredTree, subtreeStats, visibleTreeRows, toggleSelect, selectAll, deselectAll, applySelectionPreset, toggleSkeleton, toggleRedactSecrets, toggleIncludeGitDiff, selectGitFiles, autoFitToBudget, clearCustomDeselect, toggleExpand, expandAll, collapseAll, changeFormat } = useSelection({ currentPath, nodes, setNodes, format, setFormat, tokenSort, gitContext, junkDirs, customProjects, setCustomProjects, targetBudgetTokens, stats, fileTokens, skeletonSet, setSkeletonSet, setRedactSecretsEnabled, setIncludeGitDiff, setOutput, setStats, setGenerating, genSeq, generateTimer, generate, pushToast });
   const { filePreview, previewLoading, previewError, previewRelPath, contextMenu, setContextMenu, openFilePreview, openInDefaultApp, openWithApp, pickAppAndOpen, handleTreeContextMenu, selectRelatedFiles, setFilePreview, setPreviewRelPath, setPreviewError } = useFilePreviewAndMenu({ currentPath, nodes, format, browserProjectRef, setView, setFocusedPath, setNodes, pushToast, generate, workspaceRevision });
 
@@ -187,17 +229,78 @@ export function useWorkspace() {
     setCustomProjects((prev) => removeProject(prev, entry.path));
   }, []);
 
+  const refreshPromptStudio = useCallback(() => {
+    setPromptStudioRevision((n) => n + 1);
+  }, []);
+
   /* ─── Preferences export / import ──────────────────── */
 
   const exportPrefs = useCallback(() => {
-    const snapshot = buildPrefSnapshot(customProjects, folderHistory);
+    const snapshot = buildPrefSnapshot(customProjects, folderHistory, loadPromptStudioStore());
     const text = JSON.stringify(snapshot, null, 2);
     downloadText(snapshotFileName(), text);
+    const studio = snapshot.promptStudio;
     pushToast(
       'success',
-      `Exported ${customProjects.length} projects · ${folderHistory.length} history entries`,
+      `Exported ${customProjects.length} projects · ${folderHistory.length} history · ${studio?.customPrompts.length ?? 0} prompts`,
     );
   }, [customProjects, folderHistory, pushToast]);
+
+  const exportPromptStudioPack = useCallback(() => {
+    downloadText(promptStudioFileName(), exportPromptStudioOnly());
+    pushToast('success', 'Exported Prompt Studio pack');
+  }, [pushToast]);
+
+  const cancelImportPrefs = useCallback(() => {
+    setImportPreview(null);
+    setPendingImportText(null);
+  }, []);
+
+  const confirmImportPrefs = useCallback(() => {
+    if (!pendingImportText) return;
+    try {
+      const snapshot = parsePrefSnapshot(pendingImportText);
+      const result = mergePrefSnapshot(
+        snapshot,
+        customProjects,
+        folderHistory,
+        loadPromptStudioStore(),
+        { mode: importMode, applyImportedDefault: importApplyDefault },
+      );
+      setCustomProjects(result.projects);
+      setFolderHistory(result.history);
+      if (result.promptStudio) {
+        applyPromptStudioImport(result.promptStudio);
+        refreshPromptStudio();
+      }
+      const promptMsg = result.promptStats
+        ? ` · prompts +${result.promptStats.addedCount}/~${result.promptStats.updatedCount}`
+        : '';
+      const secretMsg =
+        result.secretWarnings.length > 0
+          ? ` · ⚠ ${result.secretWarnings.length} prompt(s) with secret-like content`
+          : '';
+      pushToast(
+        'success',
+        `Imported ${result.projectsImported} projects · ${result.historyImported} history${promptMsg}` +
+          (result.skipped > 0 ? ` (${result.skipped} invalid skipped)` : '') +
+          secretMsg,
+      );
+    } catch (e) {
+      pushToast('error', e instanceof Error ? e.message : 'Import failed');
+    } finally {
+      cancelImportPrefs();
+    }
+  }, [
+    pendingImportText,
+    customProjects,
+    folderHistory,
+    importMode,
+    importApplyDefault,
+    pushToast,
+    refreshPromptStudio,
+    cancelImportPrefs,
+  ]);
 
   const importPrefs = useCallback(async () => {
     const input = document.createElement('input');
@@ -219,23 +322,76 @@ export function useWorkspace() {
     if (!file) return;
 
     try {
-      const snapshot = parsePrefSnapshot(await file.text());
-      const result = mergePrefSnapshot(
+      const text = await file.text();
+      const snapshot = parsePrefSnapshot(text);
+      const preview = previewPrefImport(
         snapshot,
         customProjects,
         folderHistory,
+        loadPromptStudioStore(),
       );
-      setCustomProjects(result.projects);
-      setFolderHistory(result.history);
-      pushToast(
-        'success',
-        `Imported ${result.projectsImported} projects · ${result.historyImported} history entries` +
-          (result.skipped > 0 ? ` (${result.skipped} invalid skipped)` : ''),
-      );
+      setPendingImportText(text);
+      setImportPreview(preview);
+      setImportMode('merge');
+      setImportApplyDefault(Boolean(preview.defaultPromptId));
     } catch (e) {
       pushToast('error', e instanceof Error ? e.message : 'Import failed');
     }
   }, [customProjects, folderHistory, pushToast]);
+
+  const applyPlaybook = useCallback(
+    (prompt: CustomPromptTemplate, config?: PromptPresetConfig) => {
+      setShowPromptStudio(true);
+      setPromptTemplateId(prompt.id);
+      setActivePromptId(prompt.id);
+      const folder =
+        (currentPath.split(/[/\\]/).filter(Boolean).pop() ?? currentPath) || 'Workspace';
+      const text = interpolatePromptVariables(prompt.content, {
+        projectName: folder,
+        gitBranch: gitContext?.currentBranch ?? undefined,
+        selectedFilesCount: nodes.filter((n) => n.selected && !n.is_dir).length,
+        tokenBudget:
+          config?.recommendedBudget ??
+          (budgetPreset === 'custom' ? customBudget : BUDGET_LIMITS[budgetPreset]),
+        skeletonEnabled: config?.enableSkeleton ?? skeletonSet.size > 0,
+      });
+      setTaskPrompt(text);
+      if (config?.recommendedBudget) {
+        const b = config.recommendedBudget;
+        if (b <= 32_000) setBudgetPreset('32k');
+        else if (b <= 64_000) setBudgetPreset('64k');
+        else if (b <= 128_000) setBudgetPreset('128k');
+        else if (b <= 200_000) setBudgetPreset('200k');
+        else {
+          setBudgetPreset('custom');
+          setCustomBudget(b);
+        }
+      }
+      if (config?.recommendedFormat) {
+        setFormat(config.recommendedFormat === 'plain' ? 'plain' : config.recommendedFormat);
+      }
+      if (config?.includeGitDiff != null) setIncludeGitDiff(config.includeGitDiff);
+      refreshPromptStudio();
+      pushToast('success', `Załadowano playbook: ${prompt.name}`);
+      if (currentPath && nodes.length > 0) {
+        generate(nodes, currentPath, format, true, { prompt: text });
+      }
+    },
+    [
+      currentPath,
+      gitContext,
+      nodes,
+      budgetPreset,
+      customBudget,
+      skeletonSet,
+      format,
+      generate,
+      pushToast,
+      refreshPromptStudio,
+      setFormat,
+      setIncludeGitDiff,
+    ],
+  );
 
   const clearCurrentProject = useCallback(() => {
     if (!currentPath && nodes.length === 0 && !output) return;
@@ -320,6 +476,31 @@ export function useWorkspace() {
       hasLoadedOnce.current = false;
       if (!fromBrowser) rememberLoadedFolder(pathLabel);
 
+      // Auto-apply default Prompt Studio template when opening a workspace (not on refresh)
+      if (!preserve) {
+        const studio = loadPromptStudioStore();
+        if (studio.autoApplyDefaultOnOpen) {
+          const def = resolveDefaultPromptForWorkspace(pathLabel);
+          if (def) {
+            setPromptTemplateId(def.id);
+            setActivePromptId(def.id);
+            const projectName =
+              pathLabel.split(/[/\\]/).filter(Boolean).pop() ?? pathLabel;
+            setTaskPrompt(
+              interpolatePromptVariables(def.content, {
+                projectName,
+                selectedFilesCount: withSelection.filter((n) => n.selected && !n.is_dir)
+                  .length,
+                tokenBudget: targetBudgetTokens,
+                skeletonEnabled: nextSkels.size > 0,
+              }),
+            );
+            setShowPromptStudio(true);
+            setPromptStudioRevision((n) => n + 1);
+          }
+        }
+      }
+
       const topDirs = withSelection
         .filter((n) => n.is_dir && !n.path.includes('/'))
         .map((n) => n.path);
@@ -357,7 +538,7 @@ export function useWorkspace() {
       // Pack after tree is visible
       await generateNow(withSelection, pathLabel, format, { skeletons: nextSkels });
     },
-    [format, generateNow, pushToast, rememberLoadedFolder, customProjects, junkDirs],
+    [format, generateNow, pushToast, rememberLoadedFolder, customProjects, junkDirs, targetBudgetTokens],
   );
 
   const scan = useCallback(
@@ -654,6 +835,14 @@ export function useWorkspace() {
         return;
       }
       if (e.key === 'Escape') {
+        if (showDocs) {
+          setShowDocs(false);
+          return;
+        }
+        if (importPreview) {
+          cancelImportPrefs();
+          return;
+        }
         if (showHelp) {
           setShowHelp(false);
           return;
@@ -676,14 +865,19 @@ export function useWorkspace() {
         }
         return;
       }
+      if (e.key === 'F1' || (meta && e.key === '/')) {
+        e.preventDefault();
+        setShowDocs((v) => !v);
+        return;
+      }
       if (!inField && (e.key === '?' || (e.shiftKey && e.key === '/'))) {
         e.preventDefault();
         setShowHelp((v) => !v);
       }
     };
 
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   }, [
     openFolder,
     handleSave,
@@ -699,6 +893,9 @@ export function useWorkspace() {
     showAbout,
     showHistory,
     showCustom,
+    showDocs,
+    importPreview,
+    cancelImportPrefs,
   ]);
 
 
@@ -774,17 +971,20 @@ export function useWorkspace() {
 
   return {
     ROW_HEIGHT,
+    applyPlaybook,
     applySelectionPreset,
     autoFitToBudget,
     availableUpdate,
     browserMode,
     budgetPreset,
+    cancelImportPrefs,
     changeCustomNote,
     changeFormat,
     clearCurrentProject,
     clearCustomDeselect,
     clearFolderHistory,
     collapseAll,
+    confirmImportPrefs,
     contextMenu,
     currentPath,
     customBudget,
@@ -796,6 +996,7 @@ export function useWorkspace() {
     expandAll,
     expanded,
     exportPrefs,
+    exportPromptStudioPack,
     fileListText,
     filePreview,
     fileTokens,
@@ -817,7 +1018,10 @@ export function useWorkspace() {
     handleSave,
     handleToggleFullPreview,
     handleTreeContextMenu,
+    importApplyDefault,
+    importMode,
     importPrefs,
+    importPreview,
     includeGitDiff,
     installUpdate,
     listFormat,
@@ -835,11 +1039,13 @@ export function useWorkspace() {
     previewError,
     previewLoading,
     previewRelPath,
+    promptStudioRevision,
     promptTemplateId,
     pushToast,
     readyBadge,
     redactSecretsEnabled,
     redactionSummary,
+    refreshPromptStudio,
     removeCustomProject,
     removeFolderFromHistory,
     resizing,
@@ -856,11 +1062,14 @@ export function useWorkspace() {
     setCustomBudget,
     setFilterText,
     setFocusedPath,
+    setImportApplyDefault,
+    setImportMode,
     setListFormat,
     setPromptTemplateId,
     setResizing,
     setShowAbout,
     setShowCustom,
+    setShowDocs,
     setShowHelp,
     setShowHistory,
     setShowPromptStudio,
@@ -873,6 +1082,7 @@ export function useWorkspace() {
     setView,
     showAbout,
     showCustom,
+    showDocs,
     showHelp,
     showHistory,
     showInitialLoading,
